@@ -1,0 +1,16 @@
+# Build output
+/quanta
+*.o
+*.a
+*.out
+
+# Cross-compiled test artifacts
+tests/*.elf
+tests/*.bin
+
+# Debug / editor / OS cruft
+*.dSYM/
+.vscode/
+*.swp
+*~
+.DS_Store

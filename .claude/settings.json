@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make:*)",
+      "Bash(gcc:*)",
+      "Bash(./quanta:*)",
+      "Bash(gdb:*)",
+      "Bash(riscv64-unknown-elf-gcc:*)",
+      "Bash(riscv64-unknown-elf-objdump:*)",
+      "Bash(riscv64-unknown-elf-readelf:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
+    ]
+  }
+}

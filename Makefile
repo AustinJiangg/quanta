@@ -1,0 +1,48 @@
+# Quanta build
+#
+# Two distinct toolchains are at play here:
+#   CC       - your host compiler. Builds the emulator (a native x86 binary).
+#   RVCC     - the RISC-V cross-compiler. Builds test programs that the
+#              emulator will eventually load and run.
+#
+# Targets:
+#   make            build the emulator -> ./quanta
+#   make run        build and run the MVP (hardcoded program)
+#   make tests      build the sample RISC-V program -> tests/hello.elf
+#   make debug      build with -g -O0 for stepping under gdb
+#   make clean      remove build artifacts
+
+CC      ?= gcc
+CFLAGS  ?= -std=c11 -Wall -Wextra -O2 -Isrc
+LDFLAGS ?=
+
+# RISC-V cross-toolchain (override if yours is named differently).
+RVCC      ?= riscv64-unknown-elf-gcc
+RVOBJDUMP ?= riscv64-unknown-elf-objdump
+RVCFLAGS  ?= -march=rv32i -mabi=ilp32 -nostdlib -nostartfiles -Ttext=0x80000000
+
+SRC := $(wildcard src/*.c)
+BIN := quanta
+
+.PHONY: all run tests debug clean
+
+all: $(BIN)
+
+$(BIN): $(SRC)
+	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
+
+run: $(BIN)
+	./$(BIN)
+
+# Build the sample assembly program with the cross-toolchain.
+tests: tests/hello.elf
+
+tests/hello.elf: tests/hello.S
+	$(RVCC) $(RVCFLAGS) -o $@ $<
+	@echo "Built $@ — disassemble with: $(RVOBJDUMP) -d $@"
+
+debug: CFLAGS := -std=c11 -Wall -Wextra -g -O0 -Isrc
+debug: clean $(BIN)
+
+clean:
+	rm -f $(BIN) tests/*.elf
