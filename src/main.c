@@ -12,32 +12,37 @@
  *   quanta [program.elf]
  *
  * With a path, Quanta loads that RV32I ELF executable and runs it from its
- * entry point. With no argument, it runs a tiny built-in demo program — the
- * original MVP smoke test — so the emulator stays runnable even without the
+ * entry point. With no argument, it runs a tiny built-in demo program — a
+ * toolchain-free smoke test — so the emulator stays runnable even without the
  * RISC-V cross-toolchain installed.
  *
- * The demo computes a few values into registers so you can watch state change:
+ * The demo computes a couple of values, then asks the "kernel" to terminate it
+ * with the exit syscall (a7 = 93). a0 carries the status, so it doubles as the
+ * exit code:
  *
  *   addi a0, zero, 5     # a0 = 5
  *   addi a1, zero, 37    # a1 = 37
  *   add  a2, a0, a1      # a2 = a0 + a1 = 42
  *   sub  a3, a1, a0      # a3 = a1 - a0 = 32
- *   ecall                # halt
+ *   addi a7, zero, 93    # a7 = exit
+ *   addi a0, zero, 0     # status = 0   (reuses a0)
+ *   ecall                # exit(0)
  *
- * tests/hello.S is the same program in assembly; once built with the
- * cross-toolchain (`make tests`), `./quanta tests/hello.elf` reproduces the
- * register state below from a real ELF instead of these hardcoded words.
+ * tests/hello.S is the same program in assembly; tests/hello_world.S goes one
+ * step further and prints a string with the write syscall before exiting.
  */
 
 #define MEM_BASE 0x80000000u
 #define MEM_SIZE (1u << 16)   /* 64 KiB is plenty for the demo */
 
 static const uint32_t demo_program[] = {
-    0x00500513, /* addi a0, zero, 5   */
-    0x02500593, /* addi a1, zero, 37  */
-    0x00b50633, /* add  a2, a0, a1    */
-    0x40a586b3, /* sub  a3, a1, a0    */
-    0x00000073  /* ecall (halt)       */
+    0x00500513, /* addi a0, zero, 5   -> a0 = 5            */
+    0x02500593, /* addi a1, zero, 37  -> a1 = 37           */
+    0x00b50633, /* add  a2, a0, a1    -> a2 = 42           */
+    0x40a586b3, /* sub  a3, a1, a0    -> a3 = 32           */
+    0x05d00893, /* addi a7, zero, 93  -> a7 = exit syscall */
+    0x00000513, /* addi a0, zero, 0   -> exit status 0     */
+    0x00000073  /* ecall              -> exit(0)           */
 };
 
 /* Step until the program halts, or a safety limit is hit so a buggy program
@@ -92,8 +97,18 @@ int main(int argc, char **argv) {
     CPU cpu;
     cpu_init(&cpu, &mem, entry);
 
+    /* Any output the program writes via syscalls appears here, mid-run. */
     int steps = run_until_halt(&cpu);
-    printf("Halted after %d instruction(s).\n\n", steps);
+
+    if (cpu.exited) {
+        printf("Program exited with code %u after %d instruction(s).\n\n",
+               cpu.exit_code, steps);
+    } else if (cpu.halted) {
+        printf("Halted (ebreak/trap) after %d instruction(s).\n\n", steps);
+    } else {
+        printf("Stopped at the %d-instruction safety limit.\n\n", steps);
+    }
+
     cpu_dump(&cpu);
 
     /* The built-in demo has a known answer, so check it as a self-test. A
