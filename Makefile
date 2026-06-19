@@ -34,10 +34,14 @@ $(BIN): $(SRC)
 run: $(BIN)
 	./$(BIN)
 
-# Build the sample assembly program with the cross-toolchain.
-tests: tests/hello.elf
+# Build the sample assembly programs with the cross-toolchain. Every tests/*.S
+# becomes a tests/*.elf via the pattern rule below.
+TEST_SRC := $(wildcard tests/*.S)
+TEST_ELF := $(TEST_SRC:.S=.elf)
 
-tests/hello.elf: tests/hello.S
+tests: $(TEST_ELF)
+
+tests/%.elf: tests/%.S
 	$(RVCC) $(RVCFLAGS) -o $@ $<
 	@echo "Built $@ — disassemble with: $(RVOBJDUMP) -d $@"
 
