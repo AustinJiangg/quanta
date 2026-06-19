@@ -17,10 +17,12 @@
  * every instruction to respect it.
  */
 typedef struct {
-    uint32_t regs[32]; /* x0..x31; x0 is always zero */
-    uint32_t pc;       /* program counter */
-    Memory  *mem;      /* attached memory (not owned by the CPU) */
-    int      halted;   /* set when execution should stop */
+    uint32_t regs[32];   /* x0..x31; x0 is always zero */
+    uint32_t pc;         /* program counter */
+    Memory  *mem;        /* attached memory (not owned by the CPU) */
+    int      halted;     /* set when execution should stop */
+    int      exited;     /* set when the program left via the exit syscall */
+    uint32_t exit_code;  /* status the exit syscall passed in a0 */
 } CPU;
 
 /* Initialise a CPU: zero all registers, set PC to the given entry point,

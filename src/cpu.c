@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include "syscall.h"
 
 #include <stdio.h>
 
@@ -97,9 +98,11 @@ enum {
 
 void cpu_init(CPU *cpu, Memory *mem, uint32_t entry_pc) {
     for (int i = 0; i < 32; i++) cpu->regs[i] = 0;
-    cpu->pc     = entry_pc;
-    cpu->mem    = mem;
-    cpu->halted = 0;
+    cpu->pc        = entry_pc;
+    cpu->mem       = mem;
+    cpu->halted    = 0;
+    cpu->exited    = 0;
+    cpu->exit_code = 0;
 }
 
 uint32_t reg_read(const CPU *cpu, uint32_t i) {
@@ -206,6 +209,27 @@ static void exec_store(CPU *cpu, uint32_t inst) {
     }
 }
 
+/* Execute SYSTEM: environment calls. ECALL traps to the syscall layer; EBREAK
+ * stops the machine (a breakpoint with no debugger attached). The two differ
+ * only in the 12-bit immediate (funct12). CSR instructions (funct3 != 0) are
+ * not modelled yet. */
+static void exec_system(CPU *cpu, uint32_t inst) {
+    uint32_t funct12 = inst >> 20;
+    if (funct3(inst) == 0) {
+        if (funct12 == 0x000) { /* ECALL  */
+            syscall_dispatch(cpu);
+            return;
+        }
+        if (funct12 == 0x001) { /* EBREAK */
+            cpu->halted = 1;
+            return;
+        }
+    }
+    fprintf(stderr, "unimplemented SYSTEM instruction 0x%08x at pc=0x%08x\n",
+            inst, cpu->pc);
+    cpu->halted = 1;
+}
+
 void cpu_step(CPU *cpu) {
     /* FETCH: read the 32-bit instruction word at PC. */
     uint32_t inst = mem_read32(cpu->mem, cpu->pc);
@@ -253,10 +277,7 @@ void cpu_step(CPU *cpu) {
             break;
 
         case OP_SYSTEM:
-            /* MVP: treat ECALL/EBREAK as "halt the machine". A real
-             * implementation would trap to a handler; for now this gives
-             * test programs a clean way to stop. */
-            cpu->halted = 1;
+            exec_system(cpu, inst);
             break;
 
         default:
