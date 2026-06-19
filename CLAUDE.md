@@ -15,20 +15,24 @@ Quanta is a from-scratch RISC-V (RV32I) instruction-set emulator in C, built to
 learn computer architecture. It models a single hart: 32 registers, a PC, and a
 flat little-endian memory. The core is a fetch/decode/execute loop.
 
-Currently at MVP (milestone M0): runs a hardcoded program and dumps register
-state. No ELF loading or syscalls yet. The full milestone plan and learning
-path live in `ROADMAP.md` — consult it for what comes next and tick boxes there
-as milestones land.
+Currently at milestone M1: loads RV32I ELF32 executables (`quanta program.elf`)
+and dumps register state, with a hardcoded built-in demo as a toolchain-free
+fallback when no ELF is given. No syscalls yet — ECALL still halts the machine.
+The full milestone plan and learning path live in `ROADMAP.md` — consult it for
+what comes next and tick boxes there as milestones land.
 
 ## Build / run / debug
 
 ```sh
 make          # build ./quanta (native host binary)
-make run      # build and run the MVP demo
+make run      # build and run the built-in demo program
 make debug    # build with -g -O0 for gdb
 make tests    # build tests/hello.elf (needs RISC-V cross-toolchain)
 make clean
 ```
+
+Run a compiled program with `./quanta <program.elf>`; with no argument the
+built-in demo runs instead.
 
 Debugging the emulator: `make debug && gdb ./quanta`. Note the two-level
 structure — gdb debugs the emulator (x86), which internally "runs" a RISC-V
@@ -38,7 +42,8 @@ program.
 
 - **Host `gcc`** builds the emulator itself (a native x86-64 binary).
 - **`riscv64-unknown-elf-gcc`** builds RISC-V programs that the emulator will
-  load and run. Used only by `make tests`; not required for the MVP.
+  load and run. Used only by `make tests`; not required to build or run the
+  emulator itself, since the built-in demo needs no ELF.
 
 When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
 
@@ -48,8 +53,13 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
 - `src/cpu.{h,c}` — CPU state and the instruction core. Field-extraction and
   immediate-decoding helpers live at the top of `cpu.c`; each instruction
   group has its own `exec_*` function.
-- `src/main.c` — MVP driver with the hardcoded program.
-- `tests/hello.S` — sample RV32I assembly, mirrors the hardcoded demo.
+- `src/elf.{h,c}` — minimal ELF32 loader: parses the header and program
+  headers, copies `PT_LOAD` segments to their virtual addresses, returns the
+  entry point. Fields are read with explicit little-endian helpers (no struct
+  overlay), so it stays host-endianness-independent.
+- `src/main.c` — driver: loads an ELF named on the command line, or runs the
+  built-in demo program when none is given.
+- `tests/hello.S` — sample RV32I assembly, mirrors the built-in demo.
 
 ## Code style
 
@@ -67,6 +77,13 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
   sign-extended; the `imm_*` helpers are the single source of truth. Re-deriving
   them by hand is the easiest way to introduce bugs.
 - Memory is little-endian; multi-byte access assembles bytes low-first.
+- The ELF loader only accepts static, little-endian RV32 `ET_EXEC` images
+  (build with `-nostdlib -nostartfiles -Ttext=0x80000000`). PIE/`ET_DYN`
+  output won't load — there's no relocation handling — and every `PT_LOAD`
+  segment must fit the fixed 64 KiB region at `0x80000000`.
+- Guest memory is a fixed 64 KiB at `0x80000000` (`MEM_BASE`/`MEM_SIZE` in
+  `main.c`). BSS (`p_memsz > p_filesz`) reads back as zero only because that
+  region is zero-initialised at `mem_init`.
 
 ## .claude/
 

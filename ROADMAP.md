@@ -30,23 +30,25 @@ skeleton.
 
 ---
 
-## M1 — ELF loader
+## M1 — ELF loader (DONE)
 
 Stop hardcoding machine code. Load real compiled programs so the cross-toolchain
-output becomes the input.
+output becomes the input. `src/elf.{h,c}` now parses the ELF32 header and
+program headers, copies `PT_LOAD` segments to their virtual addresses, and
+hands the entry point back as the initial PC; the no-argument built-in demo is
+kept as a toolchain-free smoke test.
 
-- [ ] **Build:** a loader that parses a 32-bit RISC-V ELF, reads the program
+- [x] **Build:** a loader that parses a 32-bit RISC-V ELF, reads the program
   headers, copies `PT_LOAD` segments into memory at their virtual addresses,
   and sets PC to the ELF entry point. Add a CLI: `quanta <program.elf>`.
-- [ ] **ISA:** none new — this is infrastructure.
-- [ ] **Concept:** the ELF object format; the difference between an instruction
+- [x] **ISA:** none new — this is infrastructure.
+- [x] **Concept:** the ELF object format; the difference between an instruction
   stream on disk and a loaded memory image; entry points and load addresses;
   why the linker script's `-Ttext` matters.
-- [ ] **Done when:** `make tests` builds `tests/hello.elf`, and
+- [x] **Done when:** `make tests` builds `tests/hello.elf`, and
   `./quanta tests/hello.elf` produces the same register state as the M0 demo.
-- [ ] **Commits:** `feat: add minimal ELF32 parser`,
-  `feat: load PT_LOAD segments into memory`,
-  `feat: accept program path on command line`,
+- [x] **Commits:** `feat: add minimal ELF32 loader` (parser and segment copy
+  landed together), `feat: run elf programs from the command line`,
   `docs: document running ELF programs`.
 
 Reference: parse just enough of the ELF header and program headers; ignore

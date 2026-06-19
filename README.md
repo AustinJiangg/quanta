@@ -11,9 +11,11 @@ discrete quantum of work.
 
 ## Status
 
-MVP. The core fetch/decode/execute loop runs a hardcoded RV32I program and
-prints the resulting register state. ELF loading and system calls are the next
-milestones (see Roadmap).
+Milestone M1. The fetch/decode/execute core runs RV32I programs and prints the
+resulting register state, and it can now load real ELF32 executables
+(`quanta program.elf`). A built-in demo program runs when no ELF is given, so
+the emulator stays usable without the cross-toolchain. System calls (real
+output and a proper exit) are the next milestone (see Roadmap).
 
 ## Tech stack
 
@@ -38,6 +40,12 @@ Build the emulator and run the built-in demo:
 make run
 ```
 
+Or load and run a compiled RV32I ELF executable:
+
+```sh
+./quanta path/to/program.elf
+```
+
 Other targets:
 
 ```sh
@@ -47,15 +55,20 @@ make tests    # build tests/hello.elf with the RISC-V cross-toolchain
 make clean    # remove build artifacts
 ```
 
-### Building the sample RISC-V program
+### Building and running the sample RISC-V program
 
-This needs the cross-toolchain. On Debian/Ubuntu (including WSL2):
+Loading an ELF needs a program to load, and building one needs the
+cross-toolchain. On Debian/Ubuntu (including WSL2):
 
 ```sh
 sudo apt install gcc-riscv64-unknown-elf
-make tests
+make tests                                       # -> tests/hello.elf
 riscv64-unknown-elf-objdump -d tests/hello.elf   # inspect the machine code
+./quanta tests/hello.elf                         # load and run it
 ```
+
+`tests/hello.elf` is the same program as the built-in demo, so it halts with
+`a2 = 42, a3 = 32`.
 
 ## Project structure
 
@@ -64,7 +77,8 @@ quanta/
 ├── src/
 │   ├── cpu.h / cpu.c        # CPU state + fetch/decode/execute core
 │   ├── memory.h / memory.c  # flat little-endian address space
-│   └── main.c               # MVP driver (runs a hardcoded program)
+│   ├── elf.h / elf.c        # minimal ELF32 loader
+│   └── main.c               # driver: load an ELF, or run the built-in demo
 ├── tests/
 │   └── hello.S              # sample RV32I program for the cross-toolchain
 ├── Makefile
