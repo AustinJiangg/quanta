@@ -131,6 +131,10 @@ static int check_header(const uint8_t *buf, size_t len) {
     return 0;
 }
 
+/* Cap on the guest memory we'll allocate for one image, so a malformed or
+ * hostile ELF can't ask us to calloc the world. */
+#define ELF_MEM_MAX (256u * 1024u * 1024u)
+
 int elf_load(const char *path, Memory *mem, uint32_t *entry) {
     size_t len;
     uint8_t *buf = read_file(path, &len);
@@ -152,7 +156,12 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry) {
         goto out;
     }
 
-    /* Walk the program-header table, loading each PT_LOAD segment. */
+    /* Pass 1: validate every PT_LOAD segment and measure the span of virtual
+     * addresses they cover. A real linker page-aligns the first segment to sit
+     * just below the entry (that segment carries the ELF headers), so the
+     * lowest vaddr is typically a page under -Ttext rather than -Ttext itself.
+     * We discover the range rather than assume a fixed base. */
+    uint64_t lo = UINT64_MAX, hi = 0;
     int loaded = 0;
     for (uint16_t i = 0; i < phnum; i++) {
         size_t ph = (size_t)phoff + (size_t)i * phentsize;
@@ -171,27 +180,20 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry) {
         uint32_t p_filesz = rd_u32(p + 16);
         uint32_t p_memsz  = rd_u32(p + 20);
 
-        /* The file bytes we're about to copy must actually be in the file. */
         if ((size_t)p_offset + p_filesz > len) {
             fprintf(stderr, "elf: segment file range out of bounds\n");
             goto out;
         }
-        /* The destination [p_vaddr, p_vaddr+p_memsz) must fit in guest memory.
-         * 64-bit arithmetic keeps the bound check honest near 0xffffffff. */
-        if ((uint64_t)p_vaddr < mem->base ||
-            (uint64_t)p_vaddr + p_memsz > (uint64_t)mem->base + mem->size) {
-            fprintf(stderr,
-                    "elf: segment [0x%08x,+0x%x) does not fit in guest memory "
-                    "[0x%08x,+0x%x)\n",
-                    p_vaddr, p_memsz, mem->base, mem->size);
+        if (p_filesz > p_memsz) {
+            fprintf(stderr, "elf: segment filesz exceeds memsz\n");
             goto out;
         }
 
-        /* Copy the file-backed part. The remaining [p_filesz, p_memsz) bytes
-         * are BSS; guest memory is zero-initialised at mem_init, so they are
-         * already zero and need no explicit clearing. */
-        if (p_filesz > 0) {
-            mem_load(mem, p_vaddr, buf + p_offset, p_filesz);
+        if (p_vaddr < lo) {
+            lo = p_vaddr;
+        }
+        if ((uint64_t)p_vaddr + p_memsz > hi) {
+            hi = (uint64_t)p_vaddr + p_memsz;
         }
         loaded++;
     }
@@ -200,10 +202,49 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry) {
         fprintf(stderr, "elf: no PT_LOAD segments to run\n");
         goto out;
     }
+    if (hi > 0x100000000ULL) {
+        fprintf(stderr, "elf: image extends beyond the 32-bit address space\n");
+        goto out;
+    }
+
+    /* Allocate guest memory to exactly span the load image. (No stack/heap
+     * headroom yet — the sample programs don't use a stack; a later milestone
+     * can grow this region and set up sp.) */
+    uint64_t span = hi - lo;
+    if (span == 0 || span > ELF_MEM_MAX) {
+        fprintf(stderr, "elf: implausible image size (%llu bytes)\n",
+                (unsigned long long)span);
+        goto out;
+    }
+    if (mem_init(mem, (uint32_t)lo, (uint32_t)span) != 0) {
+        fprintf(stderr, "elf: cannot allocate %llu bytes of guest memory\n",
+                (unsigned long long)span);
+        goto out;
+    }
+
+    /* Pass 2: copy each PT_LOAD segment to its virtual address. Bytes in
+     * [p_filesz, p_memsz) are BSS and are already zero from mem_init's calloc,
+     * so only the file-backed part is copied. Every vaddr is in range by
+     * construction — we sized memory to the span measured above. */
+    for (uint16_t i = 0; i < phnum; i++) {
+        const uint8_t *p = buf + (size_t)phoff + (size_t)i * phentsize;
+        if (rd_u32(p + 0) != PT_LOAD) {
+            continue;
+        }
+        uint32_t p_offset = rd_u32(p + 4);
+        uint32_t p_vaddr  = rd_u32(p + 8);
+        uint32_t p_filesz = rd_u32(p + 16);
+        if (p_filesz > 0) {
+            mem_load(mem, p_vaddr, buf + p_offset, p_filesz);
+        }
+    }
 
     uint32_t e_entry = rd_u32(buf + 24);
-    if (e_entry < mem->base || e_entry >= mem->base + mem->size) {
-        fprintf(stderr, "elf: entry 0x%08x outside guest memory\n", e_entry);
+    if (e_entry < mem->base ||
+        (uint64_t)e_entry >= (uint64_t)mem->base + mem->size) {
+        fprintf(stderr, "elf: entry 0x%08x outside the loaded image "
+                        "[0x%08x,+0x%x)\n", e_entry, mem->base, mem->size);
+        mem_free(mem);
         goto out;
     }
 

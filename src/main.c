@@ -63,26 +63,24 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    Memory mem;
-    if (mem_init(&mem, MEM_BASE, MEM_SIZE) != 0) {
-        fprintf(stderr, "failed to allocate guest memory\n");
-        return 1;
-    }
-
+    Memory mem = {0}; /* zero-init so mem_free is safe even if loading fails */
     int demo = (argc < 2);
     uint32_t entry;
 
     /* Set up the memory image first, since loading an ELF can fail. Doing it
      * before any stdout output keeps loader diagnostics (stderr) from
-     * interleaving with a half-printed banner. */
+     * interleaving with a half-printed banner. The demo uses a fixed region;
+     * for an ELF, the loader sizes guest memory to the program's load image. */
     if (demo) {
-        /* Load the built-in program at the base of memory. */
+        if (mem_init(&mem, MEM_BASE, MEM_SIZE) != 0) {
+            fprintf(stderr, "failed to allocate guest memory\n");
+            return 1;
+        }
         mem_load(&mem, MEM_BASE, (const uint8_t *)demo_program,
                  sizeof(demo_program));
         entry = MEM_BASE;
     } else {
         if (elf_load(argv[1], &mem, &entry) != 0) {
-            mem_free(&mem);
             return 1;
         }
     }

@@ -85,10 +85,13 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
 - Memory is little-endian; multi-byte access assembles bytes low-first.
 - The ELF loader only accepts static, little-endian RV32 `ET_EXEC` images
   (build with `-nostdlib -nostartfiles -Ttext=0x80000000`). PIE/`ET_DYN`
-  output won't load — there's no relocation handling — and every `PT_LOAD`
-  segment must fit the fixed 64 KiB region at `0x80000000`.
-- Guest memory is a fixed 64 KiB at `0x80000000` (`MEM_BASE`/`MEM_SIZE` in
-  `main.c`). BSS (`p_memsz > p_filesz`) reads back as zero only because that
+  output won't load — there's no relocation handling. The loader sizes guest
+  memory to span the program's `PT_LOAD` range; note the linker places the
+  first segment a page *below* `-Ttext` (≈`0x7ffff000`, it carries the ELF
+  headers), and the entry stays at `0x80000000`. There's no stack room yet.
+- The built-in demo uses a fixed 64 KiB region at `0x80000000`
+  (`MEM_BASE`/`MEM_SIZE` in `main.c`); an ELF gets a region sized to its load
+  image instead. BSS (`p_memsz > p_filesz`) reads back as zero because the
   region is zero-initialised at `mem_init`.
 - ECALL is a system call now, not a halt: it dispatches on the `a7` number
   (`write`=64, `exit`=93, `exit_group`=94 — RISC-V Linux/newlib numbers), with

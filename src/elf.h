@@ -18,13 +18,16 @@
  * ignored — they matter to linkers, not to running an already-linked image.
  */
 
-/* Load the ELF32 executable at `path` into `mem` and report its entry point
- * in `*entry`. `mem` must already be initialised; segments are copied to their
- * virtual addresses, which must fall within the mapped region.
+/* Load the ELF32 executable at `path`, reporting its entry point in `*entry`.
  *
- * Returns 0 on success, or -1 on any error (a diagnostic is printed to
- * stderr). On failure `mem` may have been partially written and `*entry` is
- * left unset. */
+ * On success `*mem` is allocated and initialised to span the program's load
+ * image — from the lowest PT_LOAD virtual address to the highest — every
+ * PT_LOAD segment is copied to its virtual address, and the caller owns `*mem`
+ * and must mem_free() it. `*mem` need not be initialised on entry; the loader
+ * discovers the load address from the ELF rather than assuming a fixed base.
+ *
+ * Returns 0 on success, or -1 on any error (a diagnostic is printed to stderr).
+ * On failure `*mem` is left unallocated and `*entry` is left unset. */
 int elf_load(const char *path, Memory *mem, uint32_t *entry);
 
 #endif /* QUANTA_ELF_H */
