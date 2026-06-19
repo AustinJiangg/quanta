@@ -56,25 +56,30 @@ sections. `riscv64-unknown-elf-readelf -l tests/hello.elf` shows what to load.
 
 ---
 
-## M2 — System calls (real output)
+## M2 — System calls (real output) (DONE)
 
 Give programs a way to interact with the outside world, starting with printing
-and a proper exit.
+and a proper exit. `src/syscall.{h,c}` is the new "kernel" side: ECALL traps
+into it, the syscall number in `a7` selects `write` (fd 1=stdout, 2=stderr) or
+`exit`/`exit_group`, and EBREAK — distinguished from ECALL by its immediate —
+stops the machine. The driver reports the exit status (and the halt reason for
+ebreak/traps).
 
-- [ ] **Build:** an ECALL handler driven by the syscall number in `a7`,
+- [x] **Build:** an ECALL handler driven by the syscall number in `a7`,
   implementing at least `write` (so programs can print to stdout) and `exit`
   (clean halt with a status code). Follow the RISC-V Linux/`newlib` syscall ABI
   for numbers and argument registers (`a0`–`a6`).
-- [ ] **ISA:** ECALL (replacing the M0 halt-on-any-system-instruction stub);
+- [x] **ISA:** ECALL (replacing the M0 halt-on-any-system-instruction stub);
   distinguish ECALL from EBREAK via the immediate field.
-- [ ] **Concept:** the user/kernel boundary; how syscalls pass a number and
+- [x] **Concept:** the user/kernel boundary; how syscalls pass a number and
   arguments in registers; the calling convention (ABI) layered on top of the
   raw ISA.
-- [ ] **Done when:** a "hello, world" C/asm program built for bare metal prints
+- [x] **Done when:** a "hello, world" C/asm program built for bare metal prints
   text and exits with a chosen status that the emulator reports.
-- [ ] **Commits:** `feat: dispatch ecall by syscall number`,
-  `feat: implement write and exit syscalls`,
-  `test: add hello-world syscall program`.
+- [x] **Commits:** `feat: dispatch ecall to write and exit syscalls`,
+  `feat: report exit status and halt reason`,
+  `test: add syscall test programs`,
+  `docs: document system-call support`.
 
 ---
 

@@ -11,11 +11,12 @@ discrete quantum of work.
 
 ## Status
 
-Milestone M1. The fetch/decode/execute core runs RV32I programs and prints the
-resulting register state, and it can now load real ELF32 executables
-(`quanta program.elf`). A built-in demo program runs when no ELF is given, so
-the emulator stays usable without the cross-toolchain. System calls (real
-output and a proper exit) are the next milestone (see Roadmap).
+Milestone M2. The fetch/decode/execute core runs RV32I programs, loads real
+ELF32 executables (`quanta program.elf`), and services system calls — programs
+print to stdout/stderr with `write` and terminate with `exit`, whose status
+code the emulator reports. A built-in demo program runs when no ELF is given,
+so the emulator stays usable without the cross-toolchain. Full RV32I
+conformance testing is the next milestone (see Roadmap).
 
 ## Tech stack
 
@@ -26,7 +27,7 @@ output and a proper exit) are the next milestone (see Roadmap).
 - **Make** — build orchestration.
 - **RISC-V cross-toolchain** (`gcc-riscv64-unknown-elf`) — optional, used to
   build real test programs for the emulator to run. Not needed to build or run
-  the MVP itself.
+  the emulator itself.
 - **GDB** — for debugging the emulator.
 
 The emulator itself is a native host binary (built with your system `gcc`).
@@ -75,12 +76,14 @@ riscv64-unknown-elf-objdump -d tests/hello.elf   # inspect the machine code
 ```
 quanta/
 ├── src/
-│   ├── cpu.h / cpu.c        # CPU state + fetch/decode/execute core
-│   ├── memory.h / memory.c  # flat little-endian address space
-│   ├── elf.h / elf.c        # minimal ELF32 loader
-│   └── main.c               # driver: load an ELF, or run the built-in demo
+│   ├── cpu.h / cpu.c          # CPU state + fetch/decode/execute core
+│   ├── memory.h / memory.c    # flat little-endian address space
+│   ├── elf.h / elf.c          # minimal ELF32 loader
+│   ├── syscall.h / syscall.c  # ECALL handling: write + exit syscalls
+│   └── main.c                 # driver: load an ELF, or run the built-in demo
 ├── tests/
-│   └── hello.S              # sample RV32I program for the cross-toolchain
+│   ├── hello.S                # arithmetic demo (mirrors the built-in program)
+│   └── hello_world.S          # syscall demo: prints via write, then exits
 ├── Makefile
 ├── README.md
 ├── ROADMAP.md               # milestone-based development plan / learning path
@@ -93,8 +96,9 @@ quanta/
 Development proceeds in milestones (M0–M7), each a runnable step that also
 teaches one architecture concept — from an ELF loader and syscalls through full
 RV32I conformance, the RV32M extension, a cache model, and a pipeline timing
-model. M0 (the current MVP) is done. See [ROADMAP.md](ROADMAP.md) for the full
-plan, acceptance criteria, and learning path.
+model. M0–M2 are done (core loop, ELF loader, system calls). See
+[ROADMAP.md](ROADMAP.md) for the full plan, acceptance criteria, and learning
+path.
 
 ## License
 

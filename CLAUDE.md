@@ -15,11 +15,12 @@ Quanta is a from-scratch RISC-V (RV32I) instruction-set emulator in C, built to
 learn computer architecture. It models a single hart: 32 registers, a PC, and a
 flat little-endian memory. The core is a fetch/decode/execute loop.
 
-Currently at milestone M1: loads RV32I ELF32 executables (`quanta program.elf`)
-and dumps register state, with a hardcoded built-in demo as a toolchain-free
-fallback when no ELF is given. No syscalls yet — ECALL still halts the machine.
-The full milestone plan and learning path live in `ROADMAP.md` — consult it for
-what comes next and tick boxes there as milestones land.
+Currently at milestone M2: loads RV32I ELF32 executables (`quanta program.elf`),
+runs them, and services system calls — `write` (real stdout/stderr output) and
+`exit` (clean termination with a status code) — through the ECALL path. A
+hardcoded built-in demo runs when no ELF is given. The full milestone plan and
+learning path live in `ROADMAP.md` — consult it for what comes next and tick
+boxes there as milestones land.
 
 ## Build / run / debug
 
@@ -57,9 +58,14 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
   headers, copies `PT_LOAD` segments to their virtual addresses, returns the
   entry point. Fields are read with explicit little-endian helpers (no struct
   overlay), so it stays host-endianness-independent.
+- `src/syscall.{h,c}` — the system-call layer (the "kernel" side of ECALL):
+  dispatches on the `a7` syscall number and implements `write` and `exit` per
+  the RISC-V Linux/newlib ABI.
 - `src/main.c` — driver: loads an ELF named on the command line, or runs the
   built-in demo program when none is given.
 - `tests/hello.S` — sample RV32I assembly, mirrors the built-in demo.
+- `tests/hello_world.S` — syscall demo: prints a string with `write`, then
+  `exit`s.
 
 ## Code style
 
@@ -84,6 +90,13 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
 - Guest memory is a fixed 64 KiB at `0x80000000` (`MEM_BASE`/`MEM_SIZE` in
   `main.c`). BSS (`p_memsz > p_filesz`) reads back as zero only because that
   region is zero-initialised at `mem_init`.
+- ECALL is a system call now, not a halt: it dispatches on the `a7` number
+  (`write`=64, `exit`=93, `exit_group`=94 — RISC-V Linux/newlib numbers), with
+  arguments in `a0`–`a2` and the result returned in `a0`. EBREAK, unknown
+  syscalls, and unimplemented SYSTEM instructions stop the machine instead. So
+  programs must terminate by calling `exit`; a bare `ecall` with a stale `a7`
+  (or running off the end of the code) trips an "unknown syscall" halt — which
+  is why the built-in demo and `tests/hello.S` end with an explicit `exit`.
 
 ## .claude/
 
