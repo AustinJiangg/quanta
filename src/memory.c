@@ -1,21 +1,23 @@
 #include "memory.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static void fatal_oob(uint32_t addr) {
-    fprintf(stderr, "memory access out of range: 0x%08x\n", addr);
-    exit(1);
-}
-
-/* Translate a guest address to an index into `data`, aborting if it (or the
- * `width` bytes starting there) falls outside the mapped region. */
-static uint32_t translate(const Memory *mem, uint32_t addr, uint32_t width) {
-    if (addr < mem->base || addr + width > mem->base + mem->size) {
-        fatal_oob(addr);
+/* Translate a guest address to an index into `data`. If the access (the
+ * address, or the `width` bytes starting there) falls outside the mapped
+ * region, record a fault in `mem` and return 0 instead of terminating the
+ * host: the caller reads back zero or drops the write, and the CPU turns the
+ * flag into a clean halt. The comparisons are arranged to avoid 32-bit wrap
+ * for regions sitting near the top of the address space. */
+static int translate(Memory *mem, uint32_t addr, uint32_t width, uint32_t *out) {
+    if (addr < mem->base || width > mem->size ||
+        addr - mem->base > mem->size - width) {
+        mem->fault      = 1;
+        mem->fault_addr = addr;
+        return 0;
     }
-    return addr - mem->base;
+    *out = addr - mem->base;
+    return 1;
 }
 
 int mem_init(Memory *mem, uint32_t base, uint32_t size) {
@@ -23,8 +25,10 @@ int mem_init(Memory *mem, uint32_t base, uint32_t size) {
     if (!mem->data) {
         return -1;
     }
-    mem->base = base;
-    mem->size = size;
+    mem->base       = base;
+    mem->size       = size;
+    mem->fault      = 0;
+    mem->fault_addr = 0;
     return 0;
 }
 
@@ -34,27 +38,32 @@ void mem_free(Memory *mem) {
     mem->size = 0;
 }
 
-/* Little-endian: byte 0 is least significant. */
-uint32_t mem_read32(const Memory *mem, uint32_t addr) {
-    uint32_t i = translate(mem, addr, 4);
+/* Little-endian: byte 0 is least significant. A faulting read returns 0. */
+uint32_t mem_read32(Memory *mem, uint32_t addr) {
+    uint32_t i;
+    if (!translate(mem, addr, 4, &i)) return 0;
     return (uint32_t)mem->data[i]
          | (uint32_t)mem->data[i + 1] << 8
          | (uint32_t)mem->data[i + 2] << 16
          | (uint32_t)mem->data[i + 3] << 24;
 }
 
-uint16_t mem_read16(const Memory *mem, uint32_t addr) {
-    uint32_t i = translate(mem, addr, 2);
+uint16_t mem_read16(Memory *mem, uint32_t addr) {
+    uint32_t i;
+    if (!translate(mem, addr, 2, &i)) return 0;
     return (uint16_t)(mem->data[i] | mem->data[i + 1] << 8);
 }
 
-uint8_t mem_read8(const Memory *mem, uint32_t addr) {
-    uint32_t i = translate(mem, addr, 1);
+uint8_t mem_read8(Memory *mem, uint32_t addr) {
+    uint32_t i;
+    if (!translate(mem, addr, 1, &i)) return 0;
     return mem->data[i];
 }
 
+/* A faulting store is dropped. */
 void mem_write32(Memory *mem, uint32_t addr, uint32_t value) {
-    uint32_t i = translate(mem, addr, 4);
+    uint32_t i;
+    if (!translate(mem, addr, 4, &i)) return;
     mem->data[i]     = (uint8_t)(value);
     mem->data[i + 1] = (uint8_t)(value >> 8);
     mem->data[i + 2] = (uint8_t)(value >> 16);
@@ -62,17 +71,21 @@ void mem_write32(Memory *mem, uint32_t addr, uint32_t value) {
 }
 
 void mem_write16(Memory *mem, uint32_t addr, uint16_t value) {
-    uint32_t i = translate(mem, addr, 2);
+    uint32_t i;
+    if (!translate(mem, addr, 2, &i)) return;
     mem->data[i]     = (uint8_t)(value);
     mem->data[i + 1] = (uint8_t)(value >> 8);
 }
 
 void mem_write8(Memory *mem, uint32_t addr, uint8_t value) {
-    uint32_t i = translate(mem, addr, 1);
+    uint32_t i;
+    if (!translate(mem, addr, 1, &i)) return;
     mem->data[i] = value;
 }
 
-void mem_load(Memory *mem, uint32_t addr, const uint8_t *src, size_t len) {
-    uint32_t i = translate(mem, addr, (uint32_t)len);
+int mem_load(Memory *mem, uint32_t addr, const uint8_t *src, size_t len) {
+    uint32_t i;
+    if (!translate(mem, addr, (uint32_t)len, &i)) return -1;
     memcpy(mem->data + i, src, len);
+    return 0;
 }

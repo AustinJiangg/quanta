@@ -145,8 +145,12 @@ int main(int argc, char **argv) {
             fprintf(stderr, "failed to allocate guest memory\n");
             return 1;
         }
-        mem_load(&mem, MEM_BASE, (const uint8_t *)demo_program,
-                 sizeof(demo_program));
+        if (mem_load(&mem, MEM_BASE, (const uint8_t *)demo_program,
+                     sizeof demo_program) != 0) {
+            fprintf(stderr, "failed to load demo program\n");
+            mem_free(&mem);
+            return 1;
+        }
         entry = MEM_BASE;
     } else {
         if (elf_load(path, &mem, &entry) != 0) {
@@ -195,11 +199,14 @@ int main(int argc, char **argv) {
     /* Any output the program writes via syscalls appears here, mid-run. */
     int steps = run_until_halt(&cpu, trace, pipe_on ? &pipe : NULL);
 
-    if (cpu.exited) {
+    if (cpu.halt_reason == HALT_EXIT) {
         printf("Program exited with code %u after %d instruction(s).\n\n",
                cpu.exit_code, steps);
     } else if (cpu.halted) {
-        printf("Halted (ebreak/trap) after %d instruction(s).\n\n", steps);
+        printf("Halted: %s", halt_reason_str(cpu.halt_reason));
+        if (cpu.halt_reason == HALT_MEM_FAULT)
+            printf(" at 0x%08x", mem.fault_addr);
+        printf(" after %d instruction(s).\n\n", steps);
     } else {
         printf("Stopped at the %d-instruction safety limit.\n\n", steps);
     }
@@ -230,7 +237,7 @@ int main(int argc, char **argv) {
      * qemu-user or spike): a clean exit returns its code, an abnormal stop
      * (ebreak/trap/limit) returns 1. `make check` relies on this to tell a
      * passing conformance test (exit 0) from a failing one. */
-    int status = cpu.exited ? (int)(cpu.exit_code & 0xffu) : 1;
+    int status = (cpu.halt_reason == HALT_EXIT) ? (int)(cpu.exit_code & 0xffu) : 1;
     if (cache_ready) cache_free(&cache);
     mem_free(&mem);
     return status;

@@ -17,8 +17,8 @@
  */
 
 /* Service the ECALL at the current PC: read the syscall number from a7, act on
- * it, and place any return value in a0. May set cpu->halted / cpu->exited (the
- * exit family stops the machine). */
+ * it, and place any return value in a0. May set cpu->halted and record a
+ * HaltReason (the exit family stops the machine). */
 void syscall_dispatch(CPU *cpu);
 
 #endif /* QUANTA_SYSCALL_H */

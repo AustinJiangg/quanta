@@ -246,8 +246,11 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry) {
         uint32_t p_offset = rd_u32(p + 4);
         uint32_t p_vaddr  = rd_u32(p + 8);
         uint32_t p_filesz = rd_u32(p + 16);
-        if (p_filesz > 0) {
-            mem_load(mem, p_vaddr, buf + p_offset, p_filesz);
+        if (p_filesz > 0 &&
+            mem_load(mem, p_vaddr, buf + p_offset, p_filesz) != 0) {
+            fprintf(stderr, "elf: segment does not fit guest memory\n");
+            mem_free(mem);
+            goto out;
         }
     }
 

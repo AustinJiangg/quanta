@@ -20,9 +20,9 @@ void cpu_init(CPU *cpu, Memory *mem, uint32_t entry_pc) {
     cpu->pc        = entry_pc;
     cpu->mem       = mem;
     cpu->cache     = NULL;
-    cpu->halted    = 0;
-    cpu->exited    = 0;
-    cpu->exit_code = 0;
+    cpu->halted      = 0;
+    cpu->halt_reason = HALT_NONE;
+    cpu->exit_code   = 0;
 }
 
 uint32_t reg_read(const CPU *cpu, uint32_t i) {
@@ -199,18 +199,29 @@ static void exec_system(CPU *cpu, uint32_t inst) {
             return;
         }
         if (funct12 == 0x001) { /* EBREAK */
+            cpu->halt_reason = HALT_EBREAK;
             cpu->halted = 1;
             return;
         }
     }
     fprintf(stderr, "unimplemented SYSTEM instruction 0x%08x at pc=0x%08x\n",
             inst, cpu->pc);
+    cpu->halt_reason = HALT_UNIMP_SYSTEM;
     cpu->halted = 1;
 }
 
 void cpu_step(CPU *cpu) {
+    /* Clear any stale fault; a faulting access this step sets it and we turn
+     * that into a halt rather than letting the access abort the host. */
+    cpu->mem->fault = 0;
+
     /* FETCH: read the 32-bit instruction word at PC. */
     uint32_t inst = mem_read32(cpu->mem, cpu->pc);
+    if (cpu->mem->fault) { /* unmapped fetch: stop before decoding garbage */
+        cpu->halt_reason = HALT_MEM_FAULT;
+        cpu->halted = 1;
+        return;
+    }
     uint32_t next_pc = cpu->pc + 4; /* default: fall through to next word */
 
     /* DECODE + EXECUTE: dispatch on the opcode field. */
@@ -268,8 +279,15 @@ void cpu_step(CPU *cpu) {
             fprintf(stderr,
                     "illegal/unimplemented instruction 0x%08x at pc=0x%08x\n",
                     inst, cpu->pc);
+            cpu->halt_reason = HALT_ILLEGAL_INSN;
             cpu->halted = 1;
             break;
+    }
+
+    if (cpu->mem->fault) { /* a load or store left the mapped region */
+        cpu->halt_reason = HALT_MEM_FAULT;
+        cpu->halted = 1;
+        return; /* don't commit PC past the faulting instruction */
     }
 
     cpu->pc = next_pc;
@@ -284,4 +302,17 @@ void cpu_dump(const CPU *cpu) {
         printf((i % 2) ? "\n" : "    ");
     }
     if (32 % 2) printf("\n");
+}
+
+const char *halt_reason_str(HaltReason r) {
+    switch (r) {
+        case HALT_NONE:            return "running";
+        case HALT_EXIT:            return "exit syscall";
+        case HALT_EBREAK:          return "ebreak";
+        case HALT_ILLEGAL_INSN:    return "illegal instruction";
+        case HALT_UNIMP_SYSTEM:    return "unimplemented system instruction";
+        case HALT_UNKNOWN_SYSCALL: return "unknown syscall";
+        case HALT_MEM_FAULT:       return "memory access out of range";
+    }
+    return "unknown";
 }

@@ -45,9 +45,9 @@ static void sys_write(CPU *cpu) {
 
 /* exit(code) / exit_group(code): record the status and stop the machine. */
 static void sys_exit(CPU *cpu) {
-    cpu->exit_code = reg_read(cpu, REG_A0);
-    cpu->exited    = 1;
-    cpu->halted    = 1;
+    cpu->exit_code   = reg_read(cpu, REG_A0);
+    cpu->halt_reason = HALT_EXIT;
+    cpu->halted      = 1;
 }
 
 void syscall_dispatch(CPU *cpu) {
@@ -65,6 +65,7 @@ void syscall_dispatch(CPU *cpu) {
              * contract, not something to paper over: report it and stop. */
             fprintf(stderr, "unknown syscall %u (a7) at pc=0x%08x\n",
                     num, cpu->pc);
+            cpu->halt_reason = HALT_UNKNOWN_SYSCALL;
             cpu->halted = 1;
             break;
     }
