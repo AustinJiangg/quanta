@@ -11,6 +11,7 @@
 #   make tests      build the sample RISC-V program -> tests/hello.elf
 #   make check      build and run the RV32I conformance suite
 #   make check-disasm  cross-check the disassembler against objdump
+#   make check-cache   check the cache model on a locality workload
 #   make debug      build with -g -O0 for stepping under gdb
 #   make clean      remove build artifacts
 
@@ -26,7 +27,7 @@ RVCFLAGS  ?= -march=rv32i -mabi=ilp32 -nostdlib -nostartfiles -Ttext=0x80000000
 SRC := $(wildcard src/*.c)
 BIN := quanta
 
-.PHONY: all run tests check check-disasm debug clean
+.PHONY: all run tests check check-disasm check-cache debug clean
 
 all: $(BIN)
 
@@ -71,6 +72,11 @@ check: $(BIN) $(CHECK_ELF)
 # the cross-toolchain for objdump; the script skips cleanly without it.
 check-disasm: $(BIN) $(TEST_ELF)
 	@sh tests/check_disasm.sh $(TEST_ELF)
+
+# Exercise the cache model: confirm it doesn't change program results and that
+# a smaller cache misses more on the array-traversal workload (tests/test_stack).
+check-cache: $(BIN) tests/test_stack.elf
+	@sh tests/check_cache.sh
 
 debug: CFLAGS := -std=c11 -Wall -Wextra -g -O0 -Isrc
 debug: clean $(BIN)
