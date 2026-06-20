@@ -1,9 +1,12 @@
 #include "cpu.h"
 #include "memory.h"
 #include "elf.h"
+#include "decode.h"
+#include "disasm.h"
 
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 
 /*
  * Quanta driver.
@@ -45,26 +48,66 @@ static const uint32_t demo_program[] = {
     0x00000073  /* ecall              -> exit(0)           */
 };
 
+/* Execute one instruction and narrate it to stderr: the PC, the raw word, its
+ * disassembly, and any register the step changed (with the new value), plus the
+ * redirect target when control does not simply fall through. Trace goes to
+ * stderr so it stays separate from whatever the guest prints via the write
+ * syscall on stdout. cpu_step() itself is untouched — "what changed" is
+ * recovered by diffing a register snapshot taken around the step. */
+static void trace_step(CPU *cpu) {
+    uint32_t pc   = cpu->pc;
+    uint32_t inst = mem_read32(cpu->mem, pc);
+    uint32_t before[32];
+    for (int i = 0; i < 32; i++) before[i] = cpu->regs[i];
+
+    char text[80];
+    disasm(pc, inst, text, sizeof text);
+
+    cpu_step(cpu);
+
+    fprintf(stderr, "%08x:  %08x  %-24s", pc, inst, text);
+    for (int i = 1; i < 32; i++) /* x0 is hardwired; it can never change */
+        if (cpu->regs[i] != before[i])
+            fprintf(stderr, " %s=0x%08x", reg_abi_name((uint32_t)i), cpu->regs[i]);
+    if (cpu->pc != pc + 4) /* taken branch, jump, or trap */
+        fprintf(stderr, " ->0x%08x", cpu->pc);
+    fprintf(stderr, "\n");
+}
+
 /* Step until the program halts, or a safety limit is hit so a buggy program
- * can never spin forever. Returns the number of instructions executed. */
-static int run_until_halt(CPU *cpu) {
+ * can never spin forever. With trace set, narrate each instruction to stderr.
+ * Returns the number of instructions executed. */
+static int run_until_halt(CPU *cpu, int trace) {
     int steps = 0;
     const int max_steps = 1000;
     while (!cpu->halted && steps < max_steps) {
-        cpu_step(cpu);
+        if (trace) trace_step(cpu);
+        else       cpu_step(cpu);
         steps++;
     }
     return steps;
 }
 
 int main(int argc, char **argv) {
-    if (argc > 2) {
-        fprintf(stderr, "usage: %s [program.elf]\n", argv[0]);
-        return 2;
+    int trace = 0;
+    const char *path = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--trace") == 0) {
+            trace = 1;
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            fprintf(stderr, "usage: %s [--trace] [program.elf]\n", argv[0]);
+            return 2;
+        } else if (path == NULL) {
+            path = argv[i];
+        } else {
+            fprintf(stderr, "usage: %s [--trace] [program.elf]\n", argv[0]);
+            return 2;
+        }
     }
 
     Memory mem = {0}; /* zero-init so mem_free is safe even if loading fails */
-    int demo = (argc < 2);
+    int demo = (path == NULL);
     uint32_t entry;
 
     /* Set up the memory image first, since loading an ELF can fail. Doing it
@@ -80,7 +123,7 @@ int main(int argc, char **argv) {
                  sizeof(demo_program));
         entry = MEM_BASE;
     } else {
-        if (elf_load(argv[1], &mem, &entry) != 0) {
+        if (elf_load(path, &mem, &entry) != 0) {
             return 1;
         }
     }
@@ -89,14 +132,14 @@ int main(int argc, char **argv) {
     if (demo) {
         printf("No ELF given; running the built-in demo program.\n\n");
     } else {
-        printf("Loaded %s (entry = 0x%08x)\n\n", argv[1], entry);
+        printf("Loaded %s (entry = 0x%08x)\n\n", path, entry);
     }
 
     CPU cpu;
     cpu_init(&cpu, &mem, entry);
 
     /* Any output the program writes via syscalls appears here, mid-run. */
-    int steps = run_until_halt(&cpu);
+    int steps = run_until_halt(&cpu, trace);
 
     if (cpu.exited) {
         printf("Program exited with code %u after %d instruction(s).\n\n",
