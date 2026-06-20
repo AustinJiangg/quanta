@@ -142,7 +142,14 @@ void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
         }
     }
 
-    case OP_REG:
+    case OP_REG: {
+        if (f7 == 0x01) { /* RV32M: multiply/divide share the OP opcode */
+            static const char *m[8] = {
+                "mul", "mulh", "mulhsu", "mulhu", "div", "divu", "rem", "remu"
+            };
+            snprintf(buf, buflen, "%s %s,%s,%s", m[f3], d, s1, s2);
+            return;
+        }
         switch (f3) {
         case 0x0:
             if (f7 == 0x20) {
@@ -169,6 +176,7 @@ void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
         case 0x7: snprintf(buf, buflen, "and %s,%s,%s", d, s1, s2); return;
         default:  snprintf(buf, buflen, ".word 0x%08x", inst); return;
         }
+    }
 
     case OP_SYSTEM: {
         uint32_t f12 = inst >> 20;
