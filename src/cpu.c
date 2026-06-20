@@ -89,6 +89,7 @@ enum {
     OP_BRANCH = 0x63, /* BEQ/BNE/BLT/BGE/BLTU/BGEU */
     OP_LOAD   = 0x03, /* LB/LH/LW/LBU/LHU         */
     OP_STORE  = 0x23, /* SB/SH/SW                 */
+    OP_FENCE  = 0x0f, /* FENCE / FENCE.I          */
     OP_IMM    = 0x13, /* ADDI/SLTI/.../SRAI       */
     OP_REG    = 0x33, /* ADD/SUB/.../AND          */
     OP_SYSTEM = 0x73  /* ECALL/EBREAK             */
@@ -274,6 +275,12 @@ void cpu_step(CPU *cpu) {
 
         case OP_STORE:
             exec_store(cpu, inst);
+            break;
+
+        case OP_FENCE:
+            /* FENCE / FENCE.I: memory- and instruction-ordering hints. A single
+             * hart that executes in program order, with no modelled instruction
+             * cache, has nothing to reorder, so these are no-ops (PC += 4). */
             break;
 
         case OP_SYSTEM:
