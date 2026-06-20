@@ -24,7 +24,7 @@ RVCFLAGS  ?= -march=rv32i -mabi=ilp32 -nostdlib -nostartfiles -Ttext=0x80000000
 SRC := $(wildcard src/*.c)
 BIN := quanta
 
-.PHONY: all run tests debug clean
+.PHONY: all run tests check debug clean
 
 all: $(BIN)
 
@@ -44,6 +44,20 @@ tests: $(TEST_ELF)
 tests/%.elf: tests/%.S
 	$(RVCC) $(RVCFLAGS) -o $@ $<
 	@echo "Built $@ — disassemble with: $(RVOBJDUMP) -d $@"
+
+# Run the RV32I conformance suite (tests/test_*.S) through the emulator. Each
+# test exits 0 on success or the number of its first failed check, which quanta
+# propagates as its own exit status; we use that to print PASS/FAIL per file.
+CHECK_ELF := $(patsubst %.S,%.elf,$(wildcard tests/test_*.S))
+
+check: $(BIN) $(CHECK_ELF)
+	@fail=0; \
+	for t in $(CHECK_ELF); do \
+		./$(BIN) $$t >/dev/null 2>&1; rc=$$?; \
+		if [ $$rc -eq 0 ]; then echo "PASS  $$t"; \
+		else echo "FAIL  $$t (check $$rc)"; fail=1; fi; \
+	done; \
+	if [ $$fail -ne 0 ]; then echo "FAILED"; exit 1; else echo "all RV32I tests passed"; fi
 
 debug: CFLAGS := -std=c11 -Wall -Wextra -g -O0 -Isrc
 debug: clean $(BIN)
