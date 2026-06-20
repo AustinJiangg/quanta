@@ -144,21 +144,29 @@ observability they need.
 
 ---
 
-## M5 — RV32M (multiply / divide)
+## M5 — RV32M (multiply / divide) (DONE)
 
-The first ISA *extension*, showing how RISC-V is modular.
+The first ISA *extension*, showing how RISC-V is modular. RV32M reuses the OP
+opcode and is selected purely by `funct7 = 0x01`, so `cpu.c` dispatches into a
+new `exec_muldiv`: MUL/MULH(SU/U) form a 64-bit intermediate product (the three
+high-half variants differ only in each operand's sign- vs zero-extension), and
+DIV(U)/REM(U) return the spec's *defined* results for divide-by-zero and the
+`INT_MIN / -1` signed overflow instead of trapping. The disassembler gained the
+eight mnemonics, and `tests/test_muldiv.S` — assembled with `-march=rv32im` via
+a per-target Makefile override — pins the semantics; both `make check` and `make
+check-disasm` cover it.
 
-- [ ] **Build:** the M extension — MUL, MULH(SU/U), DIV(U), REM(U) — including
+- [x] **Build:** the M extension — MUL, MULH(SU/U), DIV(U), REM(U) — including
   the spec-mandated results for divide-by-zero and signed overflow.
-- [ ] **ISA:** RV32M (the OP opcode with `funct7 = 0x01`).
-- [ ] **Concept:** ISA modularity (base + optional extensions); why
+- [x] **ISA:** RV32M (the OP opcode with `funct7 = 0x01`).
+- [x] **Concept:** ISA modularity (base + optional extensions); why
   multiply/divide are separable; defined behaviour for exceptional arithmetic
   instead of faulting.
-- [ ] **Done when:** programs using `*`, `/`, `%` (compiled with
+- [x] **Done when:** programs using `*`, `/`, `%` (compiled with
   `-march=rv32im`) produce correct results, including the div-by-zero cases.
-- [ ] **Commits:** `feat: add RV32M multiply instructions`,
-  `feat: add RV32M divide and remainder`,
-  `test: cover div-by-zero and overflow`.
+- [x] **Commits:** `feat: add RV32M multiply and divide`,
+  `feat: disassemble RV32M instructions`,
+  `test: add RV32M conformance suite`, `docs: document RV32M support`.
 
 ---
 

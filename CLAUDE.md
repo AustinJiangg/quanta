@@ -15,8 +15,9 @@ Quanta is a from-scratch RISC-V (RV32I) instruction-set emulator in C, built to
 learn computer architecture. It models a single hart: 32 registers, a PC, and a
 flat little-endian memory. The core is a fetch/decode/execute loop.
 
-Currently at milestone M4: the full RV32I base integer set is implemented and
-pinned by a hand-written conformance suite (`make check`). Quanta loads ELF32
+Currently at milestone M5: the full RV32I base integer set plus the RV32M
+multiply/divide extension are implemented and pinned by a hand-written
+conformance suite (`make check`). Quanta loads ELF32
 executables (`quanta program.elf`), services `write`/`exit` system calls through
 the ECALL path, and returns the guest's exit status as its own. A hardcoded
 built-in demo runs when no ELF is given. A disassembler plus a `--trace` flag
@@ -52,7 +53,9 @@ program.
   load and run. Used only by `make tests`; not required to build or run the
   emulator itself, since the built-in demo needs no ELF.
 
-When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
+When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
+(the RV32M test uses `-march=rv32im`; the Makefile overrides `RVCFLAGS` for just
+`tests/test_muldiv.elf`).
 
 ## Code layout
 
@@ -62,7 +65,9 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
   `static inline`. The executor and the disassembler decode through this, so
   they can't disagree about an instruction's layout.
 - `src/cpu.{h,c}` — CPU state and the instruction core. Each instruction group
-  has its own `exec_*` function; decoding comes from `decode.h`.
+  has its own `exec_*` function; decoding comes from `decode.h`. RV32M
+  (multiply/divide) shares the OP opcode and lives in `exec_muldiv`, selected by
+  `funct7 == 0x01`.
 - `src/disasm.{h,c}` — RV32I disassembler: turns an instruction word back into
   objdump-style assembly (ABI names, common pseudo-instructions, absolute
   branch/jump targets). Mirrors `cpu_step`'s opcode switch over `decode.h`.
@@ -125,6 +130,12 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
   outside base RV32I: CSRs currently halt as "unimplemented SYSTEM", and
   that's why conformance uses the hand-written `make check` suite rather than
   the official `riscv-tests` (whose `-p` environment needs CSR/trap support).
+- RV32M (M5) is the one extension wired in so far: it shares the OP opcode and
+  is selected by `funct7 == 0x01` (`exec_muldiv` in `cpu.c`, mirrored in
+  `disasm.c`). Divide-by-zero and the `INT_MIN / -1` signed overflow return
+  *defined* values rather than trapping. Its test must be assembled with
+  `-march=rv32im`, so the Makefile overrides `RVCFLAGS` for
+  `tests/test_muldiv.elf` only.
 - `--trace` writes to stderr, leaving the guest's own stdout (`write`) clean;
   "changed registers" are recovered by diffing a register snapshot taken around
   `cpu_step`, so the core isn't instrumented. The disassembler prints the common

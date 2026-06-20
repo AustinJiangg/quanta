@@ -11,17 +11,17 @@ discrete quantum of work.
 
 ## Status
 
-Milestone M4. The fetch/decode/execute core runs the full RV32I base integer
-instruction set, loads real ELF32 executables (`quanta program.elf`), and
-services system calls — programs print with `write` and terminate with `exit`,
+Milestone M5. The fetch/decode/execute core runs the full RV32I base integer
+instruction set plus the RV32M multiply/divide extension, loads real ELF32
+executables (`quanta program.elf`), and services system calls — programs print with `write` and terminate with `exit`,
 whose status the emulator returns as its own exit code. A hand-written
 conformance suite (`make check`) covers every instruction group. A built-in
 demo runs when no ELF is given, so the emulator stays usable without the
 cross-toolchain. A disassembler and a `--trace` mode make execution
 observable: `quanta --trace program.elf` narrates each instruction with its
 disassembly and the registers it changed, and `make check-disasm` pins that
-disassembly to `objdump`. Up next (see Roadmap): the RV32M multiply/divide
-extension.
+disassembly to `objdump`. Up next (see Roadmap): an optional cache model that
+starts measuring memory-hierarchy performance.
 
 ## Tech stack
 
@@ -115,9 +115,9 @@ quanta/
 Development proceeds in milestones (M0–M7), each a runnable step that also
 teaches one architecture concept — from an ELF loader and syscalls through full
 RV32I conformance, the RV32M extension, a cache model, and a pipeline timing
-model. M0–M4 are done (core loop, ELF loader, system calls, RV32I conformance,
-disassembler + trace mode). See [ROADMAP.md](ROADMAP.md) for the full plan,
-acceptance criteria, and learning path.
+model. M0–M5 are done (core loop, ELF loader, system calls, RV32I conformance,
+disassembler + trace mode, RV32M extension). See [ROADMAP.md](ROADMAP.md) for
+the full plan, acceptance criteria, and learning path.
 
 ## License
 
