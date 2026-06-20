@@ -4,6 +4,7 @@
 #include "decode.h"
 #include "disasm.h"
 #include "cache.h"
+#include "pipeline.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -78,15 +79,20 @@ static void trace_step(CPU *cpu) {
 /* Step until the program halts, or a safety limit is hit so a buggy program
  * can never spin forever. With trace set, narrate each instruction to stderr.
  * Returns the number of instructions executed. */
-static int run_until_halt(CPU *cpu, int trace) {
+static int run_until_halt(CPU *cpu, int trace, Pipeline *pipe) {
     int steps = 0;
     /* A generous runaway guard: high enough to let real workloads (loops over
      * arrays, deep call chains) run to completion, low enough that a program
      * that never halts still stops in about a second instead of hanging. */
     const int max_steps = 100 * 1000 * 1000;
     while (!cpu->halted && steps < max_steps) {
+        uint32_t pc   = cpu->pc;
+        uint32_t inst = pipe ? mem_read32(cpu->mem, pc) : 0;
         if (trace) trace_step(cpu);
         else       cpu_step(cpu);
+        /* Feed the timing model the retired instruction and whether control
+         * left the fall-through path (a taken branch or a jump). */
+        if (pipe) pipeline_observe(pipe, inst, cpu->pc != pc + 4);
         steps++;
     }
     return steps;
@@ -95,6 +101,7 @@ static int run_until_halt(CPU *cpu, int trace) {
 int main(int argc, char **argv) {
     int trace = 0;
     int cache_on = 0;
+    int pipe_on = 0;
     uint32_t csize = 1024, cways = 2, cblock = 32; /* default L1 geometry */
     const char *path = NULL;
     for (int i = 1; i < argc; i++) {
@@ -109,16 +116,18 @@ int main(int argc, char **argv) {
                         "(want SIZE:WAYS:BLOCK, e.g. 1024:2:32)\n", argv[i] + 8);
                 return 2;
             }
+        } else if (strcmp(argv[i], "--pipeline") == 0) {
+            pipe_on = 1;
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             fprintf(stderr, "usage: %s [--trace] [--cache[=SIZE:WAYS:BLOCK]] "
-                    "[program.elf]\n", argv[0]);
+                    "[--pipeline] [program.elf]\n", argv[0]);
             return 2;
         } else if (path == NULL) {
             path = argv[i];
         } else {
             fprintf(stderr, "usage: %s [--trace] [--cache[=SIZE:WAYS:BLOCK]] "
-                    "[program.elf]\n", argv[0]);
+                    "[--pipeline] [program.elf]\n", argv[0]);
             return 2;
         }
     }
@@ -178,8 +187,13 @@ int main(int argc, char **argv) {
         cache_ready = 1;
     }
 
+    /* Optional pipeline timing model: another overlay (it reads the retired
+     * instruction stream, never the data), reported alongside the cache. */
+    Pipeline pipe;
+    if (pipe_on) pipeline_init(&pipe);
+
     /* Any output the program writes via syscalls appears here, mid-run. */
-    int steps = run_until_halt(&cpu, trace);
+    int steps = run_until_halt(&cpu, trace, pipe_on ? &pipe : NULL);
 
     if (cpu.exited) {
         printf("Program exited with code %u after %d instruction(s).\n\n",
@@ -192,6 +206,11 @@ int main(int argc, char **argv) {
 
     if (cache_ready) {
         cache_report(&cache, stdout);
+        printf("\n");
+    }
+
+    if (pipe_on) {
+        pipeline_report(&pipe, stdout);
         printf("\n");
     }
 
