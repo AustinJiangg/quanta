@@ -86,6 +86,9 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
 - `tests/test_framework.h` + `tests/test_*.S` — the RV32I conformance suite:
   per-group assertion programs that exit 0 on success or the failing check's
   id. `make check` runs them and reads quanta's propagated exit code.
+- `tests/test_stack.S` — exercises the loader-initialised stack (a non-leaf
+  function spilling `ra` and callee-saved registers) and a small array-traversal
+  workload; part of `make check`, and a seed for the M6 cache benchmark.
 - `tests/check_disasm.sh` — runs each sample ELF under `--trace` and diffs the
   disassembly against `objdump` (`make check-disasm`).
 
@@ -111,7 +114,10 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
   output won't load — there's no relocation handling. The loader sizes guest
   memory to span the program's `PT_LOAD` range; note the linker places the
   first segment a page *below* `-Ttext` (≈`0x7ffff000`, it carries the ELF
-  headers), and the entry stays at `0x80000000`. There's no stack room yet.
+  headers), and the entry stays at `0x80000000`. Above the image the loader
+  reserves a 64 KiB stack block (`GUEST_STACK_SIZE`), and `main.c` sets `sp` to
+  the top of the region (16-byte aligned) — for both the demo and an ELF — so
+  programs can call functions and spill locals.
 - The built-in demo uses a fixed 64 KiB region at `0x80000000`
   (`MEM_BASE`/`MEM_SIZE` in `main.c`); an ELF gets a region sized to its load
   image instead. BSS (`p_memsz > p_filesz`) reads back as zero because the
@@ -125,6 +131,9 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
   is why the built-in demo and `tests/hello.S` end with an explicit `exit`.
   Quanta returns the guest's exit code as its own process status (abnormal
   stops return 1), which is how `make check` tells pass from fail.
+- `run_until_halt` (in `main.c`) caps a run at 100M instructions as a runaway
+  guard: a program that never calls `exit` stops there, reports the limit, and
+  returns 1. Raise the cap if a workload legitimately needs more.
 - FENCE (MISC-MEM opcode `0x0f`) is a no-op — a single in-order hart has
   nothing to reorder. CSR instructions (Zicsr) and FENCE.I (Zifencei) are
   outside base RV32I: CSRs currently halt as "unimplemented SYSTEM", and

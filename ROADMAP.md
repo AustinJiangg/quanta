@@ -170,6 +170,19 @@ check-disasm` cover it.
 
 ---
 
+### Infrastructure interlude — a stack and real workloads
+
+Before the performance milestones, two MVP-era limits were lifted so non-trivial
+programs can run. The ELF loader now reserves a 64 KiB stack block above the
+load image and `main.c` initialises `sp` to the top of the guest region, so
+programs can make function calls and spill locals (the ISA reset state had
+`sp = 0`, which faulted on the first push). And the per-run instruction cap was
+raised from 1000 to 100M so loop-heavy workloads run to completion.
+`tests/test_stack.S` validates the stack — a non-leaf function spilling to it —
+and doubles as a small array-traversal workload for the cache model below.
+
+---
+
 ## M6 — Memory hierarchy: a cache model
 
 Cross from "correct execution" into *performance* architecture — the area most

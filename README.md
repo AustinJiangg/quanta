@@ -20,8 +20,10 @@ demo runs when no ELF is given, so the emulator stays usable without the
 cross-toolchain. A disassembler and a `--trace` mode make execution
 observable: `quanta --trace program.elf` narrates each instruction with its
 disassembly and the registers it changed, and `make check-disasm` pins that
-disassembly to `objdump`. Up next (see Roadmap): an optional cache model that
-starts measuring memory-hierarchy performance.
+disassembly to `objdump`. Loaded programs run with a loader-initialised stack
+(sp set to the top of their memory image), so they can call functions and use
+locals. Up next (see Roadmap): an optional cache model that starts measuring
+memory-hierarchy performance.
 
 ## Tech stack
 
