@@ -11,12 +11,14 @@ discrete quantum of work.
 
 ## Status
 
-Milestone M2. The fetch/decode/execute core runs RV32I programs, loads real
-ELF32 executables (`quanta program.elf`), and services system calls — programs
-print to stdout/stderr with `write` and terminate with `exit`, whose status
-code the emulator reports. A built-in demo program runs when no ELF is given,
-so the emulator stays usable without the cross-toolchain. Full RV32I
-conformance testing is the next milestone (see Roadmap).
+Milestone M3. The fetch/decode/execute core runs the full RV32I base integer
+instruction set, loads real ELF32 executables (`quanta program.elf`), and
+services system calls — programs print with `write` and terminate with `exit`,
+whose status the emulator returns as its own exit code. A hand-written
+conformance suite (`make check`) covers every instruction group. A built-in
+demo runs when no ELF is given, so the emulator stays usable without the
+cross-toolchain. A disassembler and instruction trace mode (M4) are next
+(see Roadmap).
 
 ## Tech stack
 
@@ -52,7 +54,8 @@ Other targets:
 ```sh
 make          # build ./quanta
 make debug    # build with -g -O0 for gdb
-make tests    # build tests/hello.elf with the RISC-V cross-toolchain
+make tests    # build the sample RISC-V programs (needs the cross-toolchain)
+make check    # build and run the RV32I conformance suite
 make clean    # remove build artifacts
 ```
 
@@ -83,7 +86,9 @@ quanta/
 │   └── main.c                 # driver: load an ELF, or run the built-in demo
 ├── tests/
 │   ├── hello.S                # arithmetic demo (mirrors the built-in program)
-│   └── hello_world.S          # syscall demo: prints via write, then exits
+│   ├── hello_world.S          # syscall demo: prints via write, then exits
+│   ├── test_framework.h       # CHECK/exit-code harness for conformance tests
+│   └── test_*.S               # RV32I conformance suite (run by `make check`)
 ├── Makefile
 ├── README.md
 ├── ROADMAP.md               # milestone-based development plan / learning path
@@ -96,9 +101,9 @@ quanta/
 Development proceeds in milestones (M0–M7), each a runnable step that also
 teaches one architecture concept — from an ELF loader and syscalls through full
 RV32I conformance, the RV32M extension, a cache model, and a pipeline timing
-model. M0–M2 are done (core loop, ELF loader, system calls). See
-[ROADMAP.md](ROADMAP.md) for the full plan, acceptance criteria, and learning
-path.
+model. M0–M3 are done (core loop, ELF loader, system calls, RV32I conformance).
+See [ROADMAP.md](ROADMAP.md) for the full plan, acceptance criteria, and
+learning path.
 
 ## License
 

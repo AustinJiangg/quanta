@@ -83,23 +83,30 @@ ebreak/traps).
 
 ---
 
-## M3 — Full RV32I conformance
+## M3 — Full RV32I conformance (DONE)
 
 Make sure every base-integer instruction is correct, not just the demo subset.
+A hand-written conformance suite (`tests/test_*.S`, run by `make check`)
+exercises each instruction group's easy-to-miss semantics and signals the first
+failed check through its exit code, which quanta now propagates. The official
+`riscv-tests` were *not* used: their `-p` environment needs CSR/trap support
+that belongs to a later privileged-mode milestone. The audit confirmed the
+arithmetic, branch, load/store, jump and upper-immediate cores were already
+correct, and found one gap — FENCE wasn't decoded — now run as a no-op.
 
-- [ ] **Build:** audit each RV32I instruction against the spec; fix edge cases
+- [x] **Build:** audit each RV32I instruction against the spec; fix edge cases
   (shift-amount masking, signed vs unsigned comparisons, sign-extension on
   loads, JALR clearing the low bit, branch offset arithmetic). Add a focused
   test per instruction group.
-- [ ] **ISA:** the complete RV32I set, with attention to the easy-to-miss
+- [x] **ISA:** the complete RV32I set, with attention to the easy-to-miss
   semantics rather than new opcodes.
-- [ ] **Concept:** why ISA specs are precise about corner cases; the cost of
+- [x] **Concept:** why ISA specs are precise about corner cases; the cost of
   ambiguity in hardware; how a conformance suite pins down behaviour.
-- [ ] **Done when:** the project passes the relevant `riscv-tests` (or a hand-
+- [x] **Done when:** the project passes the relevant `riscv-tests` (or a hand-
   written equivalent) for RV32I — each test program runs to its success exit.
-- [ ] **Commits:** one `test:` or `fix:` commit per instruction group as issues
-  are found (e.g. `fix: mask shift amount to 5 bits`,
-  `test: cover signed branch comparisons`).
+- [x] **Commits:** `feat: propagate guest exit status as the process exit code`,
+  `test: add rv32i conformance suite`, `fix: execute fence as a no-op`,
+  `docs: document the rv32i conformance suite`.
 
 Reference: the official `riscv-software-src/riscv-tests` repository; the
 RISC-V Unprivileged ISA spec, Vol. 1.

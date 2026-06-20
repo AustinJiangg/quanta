@@ -15,12 +15,13 @@ Quanta is a from-scratch RISC-V (RV32I) instruction-set emulator in C, built to
 learn computer architecture. It models a single hart: 32 registers, a PC, and a
 flat little-endian memory. The core is a fetch/decode/execute loop.
 
-Currently at milestone M2: loads RV32I ELF32 executables (`quanta program.elf`),
-runs them, and services system calls — `write` (real stdout/stderr output) and
-`exit` (clean termination with a status code) — through the ECALL path. A
-hardcoded built-in demo runs when no ELF is given. The full milestone plan and
-learning path live in `ROADMAP.md` — consult it for what comes next and tick
-boxes there as milestones land.
+Currently at milestone M3: the full RV32I base integer set is implemented and
+pinned by a hand-written conformance suite (`make check`). Quanta loads ELF32
+executables (`quanta program.elf`), services `write`/`exit` system calls through
+the ECALL path, and returns the guest's exit status as its own. A hardcoded
+built-in demo runs when no ELF is given. The full milestone plan and learning
+path live in `ROADMAP.md` — consult it for what comes next and tick boxes there
+as milestones land.
 
 ## Build / run / debug
 
@@ -28,7 +29,8 @@ boxes there as milestones land.
 make          # build ./quanta (native host binary)
 make run      # build and run the built-in demo program
 make debug    # build with -g -O0 for gdb
-make tests    # build tests/hello.elf (needs RISC-V cross-toolchain)
+make tests    # build the sample RISC-V programs (needs cross-toolchain)
+make check    # build and run the RV32I conformance suite (needs cross-toolchain)
 make clean
 ```
 
@@ -66,6 +68,9 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
 - `tests/hello.S` — sample RV32I assembly, mirrors the built-in demo.
 - `tests/hello_world.S` — syscall demo: prints a string with `write`, then
   `exit`s.
+- `tests/test_framework.h` + `tests/test_*.S` — the RV32I conformance suite:
+  per-group assertion programs that exit 0 on success or the failing check's
+  id. `make check` runs them and reads quanta's propagated exit code.
 
 ## Code style
 
@@ -100,6 +105,13 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
   programs must terminate by calling `exit`; a bare `ecall` with a stale `a7`
   (or running off the end of the code) trips an "unknown syscall" halt — which
   is why the built-in demo and `tests/hello.S` end with an explicit `exit`.
+  Quanta returns the guest's exit code as its own process status (abnormal
+  stops return 1), which is how `make check` tells pass from fail.
+- FENCE (MISC-MEM opcode `0x0f`) is a no-op — a single in-order hart has
+  nothing to reorder. CSR instructions (Zicsr) and FENCE.I (Zifencei) are
+  outside base RV32I: CSRs currently halt as "unimplemented SYSTEM", and
+  that's why conformance uses the hand-written `make check` suite rather than
+  the official `riscv-tests` (whose `-p` environment needs CSR/trap support).
 
 ## .claude/
 
