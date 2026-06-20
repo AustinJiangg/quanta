@@ -1,6 +1,7 @@
 #include "cpu.h"
 #include "decode.h"
 #include "syscall.h"
+#include "cache.h"
 
 #include <stdio.h>
 
@@ -18,6 +19,7 @@ void cpu_init(CPU *cpu, Memory *mem, uint32_t entry_pc) {
     for (int i = 0; i < 32; i++) cpu->regs[i] = 0;
     cpu->pc        = entry_pc;
     cpu->mem       = mem;
+    cpu->cache     = NULL;
     cpu->halted    = 0;
     cpu->exited    = 0;
     cpu->exit_code = 0;
@@ -159,6 +161,8 @@ static void exec_load(CPU *cpu, uint32_t inst) {
     uint32_t addr = reg_read(cpu, rs1(inst)) + (uint32_t)imm_i(inst);
     uint32_t result = 0;
 
+    if (cpu->cache) cache_access(cpu->cache, addr, 0); /* observe, don't alter */
+
     switch (funct3(inst)) {
         case 0x0: result = (uint32_t)(int8_t)mem_read8(cpu->mem, addr); break;  /* LB  */
         case 0x1: result = (uint32_t)(int16_t)mem_read16(cpu->mem, addr); break;/* LH  */
@@ -173,6 +177,8 @@ static void exec_load(CPU *cpu, uint32_t inst) {
 static void exec_store(CPU *cpu, uint32_t inst) {
     uint32_t addr = reg_read(cpu, rs1(inst)) + (uint32_t)imm_s(inst);
     uint32_t val  = reg_read(cpu, rs2(inst));
+
+    if (cpu->cache) cache_access(cpu->cache, addr, 1); /* observe, don't alter */
 
     switch (funct3(inst)) {
         case 0x0: mem_write8 (cpu->mem, addr, (uint8_t)val);  break; /* SB */
