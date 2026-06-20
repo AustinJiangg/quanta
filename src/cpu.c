@@ -56,8 +56,62 @@ static void exec_op_imm(CPU *cpu, uint32_t inst) {
     reg_write(cpu, rd(inst), result);
 }
 
-/* Execute OP: register/register arithmetic (ADD, SUB, AND, ...). */
+/* Execute RV32M: multiply, divide, and remainder (OP with funct7 = 0x01).
+ *
+ * RV32M is the first optional *extension* layered on the base integer ISA, so
+ * it reuses the OP opcode and is selected purely by funct7. Two cases that
+ * fault on many architectures are given defined results here instead of
+ * trapping: divide-by-zero, and the signed overflow of INT_MIN / -1. Software
+ * tests for them after the fact if it cares.
+ *
+ * The high-half multiplies form a 64-bit intermediate product; the three
+ * variants differ only in whether each operand is sign- or zero-extended. */
+static void exec_muldiv(CPU *cpu, uint32_t inst) {
+    uint32_t a  = reg_read(cpu, rs1(inst));
+    uint32_t b  = reg_read(cpu, rs2(inst));
+    int32_t  sa = (int32_t)a, sb = (int32_t)b;
+    uint32_t result = 0;
+
+    switch (funct3(inst)) {
+        case 0x0: /* MUL: low 32 bits of the product (same bits either signedness) */
+            result = (uint32_t)((uint64_t)a * (uint64_t)b);
+            break;
+        case 0x1: /* MULH:   high 32 bits, signed   x signed   */
+            result = (uint32_t)(((int64_t)sa * (int64_t)sb) >> 32);
+            break;
+        case 0x2: /* MULHSU: high 32 bits, signed   x unsigned */
+            result = (uint32_t)(((int64_t)sa * (int64_t)b) >> 32);
+            break;
+        case 0x3: /* MULHU:  high 32 bits, unsigned x unsigned */
+            result = (uint32_t)(((uint64_t)a * (uint64_t)b) >> 32);
+            break;
+        case 0x4: /* DIV: signed; /0 -> -1, INT_MIN/-1 -> INT_MIN */
+            if (b == 0)                           result = 0xffffffffu;
+            else if (sa == INT32_MIN && sb == -1) result = (uint32_t)INT32_MIN;
+            else                                  result = (uint32_t)(sa / sb);
+            break;
+        case 0x5: /* DIVU: unsigned; /0 -> all ones */
+            result = (b == 0) ? 0xffffffffu : (a / b);
+            break;
+        case 0x6: /* REM: signed; /0 -> dividend, INT_MIN/-1 -> 0 */
+            if (b == 0)                           result = a;
+            else if (sa == INT32_MIN && sb == -1) result = 0;
+            else                                  result = (uint32_t)(sa % sb);
+            break;
+        case 0x7: /* REMU: unsigned; /0 -> dividend */
+            result = (b == 0) ? a : (a % b);
+            break;
+    }
+    reg_write(cpu, rd(inst), result);
+}
+
+/* Execute OP: register/register arithmetic (ADD, SUB, AND, ...). RV32M shares
+ * this opcode; funct7 = 0x01 selects its multiply/divide instructions. */
 static void exec_op(CPU *cpu, uint32_t inst) {
+    if (funct7(inst) == 0x01) { /* RV32M extension */
+        exec_muldiv(cpu, inst);
+        return;
+    }
     uint32_t a = reg_read(cpu, rs1(inst));
     uint32_t b = reg_read(cpu, rs2(inst));
     uint32_t shamt = b & 0x1f;
