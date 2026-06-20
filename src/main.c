@@ -3,6 +3,7 @@
 #include "elf.h"
 #include "decode.h"
 #include "disasm.h"
+#include "cache.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -93,18 +94,31 @@ static int run_until_halt(CPU *cpu, int trace) {
 
 int main(int argc, char **argv) {
     int trace = 0;
+    int cache_on = 0;
+    uint32_t csize = 1024, cways = 2, cblock = 32; /* default L1 geometry */
     const char *path = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--trace") == 0) {
             trace = 1;
+        } else if (strcmp(argv[i], "--cache") == 0) {
+            cache_on = 1;
+        } else if (strncmp(argv[i], "--cache=", 8) == 0) {
+            cache_on = 1;
+            if (sscanf(argv[i] + 8, "%u:%u:%u", &csize, &cways, &cblock) != 3) {
+                fprintf(stderr, "bad --cache spec '%s' "
+                        "(want SIZE:WAYS:BLOCK, e.g. 1024:2:32)\n", argv[i] + 8);
+                return 2;
+            }
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
-            fprintf(stderr, "usage: %s [--trace] [program.elf]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--trace] [--cache[=SIZE:WAYS:BLOCK]] "
+                    "[program.elf]\n", argv[0]);
             return 2;
         } else if (path == NULL) {
             path = argv[i];
         } else {
-            fprintf(stderr, "usage: %s [--trace] [program.elf]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--trace] [--cache[=SIZE:WAYS:BLOCK]] "
+                    "[program.elf]\n", argv[0]);
             return 2;
         }
     }
@@ -150,6 +164,20 @@ int main(int argc, char **argv) {
     cpu_init(&cpu, &mem, entry);
     reg_write(&cpu, 2, sp); /* x2 = sp */
 
+    /* Optional cache model: a pure observability layer in front of memory. It
+     * watches data load/store addresses and tallies hits/misses without
+     * touching the data, so it never changes what the program computes. */
+    Cache cache;
+    int cache_ready = 0;
+    if (cache_on) {
+        if (cache_init(&cache, csize, cways, cblock) != 0) {
+            mem_free(&mem);
+            return 2;
+        }
+        cpu.cache = &cache;
+        cache_ready = 1;
+    }
+
     /* Any output the program writes via syscalls appears here, mid-run. */
     int steps = run_until_halt(&cpu, trace);
 
@@ -160,6 +188,11 @@ int main(int argc, char **argv) {
         printf("Halted (ebreak/trap) after %d instruction(s).\n\n", steps);
     } else {
         printf("Stopped at the %d-instruction safety limit.\n\n", steps);
+    }
+
+    if (cache_ready) {
+        cache_report(&cache, stdout);
+        printf("\n");
     }
 
     cpu_dump(&cpu);
@@ -179,6 +212,7 @@ int main(int argc, char **argv) {
      * (ebreak/trap/limit) returns 1. `make check` relies on this to tell a
      * passing conformance test (exit 0) from a failing one. */
     int status = cpu.exited ? (int)(cpu.exit_code & 0xffu) : 1;
+    if (cache_ready) cache_free(&cache);
     mem_free(&mem);
     return status;
 }
