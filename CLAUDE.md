@@ -15,14 +15,17 @@ Quanta is a from-scratch RISC-V (RV32I) instruction-set emulator in C, built to
 learn computer architecture. It models a single hart: 32 registers, a PC, and a
 flat little-endian memory. The core is a fetch/decode/execute loop.
 
-Currently at milestone M5: the full RV32I base integer set plus the RV32M
+Currently at milestone M6: the full RV32I base integer set plus the RV32M
 multiply/divide extension are implemented and pinned by a hand-written
-conformance suite (`make check`). Quanta loads ELF32
+conformance suite (`make check`), and an optional cache model sits in front of
+memory. Quanta loads ELF32
 executables (`quanta program.elf`), services `write`/`exit` system calls through
 the ECALL path, and returns the guest's exit status as its own. A hardcoded
 built-in demo runs when no ELF is given. A disassembler plus a `--trace` flag
 make execution observable, and `make check-disasm` pins the disassembly to
-`objdump`. The full milestone plan and learning path live in `ROADMAP.md` —
+`objdump`. An optional `--cache` flag models a configurable set-associative L1
+over the run's data accesses and reports hit/miss statistics without changing
+results (`make check-cache`). The full milestone plan and learning path live in `ROADMAP.md` —
 consult it for what comes next and tick boxes there as milestones land.
 
 ## Build / run / debug
@@ -34,13 +37,16 @@ make debug    # build with -g -O0 for gdb
 make tests    # build the sample RISC-V programs (needs cross-toolchain)
 make check    # build and run the RV32I conformance suite (needs cross-toolchain)
 make check-disasm  # cross-check the disassembler against objdump (needs cross-toolchain)
+make check-cache   # check the cache model on a locality workload (needs cross-toolchain)
 make clean
 ```
 
 Run a compiled program with `./quanta <program.elf>`; with no argument the
 built-in demo runs instead. Add `--trace` (`./quanta --trace <program.elf>`) to
 narrate each executed instruction — PC, disassembly, and changed registers — to
-stderr.
+stderr. Add `--cache[=SIZE:WAYS:BLOCK]` (e.g. `--cache=1024:2:32`) to model a
+set-associative L1 over the run's data accesses and print a hit/miss summary at
+exit.
 
 Debugging the emulator: `make debug && gdb ./quanta`. Note the two-level
 structure — gdb debugs the emulator (x86), which internally "runs" a RISC-V
@@ -71,6 +77,10 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
 - `src/disasm.{h,c}` — RV32I disassembler: turns an instruction word back into
   objdump-style assembly (ABI names, common pseudo-instructions, absolute
   branch/jump targets). Mirrors `cpu_step`'s opcode switch over `decode.h`.
+- `src/cache.{h,c}` — optional set-associative LRU cache model. A pure
+  observability layer: `cpu_step`'s load/store paths feed it data addresses, it
+  tallies hits/misses, but the bytes still come from `memory.c`, so results are
+  untouched. Off unless `--cache` is given (`cpu->cache == NULL`).
 - `src/elf.{h,c}` — minimal ELF32 loader: parses the header and program
   headers, copies `PT_LOAD` segments to their virtual addresses, returns the
   entry point. Fields are read with explicit little-endian helpers (no struct
@@ -91,6 +101,9 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
   workload; part of `make check`, and a seed for the M6 cache benchmark.
 - `tests/check_disasm.sh` — runs each sample ELF under `--trace` and diffs the
   disassembly against `objdump` (`make check-disasm`).
+- `tests/check_cache.sh` — runs `test_stack` under two cache geometries and
+  asserts results are unchanged and a smaller cache misses more
+  (`make check-cache`).
 
 ## Code style
 
@@ -134,6 +147,11 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
 - `run_until_halt` (in `main.c`) caps a run at 100M instructions as a runaway
   guard: a program that never calls `exit` stops there, reports the limit, and
   returns 1. Raise the cap if a workload legitimately needs more.
+- The cache model (`--cache`) is observability only: it sees data load/store
+  addresses (not instruction fetches), uses write-allocate so a store miss
+  installs the block, and must never alter results — keep it that way. It's off
+  by default, so `make check`/`make check-disasm` are unaffected; geometry is
+  `SIZE:WAYS:BLOCK` with all three powers of two and `SIZE = sets*ways*block`.
 - FENCE (MISC-MEM opcode `0x0f`) is a no-op — a single in-order hart has
   nothing to reorder. CSR instructions (Zicsr) and FENCE.I (Zifencei) are
   outside base RV32I: CSRs currently halt as "unimplemented SYSTEM", and

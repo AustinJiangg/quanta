@@ -183,25 +183,34 @@ and doubles as a small array-traversal workload for the cache model below.
 
 ---
 
-## M6 — Memory hierarchy: a cache model
+## M6 — Memory hierarchy: a cache model (DONE)
 
 Cross from "correct execution" into *performance* architecture — the area most
-relevant to real optimisation work.
+relevant to real optimisation work. `src/cache.{h,c}` adds a set-associative
+cache with LRU replacement (direct-mapped is the associativity-1 case), enabled
+by `--cache[=SIZE:WAYS:BLOCK]`. It is a pure observability layer: `cpu_step`'s
+load/store paths notify it of each data address, but the bytes still flow
+through the flat memory, so it can never change a result. At exit it reports
+accesses/hits/misses/miss-rate, and `make check-cache` pins both invariants —
+results unchanged, and a smaller cache misses more — on the `test_stack`
+array-traversal workload. A geometry sweep on that workload shows the textbook
+effects: a larger block lowers the miss rate (spatial locality), and a larger
+cache lets the second pass hit (temporal locality).
 
-- [ ] **Build:** an optional cache model in front of memory (start with a single
+- [x] **Build:** an optional cache model in front of memory (start with a single
   direct-mapped L1, then set-associative with configurable size/associativity/
   block size and LRU replacement). Count hits and misses; report a summary.
   Keep it as an observability layer — it must not change program results.
-- [ ] **ISA:** none new — this wraps LOAD/STORE.
-- [ ] **Concept:** the memory hierarchy; temporal and spatial locality; how
+- [x] **ISA:** none new — this wraps LOAD/STORE.
+- [x] **Concept:** the memory hierarchy; temporal and spatial locality; how
   associativity, block size, and replacement policy trade off; why cache
   behaviour dominates real-world performance.
-- [ ] **Done when:** running a program reports a hit/miss breakdown, and
+- [x] **Done when:** running a program reports a hit/miss breakdown, and
   changing cache parameters measurably changes the miss rate on a
   locality-sensitive workload.
-- [ ] **Commits:** `feat: add direct-mapped L1 cache model`,
-  `feat: support set-associative cache with LRU`,
-  `feat: report cache hit/miss statistics`.
+- [x] **Commits:** `feat: add a set-associative LRU cache model`,
+  `feat: report cache stats behind a --cache flag`,
+  `test: pin cache behaviour on a workload`, `docs: document the cache model`.
 
 ---
 
