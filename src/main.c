@@ -119,6 +119,11 @@ int main(int argc, char **argv) {
                a2, a3, (a2 == 42 && a3 == 32) ? "OK" : "MISMATCH");
     }
 
+    /* Propagate the guest's exit status as our own process exit code (like
+     * qemu-user or spike): a clean exit returns its code, an abnormal stop
+     * (ebreak/trap/limit) returns 1. `make check` relies on this to tell a
+     * passing conformance test (exit 0) from a failing one. */
+    int status = cpu.exited ? (int)(cpu.exit_code & 0xffu) : 1;
     mem_free(&mem);
-    return 0;
+    return status;
 }
