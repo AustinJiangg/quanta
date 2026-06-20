@@ -47,6 +47,11 @@ tests/%.elf: tests/%.S
 	$(RVCC) $(RVCFLAGS) -o $@ $<
 	@echo "Built $@ — disassemble with: $(RVOBJDUMP) -d $@"
 
+# tests/test_muldiv.S exercises the RV32M extension, which the base -march=rv32i
+# assembler rejects. Enable M for just this one ELF; the rest of the suite stays
+# pure base integer. Everything else in RVCFLAGS is carried over unchanged.
+tests/test_muldiv.elf: RVCFLAGS := $(subst rv32i,rv32im,$(RVCFLAGS))
+
 # Run the RV32I conformance suite (tests/test_*.S) through the emulator. Each
 # test exits 0 on success or the number of its first failed check, which quanta
 # propagates as its own exit status; we use that to print PASS/FAIL per file.
