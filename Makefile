@@ -12,6 +12,7 @@
 #   make check      build and run the RV32I conformance suite
 #   make check-disasm  cross-check the disassembler against objdump
 #   make check-cache   check the cache model on a locality workload
+#   make check-pipeline  check the pipeline model on a hazard workload
 #   make debug      build with -g -O0 for stepping under gdb
 #   make clean      remove build artifacts
 
@@ -27,7 +28,7 @@ RVCFLAGS  ?= -march=rv32i -mabi=ilp32 -nostdlib -nostartfiles -Ttext=0x80000000
 SRC := $(wildcard src/*.c)
 BIN := quanta
 
-.PHONY: all run tests check check-disasm check-cache debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline debug clean
 
 all: $(BIN)
 
@@ -77,6 +78,11 @@ check-disasm: $(BIN) $(TEST_ELF)
 # a smaller cache misses more on the array-traversal workload (tests/test_stack).
 check-cache: $(BIN) tests/test_stack.elf
 	@sh tests/check_cache.sh
+
+# Exercise the pipeline model: confirm that reordering to avoid a load-use
+# hazard lowers the stall count and cycle estimate without changing the result.
+check-pipeline: $(BIN) tests/hazard_slow.elf tests/hazard_fast.elf
+	@sh tests/check_pipeline.sh
 
 debug: CFLAGS := -std=c11 -Wall -Wextra -g -O0 -Isrc
 debug: clean $(BIN)
