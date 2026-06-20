@@ -113,21 +113,34 @@ RISC-V Unprivileged ISA spec, Vol. 1.
 
 ---
 
-## M4 — Disassembler and trace mode
+## M4 — Disassembler and trace mode (DONE)
 
-Make the machine observable. This pays for itself in every later milestone.
+Make the machine observable. A disassembler (`src/disasm.{h,c}`) turns an
+instruction word back into objdump-style assembly — ABI register names, the
+common pseudo-instructions (`nop`/`mv`/`li`/`j`/`jr`/`ret`/`beqz`/…), and
+absolute branch/jump targets. It reuses the very decode helpers the executor
+uses, now lifted into a shared `src/decode.h`, so the two views can never
+disagree about an instruction's layout. A `--trace` flag narrates execution to
+stderr: each instruction's PC, raw word, disassembly, the registers it changed,
+and the redirect target on a taken branch/jump/trap — recovered by diffing a
+register snapshot around `cpu_step()`, so the core stays untouched. Interactive
+single-step is deferred; the trace already gives later milestones the
+observability they need.
 
-- [ ] **Build:** a disassembler that turns an instruction word back into
+- [x] **Build:** a disassembler that turns an instruction word back into
   readable assembly, and a `--trace` flag that prints each executed instruction
-  with PC and the registers it changed. Optionally a single-step mode.
-- [ ] **ISA:** none new — a reverse view of the decoder.
-- [ ] **Concept:** the symmetry between encoding and decoding; how real tools
+  with PC and the registers it changed. (Single-step mode deferred.)
+- [x] **ISA:** none new — a reverse view of the decoder.
+- [x] **Concept:** the symmetry between encoding and decoding; how real tools
   (`objdump`, simulators) present execution; why observability matters for
   debugging hardware/emulators.
-- [ ] **Done when:** `./quanta --trace tests/hello.elf` prints a line per
-  instruction that matches `objdump -d` mnemonics.
-- [ ] **Commits:** `feat: add RV32I disassembler`,
-  `feat: add per-instruction trace flag`.
+- [x] **Done when:** `./quanta --trace tests/hello.elf` prints a line per
+  instruction that matches `objdump -d` mnemonics — pinned by `make
+  check-disasm`, which diffs the traced disassembly against objdump across the
+  whole sample suite.
+- [x] **Commits:** `refactor: extract shared decode helpers`,
+  `feat: add RV32I disassembler`, `feat: add per-instruction trace flag`,
+  `test: check disassembly against objdump`.
 
 ---
 

@@ -15,13 +15,14 @@ Quanta is a from-scratch RISC-V (RV32I) instruction-set emulator in C, built to
 learn computer architecture. It models a single hart: 32 registers, a PC, and a
 flat little-endian memory. The core is a fetch/decode/execute loop.
 
-Currently at milestone M3: the full RV32I base integer set is implemented and
+Currently at milestone M4: the full RV32I base integer set is implemented and
 pinned by a hand-written conformance suite (`make check`). Quanta loads ELF32
 executables (`quanta program.elf`), services `write`/`exit` system calls through
 the ECALL path, and returns the guest's exit status as its own. A hardcoded
-built-in demo runs when no ELF is given. The full milestone plan and learning
-path live in `ROADMAP.md` — consult it for what comes next and tick boxes there
-as milestones land.
+built-in demo runs when no ELF is given. A disassembler plus a `--trace` flag
+make execution observable, and `make check-disasm` pins the disassembly to
+`objdump`. The full milestone plan and learning path live in `ROADMAP.md` —
+consult it for what comes next and tick boxes there as milestones land.
 
 ## Build / run / debug
 
@@ -31,11 +32,14 @@ make run      # build and run the built-in demo program
 make debug    # build with -g -O0 for gdb
 make tests    # build the sample RISC-V programs (needs cross-toolchain)
 make check    # build and run the RV32I conformance suite (needs cross-toolchain)
+make check-disasm  # cross-check the disassembler against objdump (needs cross-toolchain)
 make clean
 ```
 
 Run a compiled program with `./quanta <program.elf>`; with no argument the
-built-in demo runs instead.
+built-in demo runs instead. Add `--trace` (`./quanta --trace <program.elf>`) to
+narrate each executed instruction — PC, disassembly, and changed registers — to
+stderr.
 
 Debugging the emulator: `make debug && gdb ./quanta`. Note the two-level
 structure — gdb debugs the emulator (x86), which internally "runs" a RISC-V
@@ -53,9 +57,15 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
 ## Code layout
 
 - `src/memory.{h,c}` — flat address space; little-endian load/store helpers.
-- `src/cpu.{h,c}` — CPU state and the instruction core. Field-extraction and
-  immediate-decoding helpers live at the top of `cpu.c`; each instruction
-  group has its own `exec_*` function.
+- `src/decode.h` — shared instruction decoding: field-extraction and
+  immediate-decoding helpers, the opcode map, and ABI register names, all
+  `static inline`. The executor and the disassembler decode through this, so
+  they can't disagree about an instruction's layout.
+- `src/cpu.{h,c}` — CPU state and the instruction core. Each instruction group
+  has its own `exec_*` function; decoding comes from `decode.h`.
+- `src/disasm.{h,c}` — RV32I disassembler: turns an instruction word back into
+  objdump-style assembly (ABI names, common pseudo-instructions, absolute
+  branch/jump targets). Mirrors `cpu_step`'s opcode switch over `decode.h`.
 - `src/elf.{h,c}` — minimal ELF32 loader: parses the header and program
   headers, copies `PT_LOAD` segments to their virtual addresses, returns the
   entry point. Fields are read with explicit little-endian helpers (no struct
@@ -63,14 +73,16 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
 - `src/syscall.{h,c}` — the system-call layer (the "kernel" side of ECALL):
   dispatches on the `a7` syscall number and implements `write` and `exit` per
   the RISC-V Linux/newlib ABI.
-- `src/main.c` — driver: loads an ELF named on the command line, or runs the
-  built-in demo program when none is given.
+- `src/main.c` — driver: loads an ELF named on the command line (or runs the
+  built-in demo when none is given), with an optional `--trace` flag.
 - `tests/hello.S` — sample RV32I assembly, mirrors the built-in demo.
 - `tests/hello_world.S` — syscall demo: prints a string with `write`, then
   `exit`s.
 - `tests/test_framework.h` + `tests/test_*.S` — the RV32I conformance suite:
   per-group assertion programs that exit 0 on success or the failing check's
   id. `make check` runs them and reads quanta's propagated exit code.
+- `tests/check_disasm.sh` — runs each sample ELF under `--trace` and diffs the
+  disassembly against `objdump` (`make check-disasm`).
 
 ## Code style
 
@@ -85,8 +97,9 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
 
 - Register `x0` is hardwired to zero — enforced in `reg_write`. Don't bypass it.
 - RV32I immediates are bit-scrambled across the instruction word and mostly
-  sign-extended; the `imm_*` helpers are the single source of truth. Re-deriving
-  them by hand is the easiest way to introduce bugs.
+  sign-extended; the `imm_*` helpers in `decode.h` are the single source of
+  truth, shared by the executor and the disassembler. Re-deriving them by hand
+  is the easiest way to introduce bugs.
 - Memory is little-endian; multi-byte access assembles bytes low-first.
 - The ELF loader only accepts static, little-endian RV32 `ET_EXEC` images
   (build with `-nostdlib -nostartfiles -Ttext=0x80000000`). PIE/`ET_DYN`
@@ -112,6 +125,12 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`.
   outside base RV32I: CSRs currently halt as "unimplemented SYSTEM", and
   that's why conformance uses the hand-written `make check` suite rather than
   the official `riscv-tests` (whose `-p` environment needs CSR/trap support).
+- `--trace` writes to stderr, leaving the guest's own stdout (`write`) clean;
+  "changed registers" are recovered by diffing a register snapshot taken around
+  `cpu_step`, so the core isn't instrumented. The disassembler prints the common
+  pseudo-instructions (`li`/`mv`/`j`/`ret`/`beqz`/…) so its output lines up with
+  `objdump -d`, which `make check-disasm` enforces; sharing `decode.h` with the
+  executor keeps the two from drifting apart.
 
 ## .claude/
 
