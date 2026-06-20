@@ -1,101 +1,18 @@
 #include "cpu.h"
+#include "decode.h"
 #include "syscall.h"
 
 #include <stdio.h>
 
 /* ------------------------------------------------------------------------
- * Instruction field extraction.
+ * The instruction core.
  *
- * An RV32I instruction is a single 32-bit word. Different "formats" (R, I,
- * S, B, U, J) slice that word into fields in fixed bit positions. The helpers
- * below pull each field out with shifts and masks. Getting these right is the
- * whole game in a decoder, so they are defined once and reused.
- *
- * Bit layout reference (RV32I):
- *   opcode = inst[6:0]
- *   rd     = inst[11:7]
- *   funct3 = inst[14:12]
- *   rs1    = inst[19:15]
- *   rs2    = inst[24:20]
- *   funct7 = inst[31:25]
+ * Field extraction, immediate decoding, the opcode map, and ABI register
+ * names live in decode.h, shared with the disassembler so both decode an
+ * instruction through one source of truth. Each instruction group below has
+ * its own exec_* function; cpu_step() fetches a word, dispatches on the
+ * opcode, and advances PC. Unimplemented encodings trap and halt the machine.
  * ------------------------------------------------------------------------ */
-
-static uint32_t opcode(uint32_t inst) { return inst & 0x7f; }
-static uint32_t rd    (uint32_t inst) { return (inst >> 7)  & 0x1f; }
-static uint32_t funct3(uint32_t inst) { return (inst >> 12) & 0x07; }
-static uint32_t rs1   (uint32_t inst) { return (inst >> 15) & 0x1f; }
-static uint32_t rs2   (uint32_t inst) { return (inst >> 20) & 0x1f; }
-static uint32_t funct7(uint32_t inst) { return (inst >> 25) & 0x7f; }
-
-/*
- * Immediates are the fiddly part of RV32I. The bits of an immediate are
- * scattered across the instruction word (a deliberate hardware trade-off:
- * it keeps the sign bit and register fields in fixed places across formats).
- * Each format reassembles them differently, and most are sign-extended.
- *
- * We sign-extend by casting the assembled value to int32_t after placing the
- * sign bit, relying on arithmetic right shift of a signed value.
- */
-
-/* I-type: inst[31:20], sign-extended. */
-static int32_t imm_i(uint32_t inst) {
-    return (int32_t)inst >> 20;
-}
-
-/* S-type: inst[31:25] | inst[11:7], sign-extended. */
-static int32_t imm_s(uint32_t inst) {
-    uint32_t imm = ((inst >> 25) & 0x7f) << 5
-                 | ((inst >> 7)  & 0x1f);
-    /* sign-extend from bit 11 */
-    if (imm & 0x800) imm |= 0xfffff000;
-    return (int32_t)imm;
-}
-
-/* B-type: branch offset, bits scrambled, multiple of 2, sign-extended. */
-static int32_t imm_b(uint32_t inst) {
-    uint32_t imm = ((inst >> 31) & 0x1)  << 12
-                 | ((inst >> 7)  & 0x1)  << 11
-                 | ((inst >> 25) & 0x3f) << 5
-                 | ((inst >> 8)  & 0xf)  << 1;
-    if (imm & 0x1000) imm |= 0xffffe000;
-    return (int32_t)imm;
-}
-
-/* U-type: inst[31:12] placed in the high 20 bits. */
-static int32_t imm_u(uint32_t inst) {
-    return (int32_t)(inst & 0xfffff000);
-}
-
-/* J-type: jump offset, bits scrambled, multiple of 2, sign-extended. */
-static int32_t imm_j(uint32_t inst) {
-    uint32_t imm = ((inst >> 31) & 0x1)   << 20
-                 | ((inst >> 12) & 0xff)  << 12
-                 | ((inst >> 20) & 0x1)   << 11
-                 | ((inst >> 21) & 0x3ff) << 1;
-    if (imm & 0x100000) imm |= 0xffe00000;
-    return (int32_t)imm;
-}
-
-/* ------------------------------------------------------------------------
- * Opcodes we handle in the MVP. These are the major opcode values from the
- * RV32I encoding. Not every instruction in each group is implemented yet;
- * unimplemented ones trap in cpu_step().
- * ------------------------------------------------------------------------ */
-enum {
-    OP_LUI    = 0x37,
-    OP_AUIPC  = 0x17,
-    OP_JAL    = 0x6f,
-    OP_JALR   = 0x67,
-    OP_BRANCH = 0x63, /* BEQ/BNE/BLT/BGE/BLTU/BGEU */
-    OP_LOAD   = 0x03, /* LB/LH/LW/LBU/LHU         */
-    OP_STORE  = 0x23, /* SB/SH/SW                 */
-    OP_FENCE  = 0x0f, /* FENCE / FENCE.I          */
-    OP_IMM    = 0x13, /* ADDI/SLTI/.../SRAI       */
-    OP_REG    = 0x33, /* ADD/SUB/.../AND          */
-    OP_SYSTEM = 0x73  /* ECALL/EBREAK             */
-};
-
-/* ------------------------------------------------------------------------ */
 
 void cpu_init(CPU *cpu, Memory *mem, uint32_t entry_pc) {
     for (int i = 0; i < 32; i++) cpu->regs[i] = 0;
@@ -299,16 +216,11 @@ void cpu_step(CPU *cpu) {
 }
 
 void cpu_dump(const CPU *cpu) {
-    /* ABI register names, handy when cross-checking against disassembly. */
-    static const char *names[32] = {
-        "zero", "ra", "sp", "gp", "tp",  "t0", "t1", "t2",
-        "s0",   "s1", "a0", "a1", "a2",  "a3", "a4", "a5",
-        "a6",   "a7", "s2", "s3", "s4",  "s5", "s6", "s7",
-        "s8",   "s9", "s10","s11","t3",  "t4", "t5", "t6"
-    };
+    /* ABI register names (decode.h) make the dump easy to cross-check against
+     * a disassembly. */
     printf("pc = 0x%08x\n", cpu->pc);
     for (int i = 0; i < 32; i++) {
-        printf("x%-2d %-4s = 0x%08x", i, names[i], cpu->regs[i]);
+        printf("x%-2d %-4s = 0x%08x", i, reg_abi_name((uint32_t)i), cpu->regs[i]);
         printf((i % 2) ? "\n" : "    ");
     }
     if (32 % 2) printf("\n");
