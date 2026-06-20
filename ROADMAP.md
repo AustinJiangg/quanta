@@ -242,16 +242,300 @@ with an unchanged result.
 
 ---
 
-## Beyond
+# Part II — Toward a production-grade emulator
 
-Open-ended directions once the above is solid: RV32F/D floating point, a
-privileged-mode subset with traps and CSRs, a branch predictor for the pipeline
-model, or a tiny self-hosted assembler. Pick whatever the optimisation work at
-hand makes you curious about.
+Milestones M0–M7 took Quanta from nothing to a correct, observable RV32IM core
+with cache and pipeline overlays — the *learning* arc. Part II changes the goal:
+make Quanta a **production-grade** project. That means advancing two independent
+axes at once — **engineering maturity** (how it is built, tested, and shipped)
+and **capability** (what it can actually do) — not merely adding instructions.
+
+The chosen flagship capability is **full-system emulation that boots an
+operating system**. The substrate — virtual memory, devices, interrupts, traps —
+is built and validated on **RV32 first**; the move to **RV64GC** is deferred
+until a mainstream OS demands it. Be honest about the consequence: the RV32
+phase boots an RV32 target (a bare-metal S-mode program, then a small RV32 OS or
+RV32 Linux), while upstream xv6-riscv and standard Linux distributions are
+RV64GC — that trophy lands after the RV64 transition (M17). RV64 is the *unlock*
+for mainstream OSes, not the starting point.
+
+Two architectural changes anchor the whole effort, each as defining as M0's
+fetch loop:
+
+- **Engine/library split (`libquanta`).** The core becomes a reusable library
+  with a clean C API and no fatal `exit()` calls; the CLI is a thin client.
+  This unlocks the GDB stub, language bindings, and real testability.
+- **MMU + MMIO memory layer.** `memory.c` stops being a flat array: it gains
+  VA→PA translation through a page-table walker and dispatches physical address
+  ranges to device models. This is the heart of the full-system phase.
+
+Two tracks run in parallel. The **engineering track (E-line)** is continuous and
+front-loaded — it is what most separates a learning project from a production
+one, and every later milestone leans on it. The **capability track (M8+)**
+advances the ISA and then the full-system feature set in dependency order.
+
+Legend is unchanged (**Build / ISA / Concept / Done when / Commits**); E-line
+entries add **Why** — the production rationale.
+
+---
+
+## Engineering track (E-line)
+
+Not sequential milestones but a parallel track to keep green throughout Part II.
+Front-load E1, E2, E5: the library split unblocks tooling, CI makes regressions
+visible, and differential testing against a golden model is the safety net under
+every ISA change that follows.
+
+### E1 — Split the engine into `libquanta`
+
+- [ ] **Build:** extract the core (`cpu`, `memory`, `decode`, `elf`, `syscall`,
+  `cache`, `pipeline`) into a library with a documented C API (`quanta_create` /
+  `quanta_load_elf` / `quanta_step` / `quanta_run`, register and memory
+  accessors, an event/hook interface). Replace fatal `exit()`/`abort()` in the
+  core with returned error codes — a library cannot terminate its host. `main.c`
+  becomes a thin client linking `libquanta`.
+- [ ] **Why:** precondition for the GDB stub, bindings, fuzz harnesses, and unit
+  tests. Most of Part II's tooling depends on it.
+- [ ] **Done when:** a ~20-line C program embeds the emulator and runs a guest;
+  the CLI links `libquanta`; no `exit()` remains in the core.
+- [ ] **Commits:** `refactor: return errors instead of exiting the core`,
+  `refactor: extract libquanta engine api`,
+  `refactor: rebuild the cli on libquanta`.
+
+### E2 — Continuous integration
+
+- [ ] **Build:** a GitHub Actions matrix (`gcc`×`clang`, debug×release) that
+  builds and runs every `make check / check-disasm / check-cache /
+  check-pipeline` on each push, caching the RISC-V cross-toolchain.
+- [ ] **Why:** regressions surface immediately, not at the next manual run.
+- [ ] **Done when:** every push reports a status; a CI badge is in the README.
+- [ ] **Commits:** `chore: add ci build-and-test matrix`,
+  `docs: add ci status badge`.
+
+### E3 — Sanitizer builds
+
+- [ ] **Build:** an ASan+UBSan build (MSan where feasible) running the full
+  suite in CI. The emulator parses untrusted ELF and executes arbitrary decoded
+  instructions, so memory safety is a real attack surface.
+- [ ] **Why:** memory-safety bugs in an emulator are both crashes and exploits.
+- [ ] **Done when:** the suite passes clean under ASan/UBSan in CI.
+- [ ] **Commits:** `chore: add sanitizer ci job`, `fix: <what it surfaces>`.
+
+### E4 — Fuzzing
+
+- [ ] **Build:** libFuzzer/AFL++ harnesses for (1) the ELF loader — the most
+  security-sensitive path, parsing untrusted files — and (2) decode→execute,
+  feeding random instruction words and asserting no host crash or OOB. Crashes
+  become regression tests; keep a corpus.
+- [ ] **Why:** untrusted input deserves adversarial input.
+- [ ] **Done when:** a fuzz target runs in CI; malformed ELF always errors
+  cleanly rather than hitting UB.
+- [ ] **Commits:** `test: add elf-loader fuzz harness`,
+  `test: add decode fuzz harness`,
+  `fix: harden elf parsing against malformed input`.
+
+### E5 — Differential testing against Spike
+
+- [ ] **Build:** run identical programs through Quanta and the official `spike`
+  reference, comparing architectural state (registers + touched memory) per
+  instruction or at exit. Drive it from a corpus of compiled C plus randomly
+  generated instruction sequences; wire it into CI.
+- [ ] **Why:** lockstep agreement with a golden model is how real emulators earn
+  trust — and the safety net under every ISA change in M8–M17.
+- [ ] **Done when:** the corpus matches Spike bit-for-bit in CI.
+- [ ] **Commits:** `test: add spike differential harness`,
+  `test: add randomised instruction corpus`.
+
+### E6 — Official conformance (riscv-arch-test)
+
+- [ ] **Build:** run the official architectural test suite, replacing/augmenting
+  the hand-written `make check`. Needs the minimal trap/CSR support from M8/M9.
+- [ ] **Why:** the recognised bar for "this really is RV32I/M/A/...".
+- [ ] **Done when:** RV32I (then IMAC…) signatures match the reference.
+- [ ] **Commits:** `test: run riscv-arch-test for rv32i`,
+  `docs: document conformance`.
+
+### E7 — Coverage and static analysis
+
+- [ ] **Build:** gcov/lcov coverage reporting plus a clang-tidy + scan-build +
+  cppcheck pass in CI.
+- [ ] **Why:** measure what the tests miss; catch defects before runtime.
+- [ ] **Done when:** coverage is reported per PR; static analysis is clean or
+  baselined.
+- [ ] **Commits:** `chore: add coverage reporting`,
+  `chore: add static analysis ci`.
+
+### E8 — Release engineering
+
+- [ ] **Build:** SemVer, a CHANGELOG, a `--version` flag, tagged GitHub
+  releases, a man page, reproducible builds.
+- [ ] **Why:** a production project ships versioned, documented artefacts.
+- [ ] **Done when:** `quanta --version` works and a tagged v0.x release exists.
+- [ ] **Commits:** `feat: add --version`,
+  `chore: add changelog and release tagging`.
+
+### E9 — GDB remote stub
+
+- [ ] **Build:** a gdbserver-protocol stub over TCP (read/write registers and
+  memory, single-step, breakpoints, continue) on top of the `libquanta` hooks.
+- [ ] **Why:** debugging a booting kernel without a debugger is brutal — this is
+  effectively required tooling for Stage 3, and a headline embeddable feature.
+- [ ] **Done when:** real `gdb` attaches to a running guest and single-steps it.
+- [ ] **Commits:** `feat: add gdb remote stub`, `docs: document gdb debugging`.
+
+---
+
+## Capability track — full-system, boot an OS
+
+### Stage 1 — ISA prerequisites (M8–M11)
+
+## M8 — Zicsr + Zifencei
+
+- [ ] **Build:** a CSR register file and `csrrw/csrrs/csrrc(+i)`, plus `FENCE.I`.
+- [ ] **ISA:** Zicsr, Zifencei.
+- [ ] **Concept:** control/status registers as the machine's configuration and
+  status surface; why CSR access is its own instruction class.
+- [ ] **Done when:** CSR programs run instead of halting; this unlocks the
+  official `riscv-tests` `-p` environment (E6).
+- [ ] **Commits:** `feat: add csr register file and zicsr`,
+  `feat: implement fence.i`, `docs: document csr support`.
+
+## M9 — Privileged architecture (M/S/U + traps)
+
+- [ ] **Build:** privilege levels (M/S/U), the trap CSRs
+  (`mstatus/mtvec/mepc/mcause/mie/mip/medeleg/mideleg` and the `s*` mirrors),
+  exception and interrupt entry, `mret`/`sret`, and delegation. Route ECALL,
+  EBREAK, illegal-instruction and misaligned faults through real traps.
+- [ ] **ISA:** the privileged-spec subset (no MMU yet).
+- [ ] **Concept:** the privilege model; precise traps; how interrupts and
+  exceptions share a vector; delegation between modes.
+- [ ] **Done when:** a handler installed via `mtvec` catches a deliberate
+  exception, inspects `mcause/mepc`, and returns with `mret`.
+- [ ] **Commits:** `feat: add privilege levels and trap csrs`,
+  `feat: implement trap entry and mret/sret`,
+  `feat: route exceptions through traps`, `docs: document the trap model`.
+
+## M10 — RV32A atomics
+
+- [ ] **Build:** `LR/SC` and the `AMO*` set (single-hart semantics).
+- [ ] **ISA:** RV32A.
+- [ ] **Concept:** atomic read-modify-write; load-reserved/store-conditional;
+  why atomics are a separate extension the kernel requires.
+- [ ] **Done when:** an LR/SC spinlock and the AMOs pass a focused test —
+  required before any Linux boot.
+- [ ] **Commits:** `feat: add rv32a atomics`, `feat: disassemble rv32a`,
+  `test: add rv32a conformance suite`.
+
+## M11 — Optional extensions: RV32C, RV32F/D (deferrable)
+
+- [ ] **Build:** RV32C (expand the 16-bit encodings) and/or RV32F/D (an `fcsr`,
+  rounding modes, the F/D op set via softfloat for host-independent results).
+- [ ] **ISA:** RV32C, RV32F, RV32D.
+- [ ] **Concept:** compressed encodings and code density; the float register
+  file and the hard-float vs soft-float ABI split.
+- [ ] **Done when:** as the chosen guest demands — defer by building the kernel
+  without C and userspace soft-float; a full glibc GC userspace needs both.
+- [ ] **Commits:** `feat: add rv32c compressed`, `feat: add rv32f/d float`.
+
+### Stage 2 — Full-system substrate (M12–M14)
+
+## M12 — Sv32 virtual memory
+
+- [ ] **Build:** a two-level Sv32 page-table walker, a TLB, `satp`,
+  `sfence.vma`, and page-fault traps. `memory.c` gains VA→PA translation — the
+  central architectural change of the full-system phase.
+- [ ] **ISA:** Sv32 address translation.
+- [ ] **Concept:** virtual memory; page tables and the walk; TLBs; how paging
+  and the privilege model combine.
+- [ ] **Done when:** with paging enabled a user program runs in its virtual
+  address space and an unmapped access faults precisely.
+- [ ] **Commits:** `feat: add sv32 page-table walk`, `feat: add a tlb`,
+  `feat: trap on page faults`, `docs: document virtual memory`.
+
+## M13 — Platform devices and interrupts
+
+- [ ] **Build:** MMIO dispatch in the memory layer plus a CLINT (`mtime`/
+  `mtimecmp` timer, `msip` IPI), a PLIC (external-interrupt claim/complete), and
+  a 16550 UART for console I/O.
+- [ ] **ISA:** none new — memory-mapped device models and interrupt delivery.
+- [ ] **Concept:** memory-mapped I/O; the interrupt path from device to trap;
+  timer-driven preemption.
+- [ ] **Done when:** a timer interrupt fires on `mtimecmp` and the UART prints.
+- [ ] **Commits:** `feat: add mmio dispatch`, `feat: add clint timer and ipi`,
+  `feat: add plic`, `feat: add a 16550 uart`.
+
+## M14 — Device tree and boot protocol
+
+- [ ] **Build:** load (or generate) a flattened device tree and enter the guest
+  per the RISC-V boot convention (`a0`=hartid, `a1`=DTB pointer).
+- [ ] **ISA:** none new — the firmware/OS boot contract.
+- [ ] **Concept:** hardware discovery via device tree; the boot handoff.
+- [ ] **Done when:** the guest reads its memory layout and devices from the DTB.
+- [ ] **Commits:** `feat: pass a device tree at boot`,
+  `docs: document the boot protocol`.
+
+### Stage 3 — Boot an OS (RV32 trophy) (M15–M16)
+
+## M15 — Bare-metal S-mode + SBI
+
+- [ ] **Build:** an SBI implementation (timer, console putchar/getchar, hart
+  ops) so S-mode software has a firmware interface — or run OpenSBI in emulated
+  M-mode.
+- [ ] **ISA:** none new — the SEE/SBI contract over ECALL.
+- [ ] **Concept:** the supervisor/firmware boundary; what an SEE provides.
+- [ ] **Done when:** a bare-metal S-mode program prints via the SBI console and
+  exits.
+- [ ] **Commits:** `feat: add an sbi implementation`,
+  `test: boot a bare-metal s-mode program`.
+
+## M16 — Boot a small RV32 OS
+
+- [ ] **Build:** boot a real RV32 kernel — a teaching kernel or a buildroot RV32
+  Linux + initramfs — through to userspace.
+- [ ] **ISA:** none new — the integration milestone for Stages 1–2.
+- [ ] **Concept:** what "booting" entails end to end; where emulator bugs hide
+  that unit tests miss.
+- [ ] **Done when:** the guest boots to a shell or runs a userspace process.
+- [ ] **Commits:** `test: boot a small rv32 os`, `docs: document booting an os`.
+
+### Stage 4 — Mainstream OS (triggers RV64) (M17–M19)
+
+## M17 — RV64GC transition
+
+- [ ] **Build:** parameterise XLEN (a width-agnostic register/ALU/decode path),
+  taking the core to RV64. The Spike differential harness (E5) is the safety net
+  for the whole refactor.
+- [ ] **ISA:** RV64I/M/A/C (and F/D from M11) — the GC base.
+- [ ] **Concept:** XLEN parameterisation; why the world standardised on RV64GC.
+- [ ] **Done when:** the RV64 conformance and differential suites pass.
+- [ ] **Commits:** `refactor: parameterise xlen`, `feat: add rv64 base`,
+  `test: rv64 conformance and differential`.
+
+## M18 — Sv39 + boot a mainstream OS
+
+- [ ] **Build:** the three-level Sv39 page-table scheme; then boot xv6-riscv and
+  a standard Linux + OpenSBI.
+- [ ] **ISA:** Sv39 address translation.
+- [ ] **Concept:** deeper page-table hierarchies; a real distro's boot
+  requirements.
+- [ ] **Done when:** xv6-riscv reaches its shell; Linux boots to userspace.
+- [ ] **Commits:** `feat: add sv39 paging`, `test: boot xv6-riscv`,
+  `test: boot linux`.
+
+## M19 — SMP multi-hart (stretch)
+
+- [ ] **Build:** multiple harts with CLINT IPIs, exercising the M10 atomics
+  under real contention.
+- [ ] **ISA:** none new — multi-hart coordination.
+- [ ] **Concept:** shared memory, memory ordering, and inter-hart interrupts.
+- [ ] **Done when:** an SMP guest boots and schedules across harts.
+- [ ] **Commits:** `feat: add smp multi-hart support`.
 
 ## How to use this roadmap
 
 - Do one milestone at a time; keep `main` runnable at every step.
+- In Part II, keep the E-line green continuously and let the Spike differential
+  harness (E5) gate every ISA change; advance the M-line one milestone at a time.
 - Write the test before or alongside the feature where M3+ calls for it.
 - When a milestone is done, tick its boxes and note anything surprising in
   `CLAUDE.md` so future sessions inherit it.
