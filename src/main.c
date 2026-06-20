@@ -79,7 +79,10 @@ static void trace_step(CPU *cpu) {
  * Returns the number of instructions executed. */
 static int run_until_halt(CPU *cpu, int trace) {
     int steps = 0;
-    const int max_steps = 1000;
+    /* A generous runaway guard: high enough to let real workloads (loops over
+     * arrays, deep call chains) run to completion, low enough that a program
+     * that never halts still stops in about a second instead of hanging. */
+    const int max_steps = 100 * 1000 * 1000;
     while (!cpu->halted && steps < max_steps) {
         if (trace) trace_step(cpu);
         else       cpu_step(cpu);
@@ -128,15 +131,24 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* A loader/kernel hands the program an initial stack pointer; the ISA reset
+     * state leaves every register zero, which would fault the first push. Point
+     * sp at the top of the guest region, 16-byte aligned per the RISC-V ABI.
+     * The region carries stack headroom above the image (the demo's fixed area
+     * doubles as stack; for an ELF the loader reserves it), and the stack grows
+     * downward from here. */
+    uint32_t sp = (mem.base + mem.size) & ~(uint32_t)0xf;
+
     printf("Quanta — RV32I emulator\n");
     if (demo) {
         printf("No ELF given; running the built-in demo program.\n\n");
     } else {
-        printf("Loaded %s (entry = 0x%08x)\n\n", path, entry);
+        printf("Loaded %s (entry = 0x%08x, sp = 0x%08x)\n\n", path, entry, sp);
     }
 
     CPU cpu;
     cpu_init(&cpu, &mem, entry);
+    reg_write(&cpu, 2, sp); /* x2 = sp */
 
     /* Any output the program writes via syscalls appears here, mid-run. */
     int steps = run_until_halt(&cpu, trace);

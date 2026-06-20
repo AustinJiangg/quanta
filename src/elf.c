@@ -135,6 +135,11 @@ static int check_header(const uint8_t *buf, size_t len) {
  * hostile ELF can't ask us to calloc the world. */
 #define ELF_MEM_MAX (256u * 1024u * 1024u)
 
+/* Stack headroom reserved above the load image. The ISA reset state has no
+ * stack; the loader sets this space aside and main() points sp at the top of
+ * the region, so the stack can grow downward into it. */
+#define GUEST_STACK_SIZE (64u * 1024u)
+
 int elf_load(const char *path, Memory *mem, uint32_t *entry) {
     size_t len;
     uint8_t *buf = read_file(path, &len);
@@ -207,13 +212,20 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry) {
         goto out;
     }
 
-    /* Allocate guest memory to exactly span the load image. (No stack/heap
-     * headroom yet — the sample programs don't use a stack; a later milestone
-     * can grow this region and set up sp.) */
-    uint64_t span = hi - lo;
-    if (span == 0 || span > ELF_MEM_MAX) {
+    /* Allocate guest memory: the load image, plus a block of stack headroom
+     * above it. The ISA reset state has no stack, but any program that calls
+     * functions or spills locals needs one, so — like a kernel/loader — we
+     * reserve the space here and main() points sp at the top of the region.
+     * The stack then grows downward through this headroom toward the data. */
+    uint64_t image = hi - lo;
+    if (image == 0 || image > ELF_MEM_MAX) {
         fprintf(stderr, "elf: implausible image size (%llu bytes)\n",
-                (unsigned long long)span);
+                (unsigned long long)image);
+        goto out;
+    }
+    uint64_t span = image + GUEST_STACK_SIZE;
+    if (span > ELF_MEM_MAX || (uint64_t)lo + span > 0x100000000ULL) {
+        fprintf(stderr, "elf: image plus stack does not fit guest memory\n");
         goto out;
     }
     if (mem_init(mem, (uint32_t)lo, (uint32_t)span) != 0) {
