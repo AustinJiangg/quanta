@@ -15,17 +15,20 @@ Quanta is a from-scratch RISC-V (RV32I) instruction-set emulator in C, built to
 learn computer architecture. It models a single hart: 32 registers, a PC, and a
 flat little-endian memory. The core is a fetch/decode/execute loop.
 
-Currently at milestone M6: the full RV32I base integer set plus the RV32M
-multiply/divide extension are implemented and pinned by a hand-written
-conformance suite (`make check`), and an optional cache model sits in front of
-memory. Quanta loads ELF32
+All roadmap milestones (M0–M7) are complete: the full RV32I base integer set
+plus the RV32M multiply/divide extension are implemented and pinned by a
+hand-written conformance suite (`make check`), an optional cache model sits in
+front of memory, and a `--pipeline` timing model estimates cycles and CPI.
+Quanta loads ELF32
 executables (`quanta program.elf`), services `write`/`exit` system calls through
 the ECALL path, and returns the guest's exit status as its own. A hardcoded
 built-in demo runs when no ELF is given. A disassembler plus a `--trace` flag
 make execution observable, and `make check-disasm` pins the disassembly to
 `objdump`. An optional `--cache` flag models a configurable set-associative L1
-over the run's data accesses and reports hit/miss statistics without changing
-results (`make check-cache`). The full milestone plan and learning path live in `ROADMAP.md` —
+over the run's data accesses and reports hit/miss statistics, and `--pipeline`
+adds a 5-stage timing overlay estimating cycles and CPI from load-use and control
+hazards — both pure overlays that never change results (`make check-cache`,
+`make check-pipeline`). The full milestone plan and learning path live in `ROADMAP.md` —
 consult it for what comes next and tick boxes there as milestones land.
 
 ## Build / run / debug
@@ -38,6 +41,7 @@ make tests    # build the sample RISC-V programs (needs cross-toolchain)
 make check    # build and run the RV32I conformance suite (needs cross-toolchain)
 make check-disasm  # cross-check the disassembler against objdump (needs cross-toolchain)
 make check-cache   # check the cache model on a locality workload (needs cross-toolchain)
+make check-pipeline # check the pipeline model on a hazard workload (needs cross-toolchain)
 make clean
 ```
 
@@ -46,7 +50,8 @@ built-in demo runs instead. Add `--trace` (`./quanta --trace <program.elf>`) to
 narrate each executed instruction — PC, disassembly, and changed registers — to
 stderr. Add `--cache[=SIZE:WAYS:BLOCK]` (e.g. `--cache=1024:2:32`) to model a
 set-associative L1 over the run's data accesses and print a hit/miss summary at
-exit.
+exit, and/or `--pipeline` to print a 5-stage cycle/CPI estimate. The overlays
+compose.
 
 Debugging the emulator: `make debug && gdb ./quanta`. Note the two-level
 structure — gdb debugs the emulator (x86), which internally "runs" a RISC-V
@@ -81,6 +86,11 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
   observability layer: `cpu_step`'s load/store paths feed it data addresses, it
   tallies hits/misses, but the bytes still come from `memory.c`, so results are
   untouched. Off unless `--cache` is given (`cpu->cache == NULL`).
+- `src/pipeline.{h,c}` — optional 5-stage pipeline *timing* model. Another
+  overlay: `main.c`'s run loop feeds it each retired instruction word and whether
+  control redirected, and it estimates cycles/CPI by charging load-use and
+  control-hazard stalls. Driven from the loop, not the core, so `cpu.c` stays
+  untouched. Off unless `--pipeline` is given.
 - `src/elf.{h,c}` — minimal ELF32 loader: parses the header and program
   headers, copies `PT_LOAD` segments to their virtual addresses, returns the
   entry point. Fields are read with explicit little-endian helpers (no struct
@@ -104,6 +114,10 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
 - `tests/check_cache.sh` — runs `test_stack` under two cache geometries and
   asserts results are unchanged and a smaller cache misses more
   (`make check-cache`).
+- `tests/hazard_slow.S` + `tests/hazard_fast.S` — the same array sum scheduled
+  with and without a load-use hazard; `tests/check_pipeline.sh` runs both under
+  `--pipeline` and asserts the reorder cut stalls and cycles without changing the
+  result (`make check-pipeline`).
 
 ## Code style
 
@@ -152,6 +166,11 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
   installs the block, and must never alter results — keep it that way. It's off
   by default, so `make check`/`make check-disasm` are unaffected; geometry is
   `SIZE:WAYS:BLOCK` with all three powers of two and `SIZE = sets*ways*block`.
+- The pipeline model (`--pipeline`) is likewise observability only, fed from
+  `main.c`'s run loop (`pipeline_observe` per retired instruction). Its numbers
+  are estimates under explicit assumptions — full forwarding (only load-use
+  stalls), predict-not-taken control penalties (JAL 1, taken branch/JALR 2), no
+  structural or cache-miss penalties — not a cycle-accurate simulation.
 - FENCE (MISC-MEM opcode `0x0f`) is a no-op — a single in-order hart has
   nothing to reorder. CSR instructions (Zicsr) and FENCE.I (Zifencei) are
   outside base RV32I: CSRs currently halt as "unimplemented SYSTEM", and

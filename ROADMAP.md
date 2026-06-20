@@ -214,22 +214,31 @@ cache lets the second pass hit (temporal locality).
 
 ---
 
-## M7 — A simple pipeline model (stretch)
+## M7 — A simple pipeline model (stretch) (DONE)
 
-Model time, not just outcomes. This is the conceptual capstone.
+Model time, not just outcomes. This is the conceptual capstone. `src/pipeline.
+{h,c}` adds a 5-stage timing overlay enabled by `--pipeline`. Like the cache it
+changes nothing functionally: it watches the retired instruction stream and
+estimates cycles by charging the stalls a forwarding pipeline cannot hide — one
+bubble per load-use hazard, and a predict-not-taken control penalty (2 cycles
+for a taken branch or JALR, 1 for a JAL). It reports instructions, cycles, CPI,
+and the stall breakdown. `tests/hazard_slow.S` and `tests/hazard_fast.S` are the
+same array sum scheduled two ways; `make check-pipeline` confirms that moving the
+load away from its use drops load-use stalls from 256 to 0 (3860 → 3604 cycles)
+with an unchanged result.
 
-- [ ] **Build:** a classic 5-stage pipeline view (IF, ID, EX, MEM, WB) with
+- [x] **Build:** a classic 5-stage pipeline view (IF, ID, EX, MEM, WB) with
   cycle counting, detecting data hazards and modelling stalls/forwarding and
   control-hazard penalties on branches. Functional results stay identical;
   this estimates cycles.
-- [ ] **ISA:** none new — a timing overlay on the existing core.
-- [ ] **Concept:** instruction-level parallelism; pipeline hazards (data,
+- [x] **ISA:** none new — a timing overlay on the existing core.
+- [x] **Concept:** instruction-level parallelism; pipeline hazards (data,
   control, structural); forwarding and stalls; CPI as a performance metric.
-- [ ] **Done when:** the emulator reports an estimated cycle count and CPI, and
+- [x] **Done when:** the emulator reports an estimated cycle count and CPI, and
   reordering instructions to avoid a hazard visibly lowers the stall count.
-- [ ] **Commits:** `feat: add 5-stage pipeline timing model`,
-  `feat: model data hazards with forwarding`,
-  `feat: report cycle count and CPI`.
+- [x] **Commits:** `feat: add a 5-stage pipeline timing model`,
+  `feat: report cycle count and CPI behind --pipeline`,
+  `test: show scheduling cuts load-use stalls`, `docs: document the pipeline model`.
 
 ---
 
