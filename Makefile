@@ -9,6 +9,8 @@
 #   make            build the emulator -> ./quanta
 #   make run        build and run the MVP (hardcoded program)
 #   make tests      build the sample RISC-V program -> tests/hello.elf
+#   make check      build and run the RV32I conformance suite
+#   make check-disasm  cross-check the disassembler against objdump
 #   make debug      build with -g -O0 for stepping under gdb
 #   make clean      remove build artifacts
 
@@ -24,7 +26,7 @@ RVCFLAGS  ?= -march=rv32i -mabi=ilp32 -nostdlib -nostartfiles -Ttext=0x80000000
 SRC := $(wildcard src/*.c)
 BIN := quanta
 
-.PHONY: all run tests check debug clean
+.PHONY: all run tests check check-disasm debug clean
 
 all: $(BIN)
 
@@ -58,6 +60,12 @@ check: $(BIN) $(CHECK_ELF)
 		else echo "FAIL  $$t (check $$rc)"; fail=1; fi; \
 	done; \
 	if [ $$fail -ne 0 ]; then echo "FAILED"; exit 1; else echo "all RV32I tests passed"; fi
+
+# Cross-check the disassembler against the reference assembler: run each sample
+# ELF under `quanta --trace` and diff its disassembly against objdump's. Needs
+# the cross-toolchain for objdump; the script skips cleanly without it.
+check-disasm: $(BIN) $(TEST_ELF)
+	@sh tests/check_disasm.sh $(TEST_ELF)
 
 debug: CFLAGS := -std=c11 -Wall -Wextra -g -O0 -Isrc
 debug: clean $(BIN)
