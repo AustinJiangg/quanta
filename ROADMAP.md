@@ -304,14 +304,16 @@ every ISA change that follows.
   `refactor: extract libquanta engine api`,
   `refactor: rebuild the cli on libquanta`.
 
-### E2 — Continuous integration
+### E2 — Continuous integration (DONE)
 
-- [ ] **Build:** a GitHub Actions matrix (`gcc`×`clang`, debug×release) that
-  builds and runs every `make check / check-disasm / check-cache /
-  check-pipeline` on each push, caching the RISC-V cross-toolchain.
-- [ ] **Why:** regressions surface immediately, not at the next manual run.
-- [ ] **Done when:** every push reports a status; a CI badge is in the README.
-- [ ] **Commits:** `chore: add ci build-and-test matrix`,
+- [x] **Build:** a GitHub Actions matrix (`gcc`×`clang`, release×debug) builds
+  the library + CLI and runs the embedding example and every `make check /
+  check-disasm / check-cache / check-pipeline` on each push and PR, with
+  `-Werror` so warnings fail. (The cross-toolchain is installed via apt per run;
+  caching it is a later optimisation.)
+- [x] **Why:** regressions surface immediately, not at the next manual run.
+- [x] **Done when:** every push reports a status; a CI badge is in the README.
+- [x] **Commits:** `chore: add ci build-and-test matrix`,
   `docs: add ci status badge`.
 
 ### E3 — Sanitizer builds
