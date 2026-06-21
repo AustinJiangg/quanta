@@ -1,5 +1,7 @@
 # Quanta
 
+[![CI](https://github.com/AustinJiangg/quanta/actions/workflows/ci.yml/badge.svg)](https://github.com/AustinJiangg/quanta/actions/workflows/ci.yml)
+
 A RISC-V (RV32I) instruction-set emulator written from scratch in C, built as
 a hands-on way to learn computer architecture. Quanta fetches, decodes, and
 executes RV32I machine code one instruction at a time, modelling the full
