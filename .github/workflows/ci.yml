@@ -70,3 +70,17 @@ jobs:
 
       - name: Differential vs qemu-riscv32
         run: make check-diff
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    name: sanitizers (asan+ubsan)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-toolchain and qemu-user
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf qemu-user-static
+
+      - name: Build + run the suite under ASan/UBSan
+        run: make sanitize

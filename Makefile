@@ -14,6 +14,7 @@
 #   make check-cache   check the cache model on a locality workload
 #   make check-pipeline  check the pipeline model on a hazard workload
 #   make check-diff   differential-test against a reference sim (qemu-riscv32)
+#   make sanitize     build with ASan+UBSan and run the suite through it
 #   make debug      build with -g -O0 for stepping under gdb
 #   make clean      remove build artifacts
 
@@ -21,6 +22,10 @@ CC      ?= gcc
 AR      ?= ar
 CFLAGS  ?= -std=c11 -Wall -Wextra -O2 -Isrc
 LDFLAGS ?=
+
+# AddressSanitizer + UBSan for the `sanitize` target (instruments the host
+# emulator only; the guest ELFs are built by the cross-toolchain as usual).
+SANFLAGS := -fsanitize=address,undefined -fno-sanitize-recover=all
 
 # RISC-V cross-toolchain (override if yours is named differently).
 RVCC      ?= riscv64-unknown-elf-gcc
@@ -33,7 +38,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-diff embed debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-diff embed sanitize debug clean
 
 all: $(BIN)
 
@@ -115,6 +120,16 @@ check-diff: $(BIN) $(TEST_ELF)
 
 debug: CFLAGS := -std=c11 -Wall -Wextra -g -O0 -Isrc
 debug: clean $(BIN)
+
+# Build the emulator with AddressSanitizer + UBSan and run the whole suite
+# through it. The sanitizers instrument the host emulator (not the guest), so a
+# clean pass means no memory or undefined-behaviour bug fired while parsing the
+# sample ELFs and interpreting every instruction group, overlay, and syscall.
+# UB aborts the run (-fno-sanitize-recover), so a green result is meaningful.
+sanitize:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
+		embed check check-disasm check-cache check-pipeline check-diff
 
 clean:
 	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/*.elf
