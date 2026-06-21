@@ -20,6 +20,80 @@
  * and the upper-immediate field.
  */
 
+/* objdump prints known CSRs by name; we model the handful the core touches. */
+static const char *csr_name(uint32_t addr) {
+    switch (addr) {
+        case CSR_MSCRATCH: return "mscratch";
+        case CSR_CYCLE:    return "cycle";
+        case CSR_TIME:     return "time";
+        case CSR_INSTRET:  return "instret";
+        case CSR_CYCLEH:   return "cycleh";
+        case CSR_TIMEH:    return "timeh";
+        case CSR_INSTRETH: return "instreth";
+        default:           return NULL;
+    }
+}
+
+/* A plain read of a counter has its own pseudo-instruction in objdump's output:
+ * `csrr rd, instret` prints as `rdinstret rd`, and likewise for cycle/time. */
+static const char *csr_rd_pseudo(uint32_t addr) {
+    switch (addr) {
+        case CSR_CYCLE:    return "rdcycle";
+        case CSR_TIME:     return "rdtime";
+        case CSR_INSTRET:  return "rdinstret";
+        case CSR_CYCLEH:   return "rdcycleh";
+        case CSR_TIMEH:    return "rdtimeh";
+        case CSR_INSTRETH: return "rdinstreth";
+        default:           return NULL;
+    }
+}
+
+/* Disassemble a Zicsr instruction, matching objdump's rendering: the
+ * csrw/csrr/csrs/csrc (and immediate) pseudo-instructions when rd or the
+ * source is x0, and the rd<counter> pseudos for plain counter reads. */
+static void disasm_csr(uint32_t inst, uint32_t f3, char *buf, size_t buflen) {
+    uint32_t addr = (inst >> 20) & 0xfff;
+    uint32_t rdn = rd(inst), rs1n = rs1(inst);
+    const char *d = reg_abi_name(rdn), *s1 = reg_abi_name(rs1n);
+    const char *csr = csr_name(addr);
+    char num[8];
+    if (!csr) { snprintf(num, sizeof num, "0x%x", addr); csr = num; }
+
+    switch (f3) {
+    case 0x1: /* CSRRW */
+        if (rdn == 0) snprintf(buf, buflen, "csrw %s,%s", csr, s1);
+        else          snprintf(buf, buflen, "csrrw %s,%s,%s", d, csr, s1);
+        return;
+    case 0x2: /* CSRRS — a bare read (rs1 == x0) collapses to csrr / rd<counter> */
+        if (rs1n == 0) {
+            const char *p = csr_rd_pseudo(addr);
+            if (p) snprintf(buf, buflen, "%s %s", p, d);
+            else   snprintf(buf, buflen, "csrr %s,%s", d, csr);
+        } else if (rdn == 0) snprintf(buf, buflen, "csrs %s,%s", csr, s1);
+        else                 snprintf(buf, buflen, "csrrs %s,%s,%s", d, csr, s1);
+        return;
+    case 0x3: /* CSRRC */
+        if (rdn == 0) snprintf(buf, buflen, "csrc %s,%s", csr, s1);
+        else          snprintf(buf, buflen, "csrrc %s,%s,%s", d, csr, s1);
+        return;
+    case 0x5: /* CSRRWI */
+        if (rdn == 0) snprintf(buf, buflen, "csrwi %s,%u", csr, rs1n);
+        else          snprintf(buf, buflen, "csrrwi %s,%s,%u", d, csr, rs1n);
+        return;
+    case 0x6: /* CSRRSI */
+        if (rdn == 0) snprintf(buf, buflen, "csrsi %s,%u", csr, rs1n);
+        else          snprintf(buf, buflen, "csrrsi %s,%s,%u", d, csr, rs1n);
+        return;
+    case 0x7: /* CSRRCI */
+        if (rdn == 0) snprintf(buf, buflen, "csrci %s,%u", csr, rs1n);
+        else          snprintf(buf, buflen, "csrrci %s,%s,%u", d, csr, rs1n);
+        return;
+    default:
+        snprintf(buf, buflen, ".word 0x%08x", inst);
+        return;
+    }
+}
+
 void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
     uint32_t op = opcode(inst);
     uint32_t f3 = funct3(inst);
@@ -180,9 +254,13 @@ void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
 
     case OP_SYSTEM: {
         uint32_t f12 = inst >> 20;
-        if (f3 == 0 && f12 == 0x000) snprintf(buf, buflen, "ecall");
-        else if (f3 == 0 && f12 == 0x001) snprintf(buf, buflen, "ebreak");
-        else snprintf(buf, buflen, ".word 0x%08x", inst);
+        if (f3 == 0) {
+            if (f12 == 0x000)      snprintf(buf, buflen, "ecall");
+            else if (f12 == 0x001) snprintf(buf, buflen, "ebreak");
+            else                   snprintf(buf, buflen, ".word 0x%08x", inst);
+        } else {
+            disasm_csr(inst, f3, buf, buflen);
+        }
         return;
     }
 
