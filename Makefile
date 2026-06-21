@@ -13,6 +13,7 @@
 #   make check-disasm  cross-check the disassembler against objdump
 #   make check-cache   check the cache model on a locality workload
 #   make check-pipeline  check the pipeline model on a hazard workload
+#   make check-diff   differential-test against a reference sim (qemu-riscv32)
 #   make debug      build with -g -O0 for stepping under gdb
 #   make clean      remove build artifacts
 
@@ -32,7 +33,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline embed debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-diff embed debug clean
 
 all: $(BIN)
 
@@ -105,6 +106,12 @@ check-cache: $(BIN) tests/test_stack.elf
 # hazard lowers the stall count and cycle estimate without changing the result.
 check-pipeline: $(BIN) tests/hazard_slow.elf tests/hazard_fast.elf
 	@sh tests/check_pipeline.sh
+
+# Differential test: compare quanta against a reference simulator (qemu-riscv32
+# by default; override with REF=...) on the sample programs. Skips cleanly if
+# the reference simulator is not installed.
+check-diff: $(BIN) $(TEST_ELF)
+	@sh tests/check_diff.sh $(TEST_ELF)
 
 debug: CFLAGS := -std=c11 -Wall -Wextra -g -O0 -Isrc
 debug: clean $(BIN)
