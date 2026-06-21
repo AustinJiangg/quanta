@@ -84,3 +84,44 @@ jobs:
 
       - name: Build + run the suite under ASan/UBSan
         run: make sanitize
+
+  fuzz:
+    runs-on: ubuntu-latest
+    name: fuzz (libfuzzer smoke)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-toolchain and clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf clang
+
+      - name: Build seed ELFs and fuzzers
+        run: |
+          make tests
+          make fuzz
+
+      # Fuzz each surface for a short, fixed budget. Engine stderr is captured to
+      # a log (kept clean on success); on a crash, show the tail — which holds the
+      # sanitizer report — and the crashing input is uploaded below.
+      - name: Fuzz the ELF loader
+        run: |
+          mkdir -p corpus/elf && cp tests/*.elf corpus/elf/
+          ./fuzz/fuzz_elf -max_total_time=40 -error_exitcode=1 corpus/elf 2>fuzz_elf.log \
+            || { echo '=== fuzz_elf.log (tail) ==='; tail -100 fuzz_elf.log; exit 1; }
+
+      - name: Fuzz decode/execute
+        run: |
+          ./fuzz/fuzz_decode -max_total_time=40 -error_exitcode=1 2>fuzz_decode.log \
+            || { echo '=== fuzz_decode.log (tail) ==='; tail -100 fuzz_decode.log; exit 1; }
+
+      - name: Upload crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore
