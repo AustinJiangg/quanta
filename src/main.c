@@ -10,7 +10,7 @@
  * Quanta driver — a thin client over libquanta.
  *
  * Usage:
- *   quanta [--trace] [--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [program.elf]
+ *   quanta [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [program.elf]
  *
  * With a path, Quanta loads that RV32I ELF executable and runs it from its
  * entry point. With no argument, it runs a tiny built-in demo program — a
@@ -21,6 +21,10 @@
  * (quanta.h); the driver only owns argument parsing, the trace narration, and
  * the pipeline timing overlay. The disassembler and pipeline model are library
  * utilities the driver still calls directly.
+ *
+ * --quiet suppresses all driver chatter (banner, summary, reports, register
+ * dump), leaving only what the guest itself writes — so quanta's output lines
+ * up byte-for-byte with a reference simulator for differential testing.
  *
  * The demo computes a couple of values, then asks the "kernel" to terminate it
  * with the exit syscall (a7 = 93). a0 carries the status, so it doubles as the
@@ -102,6 +106,7 @@ static uint64_t run_until_halt(Quanta *q, int trace, Pipeline *pipe) {
 
 int main(int argc, char **argv) {
     int trace = 0;
+    int quiet = 0;
     int cache_on = 0;
     int pipe_on = 0;
     uint32_t csize = 1024, cways = 2, cblock = 32; /* default L1 geometry */
@@ -109,6 +114,8 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--trace") == 0) {
             trace = 1;
+        } else if (strcmp(argv[i], "--quiet") == 0) {
+            quiet = 1;
         } else if (strcmp(argv[i], "--cache") == 0) {
             cache_on = 1;
         } else if (strncmp(argv[i], "--cache=", 8) == 0) {
@@ -122,14 +129,16 @@ int main(int argc, char **argv) {
             pipe_on = 1;
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
-            fprintf(stderr, "usage: %s [--trace] [--cache[=SIZE:WAYS:BLOCK]] "
-                    "[--pipeline] [program.elf]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--trace] [--quiet] "
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [program.elf]\n",
+                    argv[0]);
             return 2;
         } else if (path == NULL) {
             path = argv[i];
         } else {
-            fprintf(stderr, "usage: %s [--trace] [--cache[=SIZE:WAYS:BLOCK]] "
-                    "[--pipeline] [program.elf]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--trace] [--quiet] "
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [program.elf]\n",
+                    argv[0]);
             return 2;
         }
     }
@@ -158,11 +167,13 @@ int main(int argc, char **argv) {
     uint32_t entry = quanta_pc(q);
     uint32_t sp    = quanta_reg(q, 2);
 
-    printf("Quanta — RV32I emulator\n");
-    if (demo) {
-        printf("No ELF given; running the built-in demo program.\n\n");
-    } else {
-        printf("Loaded %s (entry = 0x%08x, sp = 0x%08x)\n\n", path, entry, sp);
+    if (!quiet) {
+        printf("Quanta — RV32I emulator\n");
+        if (demo) {
+            printf("No ELF given; running the built-in demo program.\n\n");
+        } else {
+            printf("Loaded %s (entry = 0x%08x, sp = 0x%08x)\n\n", path, entry, sp);
+        }
     }
 
     /* Optional cache model: a pure observability layer in front of memory. It
@@ -182,34 +193,36 @@ int main(int argc, char **argv) {
     uint64_t steps = run_until_halt(q, trace, pipe_on ? &pipe : NULL);
 
     QuantaHalt halt = quanta_halt_reason(q);
-    if (halt == QUANTA_HALT_EXIT) {
-        printf("Program exited with code %u after %llu instruction(s).\n\n",
-               quanta_exit_code(q), (unsigned long long)steps);
-    } else if (halt != QUANTA_RUN) {
-        printf("Halted: %s", quanta_halt_str(halt));
-        if (halt == QUANTA_HALT_MEM_FAULT)
-            printf(" at 0x%08x", quanta_fault_addr(q));
-        printf(" after %llu instruction(s).\n\n", (unsigned long long)steps);
-    } else {
-        printf("Stopped at the %llu-instruction safety limit.\n\n",
-               (unsigned long long)steps);
+    if (!quiet) {
+        if (halt == QUANTA_HALT_EXIT) {
+            printf("Program exited with code %u after %llu instruction(s).\n\n",
+                   quanta_exit_code(q), (unsigned long long)steps);
+        } else if (halt != QUANTA_RUN) {
+            printf("Halted: %s", quanta_halt_str(halt));
+            if (halt == QUANTA_HALT_MEM_FAULT)
+                printf(" at 0x%08x", quanta_fault_addr(q));
+            printf(" after %llu instruction(s).\n\n", (unsigned long long)steps);
+        } else {
+            printf("Stopped at the %llu-instruction safety limit.\n\n",
+                   (unsigned long long)steps);
+        }
     }
 
-    if (cache_on) {
+    if (cache_on && !quiet) {
         quanta_cache_report(q, stdout);
         printf("\n");
     }
 
-    if (pipe_on) {
+    if (pipe_on && !quiet) {
         pipeline_report(&pipe, stdout);
         printf("\n");
     }
 
-    quanta_dump_regs(q, stdout);
+    if (!quiet) quanta_dump_regs(q, stdout);
 
     /* The built-in demo has a known answer, so check it as a self-test. A
      * loaded ELF is arbitrary, so we just report its final state. */
-    if (demo) {
+    if (demo && !quiet) {
         uint32_t a2 = quanta_reg(q, 12); /* a2 */
         uint32_t a3 = quanta_reg(q, 13); /* a3 */
         printf("\nExpected: a2 = 42, a3 = 32\n");
