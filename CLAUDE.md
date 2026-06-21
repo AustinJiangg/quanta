@@ -15,8 +15,9 @@ Quanta is a from-scratch RISC-V (RV32I) instruction-set emulator in C, built to
 learn computer architecture. It models a single hart: 32 registers, a PC, and a
 flat little-endian memory. The core is a fetch/decode/execute loop.
 
-All roadmap milestones (M0–M7) are complete: the full RV32I base integer set
-plus the RV32M multiply/divide extension are implemented and pinned by a
+All roadmap milestones (M0–M7) are complete, and Part II is under way: the full
+RV32I base integer set plus the RV32M multiply/divide and Zicsr/Zifencei (CSR
+access and `fence.i`, M8) extensions are implemented and pinned by a
 hand-written conformance suite (`make check`), an optional cache model sits in
 front of memory, and a `--pipeline` timing model estimates cycles and CPI.
 Quanta loads ELF32
@@ -71,8 +72,9 @@ program.
   emulator itself, since the built-in demo needs no ELF.
 
 When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
-(the RV32M test uses `-march=rv32im`; the Makefile overrides `RVCFLAGS` for just
-`tests/test_muldiv.elf`).
+(the RV32M test uses `-march=rv32im` and the CSR test
+`-march=rv32i_zicsr_zifencei`; the Makefile overrides `RVCFLAGS` for just those
+two ELFs).
 
 ## Code layout
 
@@ -84,7 +86,9 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
 - `src/cpu.{h,c}` — CPU state and the instruction core. Each instruction group
   has its own `exec_*` function; decoding comes from `decode.h`. RV32M
   (multiply/divide) shares the OP opcode and lives in `exec_muldiv`, selected by
-  `funct7 == 0x01`.
+  `funct7 == 0x01`. Zicsr (CSR access) lives in `exec_csr`, reached from
+  `exec_system` when SYSTEM carries a non-zero funct3; `csr_read`/`csr_write`
+  are the choke point the (still privilege-free) CSR file flows through.
 - `src/disasm.{h,c}` — RV32I disassembler: turns an instruction word back into
   objdump-style assembly (ABI names, common pseudo-instructions, absolute
   branch/jump targets). Mirrors `cpu_step`'s opcode switch over `decode.h`.
@@ -134,7 +138,9 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
 - `tests/check_diff.sh` — differential test: runs each sample ELF under
   `quanta --quiet` and a reference simulator (qemu-riscv32 by default, override
   with `REF=`) and asserts they agree on stdout and exit code (`make
-  check-diff`). Skips cleanly if the reference is absent.
+  check-diff`). Skips cleanly if the reference is absent. `tests/test_csr.elf`
+  is excluded (its machine-mode CSR use trips user-mode qemu's privilege
+  check); `make check` pins it instead.
 - `fuzz/fuzz_elf.c`, `fuzz/fuzz_decode.c` — libFuzzer harnesses over the ELF
   loader and the decode/execute path; `fuzz/standalone.c` is a plain-main driver
   so they replay over a corpus under gcc (`make fuzz` / `make fuzz-replay`).
@@ -196,11 +202,18 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
   stalls), predict-not-taken control penalties (JAL 1, taken branch/JALR 2), no
   structural or cache-miss penalties — not a cycle-accurate simulation.
 - FENCE (MISC-MEM opcode `0x0f`) is a no-op — a single in-order hart has
-  nothing to reorder. CSR instructions (Zicsr) and FENCE.I (Zifencei) are
-  outside base RV32I: CSRs currently halt as "unimplemented SYSTEM", and
-  that's why conformance uses the hand-written `make check` suite rather than
-  the official `riscv-tests` (whose `-p` environment needs CSR/trap support).
-- RV32M (M5) is the one extension wired in so far: it shares the OP opcode and
+  nothing to reorder — and so is FENCE.I (Zifencei), its instruction-stream
+  cousin, for the same reason (no modelled icache to flush). CSR instructions
+  (Zicsr, M8) are implemented: a SYSTEM word with a non-zero funct3 runs
+  `csrrw/s/c` and their immediate forms through `exec_csr`. Most CSRs are plain
+  WARL storage; the unprivileged counters (`cycle`/`time`/`instret` and their
+  high halves) read back the retired-instruction count, and writes to read-only
+  CSRs are dropped. Privilege levels and the trap CSRs (`mstatus`/`mtvec`/…)
+  are still to come (M9), so `mret`/`sret`/`wfi` and a reserved `funct3 == 4`
+  still halt as "unimplemented SYSTEM". Conformance stays on the hand-written
+  `make check` rather than the official `riscv-tests` (whose `-p` environment
+  needs the M9 trap support).
+- RV32M (M5) was the first extension wired in: it shares the OP opcode and
   is selected by `funct7 == 0x01` (`exec_muldiv` in `cpu.c`, mirrored in
   `disasm.c`). Divide-by-zero and the `INT_MIN / -1` signed overflow return
   *defined* values rather than trapping. Its test must be assembled with

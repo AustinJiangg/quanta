@@ -404,15 +404,30 @@ every ISA change that follows.
 
 ### Stage 1 — ISA prerequisites (M8–M11)
 
-## M8 — Zicsr + Zifencei
+## M8 — Zicsr + Zifencei (DONE)
 
-- [ ] **Build:** a CSR register file and `csrrw/csrrs/csrrc(+i)`, plus `FENCE.I`.
-- [ ] **ISA:** Zicsr, Zifencei.
-- [ ] **Concept:** control/status registers as the machine's configuration and
+The first Part II capability milestone. A SYSTEM word with a non-zero funct3 now
+runs the six CSR instructions (`csrrw/csrrs/csrrc` and their immediate forms)
+through a CSR file in `cpu.c` (`exec_csr`, with `csr_read`/`csr_write` as the
+choke point M9 will hook privilege into). Most CSRs are plain WARL storage for
+now; the unprivileged counters (`cycle`/`time`/`instret` and their RV32 high
+halves) read back a live retired-instruction count, and writes to read-only CSRs
+are dropped rather than trapped (traps are M9). FENCE.I (Zifencei) joins FENCE as
+a no-op — a single in-order hart with no modelled icache has nothing to flush.
+The disassembler gained the CSR pseudo-instructions (`csrr`/`csrw`/`rdinstret`/…)
+so `make check-disasm` still matches objdump, and `tests/test_csr.S` pins the
+read-modify-write and side-effect semantics. That test uses `mscratch`, a
+machine-mode CSR user-mode qemu rejects, so it is kept out of `make check-diff`
+and covered by `make check` instead. The official `riscv-tests` `-p` environment
+(E6) needs the trap support that follows in M9; this milestone is its CSR half.
+
+- [x] **Build:** a CSR register file and `csrrw/csrrs/csrrc(+i)`, plus `FENCE.I`.
+- [x] **ISA:** Zicsr, Zifencei.
+- [x] **Concept:** control/status registers as the machine's configuration and
   status surface; why CSR access is its own instruction class.
-- [ ] **Done when:** CSR programs run instead of halting; this unlocks the
+- [x] **Done when:** CSR programs run instead of halting; this unlocks the
   official `riscv-tests` `-p` environment (E6).
-- [ ] **Commits:** `feat: add csr register file and zicsr`,
+- [x] **Commits:** `feat: add csr register file and zicsr`,
   `feat: implement fence.i`, `docs: document csr support`.
 
 ## M9 — Privileged architecture (M/S/U + traps)
