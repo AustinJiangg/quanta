@@ -4,6 +4,7 @@
 #include "cache.h"
 
 #include <stdio.h>
+#include <string.h>
 
 /* ------------------------------------------------------------------------
  * The instruction core.
@@ -23,6 +24,8 @@ void cpu_init(CPU *cpu, Memory *mem, uint32_t entry_pc) {
     cpu->halted      = 0;
     cpu->halt_reason = HALT_NONE;
     cpu->exit_code   = 0;
+    cpu->instret     = 0;
+    memset(cpu->csr, 0, sizeof cpu->csr);
 }
 
 uint32_t reg_read(const CPU *cpu, uint32_t i) {
@@ -187,23 +190,97 @@ static void exec_store(CPU *cpu, uint32_t inst) {
     }
 }
 
-/* Execute SYSTEM: environment calls. ECALL traps to the syscall layer; EBREAK
- * stops the machine (a breakpoint with no debugger attached). The two differ
- * only in the 12-bit immediate (funct12). CSR instructions (funct3 != 0) are
- * not modelled yet. */
+/* ------------------------------------------------------------------------
+ * Zicsr: the control/status register file.
+ *
+ * CSRs occupy a separate 12-bit address space (4096 of them), reached only by
+ * the CSR instructions — never by load/store. Most are plain WARL storage at
+ * this milestone; the unprivileged counters (cycle/time/instret) are live
+ * views of the retired-instruction count. The privilege model and the
+ * architecturally-defined trap CSRs (mstatus/mtvec/...) arrive in M9, so
+ * csr_read/csr_write are deliberately a choke point: that is where privilege
+ * checks and read side effects will hook in.
+ * ------------------------------------------------------------------------ */
+
+/* Read CSR `addr`. The three unprivileged counters (and their RV32 high
+ * halves) read back the retired-instruction count; cycle == instret here
+ * because the functional core retires one instruction per "cycle" — the
+ * --pipeline overlay is the place that models cycles != instructions. */
+static uint32_t csr_read(const CPU *cpu, uint32_t addr) {
+    switch (addr) {
+        case CSR_CYCLE:  case CSR_TIME:  case CSR_INSTRET:
+            return (uint32_t)cpu->instret;
+        case CSR_CYCLEH: case CSR_TIMEH: case CSR_INSTRETH:
+            return (uint32_t)(cpu->instret >> 32);
+        default:
+            return cpu->csr[addr];
+    }
+}
+
+/* Write `val` to CSR `addr`. A CSR whose address has 0b11 in its top two bits
+ * is read-only by the spec's encoding convention (the counters live there):
+ * drop the write rather than fault, since traps don't exist until M9. */
+static void csr_write(CPU *cpu, uint32_t addr, uint32_t val) {
+    if (((addr >> 10) & 0x3) == 0x3) return; /* read-only CSR */
+    cpu->csr[addr] = val;
+}
+
+/* Execute a Zicsr instruction: an atomic read-modify-write of one CSR.
+ *
+ * Every form reads the old CSR value into rd and then updates the CSR; they
+ * differ in how the new value is formed and which side effect is skipped:
+ *   - CSRRW(I) writes the operand outright, and skips the *read* when rd == x0.
+ *   - CSRRS(I) sets the operand's bits and CSRRC(I) clears them; both skip the
+ *     *write* when the source is zero, so a bare read causes no write effects.
+ * The immediate forms (funct3 1xx) take a 5-bit zero-extended immediate from
+ * the rs1 field instead of the register value; in both forms an rs1 field of 0
+ * is the "no source" case, so one test covers register and immediate alike. */
+static void exec_csr(CPU *cpu, uint32_t inst) {
+    uint32_t addr = (inst >> 20) & 0xfff;
+    uint32_t f3   = funct3(inst);
+    uint32_t rs1f = rs1(inst);
+    uint32_t src  = (f3 & 0x4) ? rs1f : reg_read(cpu, rs1f);
+    uint32_t old  = 0;
+
+    switch (f3 & 0x3) {
+        case 0x1: /* CSRRW(I): swap; the read is suppressed when rd is x0 */
+            if (rd(inst) != 0) old = csr_read(cpu, addr);
+            csr_write(cpu, addr, src);
+            break;
+        case 0x2: /* CSRRS(I): read, then set bits (no write if source is 0) */
+            old = csr_read(cpu, addr);
+            if (rs1f != 0) csr_write(cpu, addr, old | src);
+            break;
+        case 0x3: /* CSRRC(I): read, then clear bits (no write if source is 0) */
+            old = csr_read(cpu, addr);
+            if (rs1f != 0) csr_write(cpu, addr, old & ~src);
+            break;
+    }
+    reg_write(cpu, rd(inst), old);
+}
+
+/* Execute SYSTEM: environment calls and CSR access. With funct3 == 0, ECALL
+ * traps to the syscall layer and EBREAK stops the machine (a breakpoint with
+ * no debugger attached) — the two differ only in the 12-bit immediate. A
+ * non-zero funct3 (other than the reserved 4) selects the Zicsr instructions.
+ * Other funct3 == 0 system ops (mret/sret/wfi) are privileged-spec material
+ * for M9 and stop the machine for now. */
 static void exec_system(CPU *cpu, uint32_t inst) {
-    uint32_t funct12 = inst >> 20;
-    if (funct3(inst) == 0) {
-        if (funct12 == 0x000) { /* ECALL  */
-            syscall_dispatch(cpu);
-            return;
-        }
-        if (funct12 == 0x001) { /* EBREAK */
+    uint32_t f3 = funct3(inst);
+
+    if (f3 == 0) {
+        uint32_t funct12 = inst >> 20;
+        if (funct12 == 0x000) { syscall_dispatch(cpu); return; } /* ECALL  */
+        if (funct12 == 0x001) {                                  /* EBREAK */
             cpu->halt_reason = HALT_EBREAK;
             cpu->halted = 1;
             return;
         }
+    } else if (f3 != 0x4) { /* funct3 1/2/3/5/6/7 = the Zicsr group */
+        exec_csr(cpu, inst);
+        return;
     }
+
     fprintf(stderr, "unimplemented SYSTEM instruction 0x%08x at pc=0x%08x\n",
             inst, cpu->pc);
     cpu->halt_reason = HALT_UNIMP_SYSTEM;
@@ -290,6 +367,7 @@ void cpu_step(CPU *cpu) {
         return; /* don't commit PC past the faulting instruction */
     }
 
+    cpu->instret++; /* the instruction retired; drives the counter CSRs */
     cpu->pc = next_pc;
 }
 

@@ -103,7 +103,19 @@ enum {
     OP_FENCE  = 0x0f, /* FENCE / FENCE.I          */
     OP_IMM    = 0x13, /* ADDI/SLTI/.../SRAI       */
     OP_REG    = 0x33, /* ADD/SUB/.../AND          */
-    OP_SYSTEM = 0x73  /* ECALL/EBREAK             */
+    OP_SYSTEM = 0x73  /* ECALL/EBREAK/CSR         */
+};
+
+/* ------------------------------------------------------------------------
+ * Zicsr CSR addresses referenced by name in the core and the disassembler.
+ * The unprivileged counters are read-only (their address's top two bits are
+ * 0b11) and read back a live value; mscratch is a plain read/write CSR used
+ * by the conformance test. The full privileged CSR set arrives with M9.
+ * ------------------------------------------------------------------------ */
+enum {
+    CSR_MSCRATCH = 0x340,
+    CSR_CYCLE    = 0xc00, CSR_TIME  = 0xc01, CSR_INSTRET  = 0xc02,
+    CSR_CYCLEH   = 0xc80, CSR_TIMEH = 0xc81, CSR_INSTRETH = 0xc82
 };
 
 /* ABI register names (x0..x31), handy for register dumps and disassembly. */

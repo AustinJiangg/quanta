@@ -8,9 +8,11 @@
  * RV32I CPU state.
  *
  * The architectural state of an RV32I hart is small: 32 general-purpose
- * 32-bit registers plus a program counter. That is the entire "visible"
- * machine. Everything the processor does is a function that maps one such
- * state to the next.
+ * 32-bit registers plus a program counter. With the Zicsr extension a sparse
+ * file of control/status registers joins them — configuration and counters
+ * read and written only by the CSR instructions, never by load/store.
+ * Everything the processor does is a function that maps one such state to the
+ * next.
  *
  * Register x0 is hardwired to zero in RISC-V: reads always return 0 and
  * writes are discarded. We enforce that in reg_write() rather than trusting
@@ -28,7 +30,7 @@ typedef enum {
     HALT_EXIT,             /* clean stop via the exit syscall */
     HALT_EBREAK,           /* ebreak with no debugger attached */
     HALT_ILLEGAL_INSN,     /* illegal or unimplemented instruction */
-    HALT_UNIMP_SYSTEM,     /* unimplemented SYSTEM instruction (e.g. a CSR) */
+    HALT_UNIMP_SYSTEM,     /* unimplemented SYSTEM instruction (e.g. mret/wfi) */
     HALT_UNKNOWN_SYSCALL,  /* ecall with a syscall number we do not implement */
     HALT_MEM_FAULT         /* fetch/load/store outside mapped memory */
 } HaltReason;
@@ -41,6 +43,8 @@ typedef struct {
     int      halted;        /* set when execution should stop */
     HaltReason halt_reason; /* why it stopped (meaningful once halted) */
     uint32_t exit_code;     /* status the exit syscall passed in a0 */
+    uint64_t instret;       /* retired-instruction count; backs the counter CSRs */
+    uint32_t csr[4096];     /* Zicsr control/status registers; see csr_read/write */
 } CPU;
 
 /* Initialise a CPU: zero all registers, set PC to the given entry point,
