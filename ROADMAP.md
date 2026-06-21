@@ -328,18 +328,21 @@ every ISA change that follows.
 - [x] **Done when:** the suite passes clean under ASan/UBSan in CI.
 - [x] **Commits:** `chore: add a sanitizer build and ci job`.
 
-### E4 — Fuzzing
+### E4 — Fuzzing (DONE)
 
-- [ ] **Build:** libFuzzer/AFL++ harnesses for (1) the ELF loader — the most
-  security-sensitive path, parsing untrusted files — and (2) decode→execute,
-  feeding random instruction words and asserting no host crash or OOB. Crashes
-  become regression tests; keep a corpus.
-- [ ] **Why:** untrusted input deserves adversarial input.
-- [ ] **Done when:** a fuzz target runs in CI; malformed ELF always errors
-  cleanly rather than hitting UB.
-- [ ] **Commits:** `test: add elf-loader fuzz harness`,
-  `test: add decode fuzz harness`,
-  `fix: harden elf parsing against malformed input`.
+- [x] **Build:** two libFuzzer harnesses (`fuzz/`) over the untrusted-input
+  surfaces — the ELF loader (`fuzz_elf`) and decode→execute (`fuzz_decode`),
+  each linking the engine under `-fsanitize=fuzzer,address,undefined`. `make
+  fuzz` builds them (clang); `make fuzz-replay` runs them over the seed corpus
+  under gcc + ASan/UBSan (via `fuzz/standalone.c`) so they stay exercised without
+  clang. A CI job fuzzes each for 40s, seeded with the sample ELFs, and uploads
+  any crash input as an artifact.
+- [x] **Why:** untrusted input deserves adversarial input.
+- [x] **Done when:** a fuzz target runs in CI; malformed ELF always errors
+  cleanly rather than hitting UB. (No bug found — the loader is defensively
+  bounds-checked; a local 650-input malformed smoke was clean too.)
+- [x] **Commits:** `test: add libfuzzer harnesses`,
+  `chore: run fuzzing in ci`.
 
 ### E5 — Differential testing against a golden model (DONE)
 

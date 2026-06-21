@@ -45,6 +45,8 @@ make check-cache   # check the cache model on a locality workload (needs cross-t
 make check-pipeline # check the pipeline model on a hazard workload (needs cross-toolchain)
 make check-diff    # differential-test against qemu-riscv32 (needs qemu-user-static)
 make sanitize      # build with ASan+UBSan and run the suite (needs cross-toolchain)
+make fuzz          # build the libFuzzer harnesses (needs clang)
+make fuzz-replay   # run the harnesses over the corpus under gcc (needs cross-toolchain)
 make clean
 ```
 
@@ -133,6 +135,9 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
   `quanta --quiet` and a reference simulator (qemu-riscv32 by default, override
   with `REF=`) and asserts they agree on stdout and exit code (`make
   check-diff`). Skips cleanly if the reference is absent.
+- `fuzz/fuzz_elf.c`, `fuzz/fuzz_decode.c` — libFuzzer harnesses over the ELF
+  loader and the decode/execute path; `fuzz/standalone.c` is a plain-main driver
+  so they replay over a corpus under gcc (`make fuzz` / `make fuzz-replay`).
 - `tests/hazard_slow.S` + `tests/hazard_fast.S` — the same array sum scheduled
   with and without a load-use hazard; `tests/check_pipeline.sh` runs both under
   `--pipeline` and asserts the reorder cut stalls and cycles without changing the
