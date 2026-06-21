@@ -286,19 +286,21 @@ Front-load E1, E2, E5: the library split unblocks tooling, CI makes regressions
 visible, and differential testing against a golden model is the safety net under
 every ISA change that follows.
 
-### E1 — Split the engine into `libquanta`
+### E1 — Split the engine into `libquanta` (DONE)
 
-- [ ] **Build:** extract the core (`cpu`, `memory`, `decode`, `elf`, `syscall`,
-  `cache`, `pipeline`) into a library with a documented C API (`quanta_create` /
-  `quanta_load_elf` / `quanta_step` / `quanta_run`, register and memory
-  accessors, an event/hook interface). Replace fatal `exit()`/`abort()` in the
-  core with returned error codes — a library cannot terminate its host. `main.c`
-  becomes a thin client linking `libquanta`.
-- [ ] **Why:** precondition for the GDB stub, bindings, fuzz harnesses, and unit
+- [x] **Build:** the core is wrapped behind an opaque `Quanta *` handle
+  (`src/quanta.{h,c}`): lifecycle, ELF/raw-image loading, optional cache,
+  `quanta_step`/`quanta_run`, and register/memory accessors, with public
+  `QuantaStatus`/`QuantaHalt` enums decoupled from the internal `HaltReason`. The
+  core's only host-killing `exit()` is gone — an out-of-range access is now a
+  recorded fault. `main.c` is a thin client; the engine builds as `libquanta.a`.
+  (The richer event/hook interface is deferred to E9, where the GDB stub needs it.)
+- [x] **Why:** precondition for the GDB stub, bindings, fuzz harnesses, and unit
   tests. Most of Part II's tooling depends on it.
-- [ ] **Done when:** a ~20-line C program embeds the emulator and runs a guest;
-  the CLI links `libquanta`; no `exit()` remains in the core.
-- [ ] **Commits:** `refactor: return errors instead of exiting the core`,
+- [x] **Done when:** `examples/embed.c` (~30 lines) embeds the emulator and runs
+  a guest (`make embed`); the CLI links `libquanta`; no `exit()` remains in the
+  core.
+- [x] **Commits:** `refactor: replace core exit() with halt reasons`,
   `refactor: extract libquanta engine api`,
   `refactor: rebuild the cli on libquanta`.
 

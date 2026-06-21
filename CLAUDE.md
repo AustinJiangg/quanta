@@ -36,6 +36,7 @@ consult it for what comes next and tick boxes there as milestones land.
 ```sh
 make          # build ./quanta (native host binary)
 make run      # build and run the built-in demo program
+make embed    # build and run the libquanta embedding example
 make debug    # build with -g -O0 for gdb
 make tests    # build the sample RISC-V programs (needs cross-toolchain)
 make check    # build and run the RV32I conformance suite (needs cross-toolchain)
@@ -98,8 +99,19 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
 - `src/syscall.{h,c}` — the system-call layer (the "kernel" side of ECALL):
   dispatches on the `a7` syscall number and implements `write` and `exit` per
   the RISC-V Linux/newlib ABI.
-- `src/main.c` — driver: loads an ELF named on the command line (or runs the
-  built-in demo when none is given), with an optional `--trace` flag.
+- `src/quanta.{h,c}` — the public `libquanta` engine API: an opaque `Quanta *`
+  handle wrapping CPU + memory + the optional cache, with lifecycle, ELF/raw-image
+  loading, `quanta_step`/`quanta_run`, and register/memory accessors. The engine
+  core never calls `exit()` on its host — every stop is a `HaltReason` (an
+  out-of-range access becomes `HALT_MEM_FAULT`), surfaced through the public
+  `QuantaStatus`/`QuantaHalt` enums. Built as `libquanta.a`; the CLI and
+  `examples/embed.c` are clients of it.
+- `src/main.c` — the CLI driver, a thin client over `quanta.h`: argument parsing,
+  the `--trace` narration, and the `--pipeline`/`--cache` overlays, all driving
+  the machine through the public API (no engine internals). Loads an ELF named on
+  the command line, or runs the built-in demo when none is given.
+- `examples/embed.c` — minimal embedding example: ~30 lines that load and run a
+  guest through `libquanta` (`make embed`).
 - `tests/hello.S` — sample RV32I assembly, mirrors the built-in demo.
 - `tests/hello_world.S` — syscall demo: prints a string with `write`, then
   `exit`s.
