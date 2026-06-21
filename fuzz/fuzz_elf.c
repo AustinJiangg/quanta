@@ -9,6 +9,8 @@
  * `make fuzz-replay` links fuzz/standalone.c and runs it over the seed corpus
  * under gcc + ASan/UBSan (no clang needed).
  */
+#define _DEFAULT_SOURCE   /* expose POSIX mkstemp/write/unlink under -std=c11 */
+
 #include "quanta.h"
 
 #include <stdlib.h>

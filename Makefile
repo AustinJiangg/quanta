@@ -145,13 +145,13 @@ sanitize:
 fuzz: $(FUZZ_TARGETS)
 
 fuzz/fuzz_%: fuzz/fuzz_%.c $(LIB_SRC) $(wildcard src/*.h)
-	$(FUZZ_CC) -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined -Isrc \
-		-o $@ $< $(LIB_SRC)
+	$(FUZZ_CC) -std=c11 -Wall -Wextra -g -O1 -fsanitize=fuzzer,address,undefined \
+		-Isrc -o $@ $< $(LIB_SRC)
 
 fuzz-replay: $(TEST_ELF)
 	@for h in fuzz_elf fuzz_decode; do \
-		$(CC) -std=c11 -g -O1 $(SANFLAGS) -Isrc -o fuzz/$$h.replay \
-			fuzz/$$h.c fuzz/standalone.c $(LIB_SRC) || exit 1; \
+		$(CC) -std=c11 -Wall -Wextra -Werror -g -O1 $(SANFLAGS) -Isrc \
+			-o fuzz/$$h.replay fuzz/$$h.c fuzz/standalone.c $(LIB_SRC) || exit 1; \
 		echo "replay $$h over $(words $(TEST_ELF)) sample ELF(s):"; \
 		./fuzz/$$h.replay $(TEST_ELF) && echo "  OK — $$h sanitizer-clean" || exit 1; \
 	done
