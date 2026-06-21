@@ -58,9 +58,6 @@ void reg_write(CPU *cpu, uint32_t i, uint32_t value);
  * stops instead of advancing. */
 void cpu_step(CPU *cpu);
 
-/* Dump all registers and PC to stdout, for debugging. */
-void cpu_dump(const CPU *cpu);
-
 /* A short human-readable name for a halt reason, for diagnostics. */
 const char *halt_reason_str(HaltReason r);
 

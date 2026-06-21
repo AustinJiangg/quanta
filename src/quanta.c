@@ -4,6 +4,7 @@
 #include "memory.h"
 #include "elf.h"
 #include "cache.h"
+#include "decode.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -193,4 +194,18 @@ const char *quanta_halt_str(QuantaHalt h) {
         case QUANTA_HALT_STEP_LIMIT:      return "instruction-count limit";
     }
     return "unknown";
+}
+
+const char *quanta_reg_name(int i) {
+    return (i >= 0 && i <= 31) ? reg_abi_name((uint32_t)i) : "?";
+}
+
+void quanta_dump_regs(const Quanta *q, FILE *out) {
+    if (!q || !out) return;
+    fprintf(out, "pc = 0x%08x\n", quanta_pc(q));
+    for (int i = 0; i < 32; i++) {
+        fprintf(out, "x%-2d %-4s = 0x%08x", i, reg_abi_name((uint32_t)i),
+                quanta_reg(q, i));
+        fputs((i % 2) ? "\n" : "    ", out);
+    }
 }

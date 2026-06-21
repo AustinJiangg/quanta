@@ -293,17 +293,6 @@ void cpu_step(CPU *cpu) {
     cpu->pc = next_pc;
 }
 
-void cpu_dump(const CPU *cpu) {
-    /* ABI register names (decode.h) make the dump easy to cross-check against
-     * a disassembly. */
-    printf("pc = 0x%08x\n", cpu->pc);
-    for (int i = 0; i < 32; i++) {
-        printf("x%-2d %-4s = 0x%08x", i, reg_abi_name((uint32_t)i), cpu->regs[i]);
-        printf((i % 2) ? "\n" : "    ");
-    }
-    if (32 % 2) printf("\n");
-}
-
 const char *halt_reason_str(HaltReason r) {
     switch (r) {
         case HALT_NONE:            return "running";

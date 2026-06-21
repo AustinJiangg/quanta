@@ -1,9 +1,5 @@
-#include "cpu.h"
-#include "memory.h"
-#include "elf.h"
-#include "decode.h"
+#include "quanta.h"
 #include "disasm.h"
-#include "cache.h"
 #include "pipeline.h"
 
 #include <stdio.h>
@@ -11,15 +7,20 @@
 #include <string.h>
 
 /*
- * Quanta driver.
+ * Quanta driver — a thin client over libquanta.
  *
  * Usage:
- *   quanta [program.elf]
+ *   quanta [--trace] [--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [program.elf]
  *
  * With a path, Quanta loads that RV32I ELF executable and runs it from its
  * entry point. With no argument, it runs a tiny built-in demo program — a
  * toolchain-free smoke test — so the emulator stays runnable even without the
  * RISC-V cross-toolchain installed.
+ *
+ * Everything that touches the machine goes through the public engine API
+ * (quanta.h); the driver only owns argument parsing, the trace narration, and
+ * the pipeline timing overlay. The disassembler and pipeline model are library
+ * utilities the driver still calls directly.
  *
  * The demo computes a couple of values, then asks the "kernel" to terminate it
  * with the exit syscall (a7 = 93). a0 carries the status, so it doubles as the
@@ -54,45 +55,46 @@ static const uint32_t demo_program[] = {
  * disassembly, and any register the step changed (with the new value), plus the
  * redirect target when control does not simply fall through. Trace goes to
  * stderr so it stays separate from whatever the guest prints via the write
- * syscall on stdout. cpu_step() itself is untouched — "what changed" is
- * recovered by diffing a register snapshot taken around the step. */
-static void trace_step(CPU *cpu) {
-    uint32_t pc   = cpu->pc;
-    uint32_t inst = mem_read32(cpu->mem, pc);
+ * syscall on stdout. "What changed" is recovered by diffing a register snapshot
+ * taken around the step through the public accessors, so the engine core stays
+ * untouched. */
+static void trace_step(Quanta *q) {
+    uint32_t pc   = quanta_pc(q);
+    uint32_t inst = quanta_read_u32(q, pc, NULL);
     uint32_t before[32];
-    for (int i = 0; i < 32; i++) before[i] = cpu->regs[i];
+    for (int i = 0; i < 32; i++) before[i] = quanta_reg(q, i);
 
     char text[80];
     disasm(pc, inst, text, sizeof text);
 
-    cpu_step(cpu);
+    quanta_step(q);
 
     fprintf(stderr, "%08x:  %08x  %-24s", pc, inst, text);
     for (int i = 1; i < 32; i++) /* x0 is hardwired; it can never change */
-        if (cpu->regs[i] != before[i])
-            fprintf(stderr, " %s=0x%08x", reg_abi_name((uint32_t)i), cpu->regs[i]);
-    if (cpu->pc != pc + 4) /* taken branch, jump, or trap */
-        fprintf(stderr, " ->0x%08x", cpu->pc);
+        if (quanta_reg(q, i) != before[i])
+            fprintf(stderr, " %s=0x%08x", quanta_reg_name(i), quanta_reg(q, i));
+    if (quanta_pc(q) != pc + 4) /* taken branch, jump, or trap */
+        fprintf(stderr, " ->0x%08x", quanta_pc(q));
     fprintf(stderr, "\n");
 }
 
-/* Step until the program halts, or a safety limit is hit so a buggy program
- * can never spin forever. With trace set, narrate each instruction to stderr.
- * Returns the number of instructions executed. */
-static int run_until_halt(CPU *cpu, int trace, Pipeline *pipe) {
-    int steps = 0;
+/* Step until the program halts, or a safety limit is hit so a buggy program can
+ * never spin forever. With trace set, narrate each instruction to stderr; with a
+ * pipeline, feed it each retired instruction. Returns the instruction count. */
+static uint64_t run_until_halt(Quanta *q, int trace, Pipeline *pipe) {
+    uint64_t steps = 0;
     /* A generous runaway guard: high enough to let real workloads (loops over
      * arrays, deep call chains) run to completion, low enough that a program
      * that never halts still stops in about a second instead of hanging. */
-    const int max_steps = 100 * 1000 * 1000;
-    while (!cpu->halted && steps < max_steps) {
-        uint32_t pc   = cpu->pc;
-        uint32_t inst = pipe ? mem_read32(cpu->mem, pc) : 0;
-        if (trace) trace_step(cpu);
-        else       cpu_step(cpu);
+    const uint64_t max_steps = 100ull * 1000 * 1000;
+    while (quanta_halt_reason(q) == QUANTA_RUN && steps < max_steps) {
+        uint32_t pc   = quanta_pc(q);
+        uint32_t inst = pipe ? quanta_read_u32(q, pc, NULL) : 0;
+        if (trace) trace_step(q);
+        else       quanta_step(q);
         /* Feed the timing model the retired instruction and whether control
          * left the fall-through path (a taken branch or a jump). */
-        if (pipe) pipeline_observe(pipe, inst, cpu->pc != pc + 4);
+        if (pipe) pipeline_observe(pipe, inst, quanta_pc(q) != pc + 4);
         steps++;
     }
     return steps;
@@ -132,39 +134,29 @@ int main(int argc, char **argv) {
         }
     }
 
-    Memory mem = {0}; /* zero-init so mem_free is safe even if loading fails */
-    int demo = (path == NULL);
-    uint32_t entry;
-
-    /* Set up the memory image first, since loading an ELF can fail. Doing it
-     * before any stdout output keeps loader diagnostics (stderr) from
-     * interleaving with a half-printed banner. The demo uses a fixed region;
-     * for an ELF, the loader sizes guest memory to the program's load image. */
-    if (demo) {
-        if (mem_init(&mem, MEM_BASE, MEM_SIZE) != 0) {
-            fprintf(stderr, "failed to allocate guest memory\n");
-            return 1;
-        }
-        if (mem_load(&mem, MEM_BASE, (const uint8_t *)demo_program,
-                     sizeof demo_program) != 0) {
-            fprintf(stderr, "failed to load demo program\n");
-            mem_free(&mem);
-            return 1;
-        }
-        entry = MEM_BASE;
-    } else {
-        if (elf_load(path, &mem, &entry) != 0) {
-            return 1;
-        }
+    Quanta *q = quanta_create();
+    if (!q) {
+        fprintf(stderr, "failed to allocate emulator\n");
+        return 1;
     }
 
-    /* A loader/kernel hands the program an initial stack pointer; the ISA reset
-     * state leaves every register zero, which would fault the first push. Point
-     * sp at the top of the guest region, 16-byte aligned per the RISC-V ABI.
-     * The region carries stack headroom above the image (the demo's fixed area
-     * doubles as stack; for an ELF the loader reserves it), and the stack grows
-     * downward from here. */
-    uint32_t sp = (mem.base + mem.size) & ~(uint32_t)0xf;
+    /* Load the program first, since it can fail. The demo maps a fixed region
+     * and copies the hardcoded image; an ELF gets a region sized to its load
+     * image, and the loader prints its own diagnostics on failure. */
+    int demo = (path == NULL);
+    QuantaStatus st = demo
+        ? quanta_load_image(q, MEM_BASE, MEM_SIZE,
+                            demo_program, sizeof demo_program, MEM_BASE)
+        : quanta_load_elf(q, path);
+    if (st != QUANTA_OK) {
+        if (demo) fprintf(stderr, "failed to load demo program\n");
+        quanta_destroy(q);
+        return 1;
+    }
+
+    /* The loader set PC to the entry point and sp to the top of the region. */
+    uint32_t entry = quanta_pc(q);
+    uint32_t sp    = quanta_reg(q, 2);
 
     printf("Quanta — RV32I emulator\n");
     if (demo) {
@@ -173,22 +165,12 @@ int main(int argc, char **argv) {
         printf("Loaded %s (entry = 0x%08x, sp = 0x%08x)\n\n", path, entry, sp);
     }
 
-    CPU cpu;
-    cpu_init(&cpu, &mem, entry);
-    reg_write(&cpu, 2, sp); /* x2 = sp */
-
     /* Optional cache model: a pure observability layer in front of memory. It
      * watches data load/store addresses and tallies hits/misses without
      * touching the data, so it never changes what the program computes. */
-    Cache cache;
-    int cache_ready = 0;
-    if (cache_on) {
-        if (cache_init(&cache, csize, cways, cblock) != 0) {
-            mem_free(&mem);
-            return 2;
-        }
-        cpu.cache = &cache;
-        cache_ready = 1;
+    if (cache_on && quanta_enable_cache(q, csize, cways, cblock) != QUANTA_OK) {
+        quanta_destroy(q);
+        return 2;
     }
 
     /* Optional pipeline timing model: another overlay (it reads the retired
@@ -197,22 +179,24 @@ int main(int argc, char **argv) {
     if (pipe_on) pipeline_init(&pipe);
 
     /* Any output the program writes via syscalls appears here, mid-run. */
-    int steps = run_until_halt(&cpu, trace, pipe_on ? &pipe : NULL);
+    uint64_t steps = run_until_halt(q, trace, pipe_on ? &pipe : NULL);
 
-    if (cpu.halt_reason == HALT_EXIT) {
-        printf("Program exited with code %u after %d instruction(s).\n\n",
-               cpu.exit_code, steps);
-    } else if (cpu.halted) {
-        printf("Halted: %s", halt_reason_str(cpu.halt_reason));
-        if (cpu.halt_reason == HALT_MEM_FAULT)
-            printf(" at 0x%08x", mem.fault_addr);
-        printf(" after %d instruction(s).\n\n", steps);
+    QuantaHalt halt = quanta_halt_reason(q);
+    if (halt == QUANTA_HALT_EXIT) {
+        printf("Program exited with code %u after %llu instruction(s).\n\n",
+               quanta_exit_code(q), (unsigned long long)steps);
+    } else if (halt != QUANTA_RUN) {
+        printf("Halted: %s", quanta_halt_str(halt));
+        if (halt == QUANTA_HALT_MEM_FAULT)
+            printf(" at 0x%08x", quanta_fault_addr(q));
+        printf(" after %llu instruction(s).\n\n", (unsigned long long)steps);
     } else {
-        printf("Stopped at the %d-instruction safety limit.\n\n", steps);
+        printf("Stopped at the %llu-instruction safety limit.\n\n",
+               (unsigned long long)steps);
     }
 
-    if (cache_ready) {
-        cache_report(&cache, stdout);
+    if (cache_on) {
+        quanta_cache_report(q, stdout);
         printf("\n");
     }
 
@@ -221,13 +205,13 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
-    cpu_dump(&cpu);
+    quanta_dump_regs(q, stdout);
 
     /* The built-in demo has a known answer, so check it as a self-test. A
      * loaded ELF is arbitrary, so we just report its final state. */
     if (demo) {
-        uint32_t a2 = reg_read(&cpu, 12); /* a2 */
-        uint32_t a3 = reg_read(&cpu, 13); /* a3 */
+        uint32_t a2 = quanta_reg(q, 12); /* a2 */
+        uint32_t a3 = quanta_reg(q, 13); /* a3 */
         printf("\nExpected: a2 = 42, a3 = 32\n");
         printf("Got:      a2 = %u, a3 = %u  -> %s\n",
                a2, a3, (a2 == 42 && a3 == 32) ? "OK" : "MISMATCH");
@@ -237,8 +221,8 @@ int main(int argc, char **argv) {
      * qemu-user or spike): a clean exit returns its code, an abnormal stop
      * (ebreak/trap/limit) returns 1. `make check` relies on this to tell a
      * passing conformance test (exit 0) from a failing one. */
-    int status = (cpu.halt_reason == HALT_EXIT) ? (int)(cpu.exit_code & 0xffu) : 1;
-    if (cache_ready) cache_free(&cache);
-    mem_free(&mem);
+    int status = (halt == QUANTA_HALT_EXIT)
+        ? (int)(quanta_exit_code(q) & 0xffu) : 1;
+    quanta_destroy(q);
     return status;
 }

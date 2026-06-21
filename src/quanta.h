@@ -118,6 +118,12 @@ uint32_t quanta_mem_size(const Quanta *q);
 /* Human-readable name for a halt state. */
 const char *quanta_halt_str(QuantaHalt h);
 
+/* ABI name for register x`i` ("zero","ra","sp",...); "?" if out of range. */
+const char *quanta_reg_name(int i);
+
+/* Print all registers and PC to `out` with ABI names, for diagnostics. */
+void quanta_dump_regs(const Quanta *q, FILE *out);
+
 #ifdef __cplusplus
 }
 #endif
