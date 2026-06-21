@@ -44,6 +44,7 @@ make check-disasm  # cross-check the disassembler against objdump (needs cross-t
 make check-cache   # check the cache model on a locality workload (needs cross-toolchain)
 make check-pipeline # check the pipeline model on a hazard workload (needs cross-toolchain)
 make check-diff    # differential-test against qemu-riscv32 (needs qemu-user-static)
+make sanitize      # build with ASan+UBSan and run the suite (needs cross-toolchain)
 make clean
 ```
 

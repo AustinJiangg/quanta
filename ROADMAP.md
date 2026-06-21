@@ -316,14 +316,17 @@ every ISA change that follows.
 - [x] **Commits:** `chore: add ci build-and-test matrix`,
   `docs: add ci status badge`.
 
-### E3 — Sanitizer builds
+### E3 — Sanitizer builds (DONE)
 
-- [ ] **Build:** an ASan+UBSan build (MSan where feasible) running the full
-  suite in CI. The emulator parses untrusted ELF and executes arbitrary decoded
-  instructions, so memory safety is a real attack surface.
-- [ ] **Why:** memory-safety bugs in an emulator are both crashes and exploits.
-- [ ] **Done when:** the suite passes clean under ASan/UBSan in CI.
-- [ ] **Commits:** `chore: add sanitizer ci job`, `fix: <what it surfaces>`.
+- [x] **Build:** `make sanitize` builds the emulator with ASan + UBSan
+  (`-fno-sanitize-recover`, so UB aborts) and runs the whole suite — embed,
+  conformance, disasm, cache, pipeline, differential — through the instrumented
+  binary. A dedicated CI job runs it on every push. The tree was already clean
+  (E1's bounds-safe memory and UB-free decode), so no fixes were needed.
+- [x] **Why:** memory-safety bugs in an emulator are both crashes and exploits;
+  it parses untrusted ELF and executes arbitrary decoded instructions.
+- [x] **Done when:** the suite passes clean under ASan/UBSan in CI.
+- [x] **Commits:** `chore: add a sanitizer build and ci job`.
 
 ### E4 — Fuzzing
 
