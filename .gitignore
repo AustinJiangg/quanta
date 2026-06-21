@@ -1,5 +1,6 @@
 # Build output
 /quanta
+/examples/embed
 *.o
 *.a
 *.out

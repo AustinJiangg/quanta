@@ -1,0 +1,196 @@
+#include "quanta.h"
+
+#include "cpu.h"
+#include "memory.h"
+#include "elf.h"
+#include "cache.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+/* A generous runaway guard for quanta_run(max_steps == 0): high enough for real
+ * workloads (array loops, deep call chains), low enough that a program that
+ * never halts still stops in about a second instead of hanging. */
+#define QUANTA_DEFAULT_MAX_STEPS (100u * 1000u * 1000u)
+
+/*
+ * The handle owns every piece of the machine. CPU holds a borrowed pointer to
+ * Memory (and, when enabled, the Cache), so the three live together here and
+ * are wired up by the loaders.
+ */
+struct Quanta {
+    CPU    cpu;
+    Memory mem;
+    Cache  cache;
+    int    cache_on;  /* a cache has been attached */
+    int    loaded;    /* memory is initialised and PC/sp are set */
+};
+
+/* Map the internal halt reason to the public enum. */
+static QuantaHalt map_halt(HaltReason r) {
+    switch (r) {
+        case HALT_NONE:            return QUANTA_RUN;
+        case HALT_EXIT:            return QUANTA_HALT_EXIT;
+        case HALT_EBREAK:          return QUANTA_HALT_EBREAK;
+        case HALT_ILLEGAL_INSN:    return QUANTA_HALT_ILLEGAL_INSN;
+        case HALT_UNIMP_SYSTEM:    return QUANTA_HALT_UNIMP_SYSTEM;
+        case HALT_UNKNOWN_SYSCALL: return QUANTA_HALT_UNKNOWN_SYSCALL;
+        case HALT_MEM_FAULT:       return QUANTA_HALT_MEM_FAULT;
+    }
+    return QUANTA_RUN;
+}
+
+/* Bounds check shared by the peek/poke helpers, written to avoid 32-bit wrap.
+ * Returns the host offset for `addr` (valid only when it returns QUANTA_OK). */
+static QuantaStatus in_range(const Memory *mem, uint32_t addr, size_t len,
+                            uint32_t *off) {
+    if (addr < mem->base || len > mem->size ||
+        addr - mem->base > mem->size - (uint32_t)len) {
+        return QUANTA_ERR_RANGE;
+    }
+    *off = addr - mem->base;
+    return QUANTA_OK;
+}
+
+Quanta *quanta_create(void) {
+    return calloc(1, sizeof(Quanta)); /* NULL on OOM */
+}
+
+void quanta_destroy(Quanta *q) {
+    if (!q) return;
+    if (q->cache_on) cache_free(&q->cache);
+    mem_free(&q->mem);
+    free(q);
+}
+
+/* Shared tail of the loaders: attach the CPU to memory at `entry`, re-attach the
+ * cache if one is enabled, and set sp to the top of the region (16-byte aligned
+ * per the RISC-V ABI) so the program can call functions and spill locals. */
+static void start_at(Quanta *q, uint32_t entry) {
+    cpu_init(&q->cpu, &q->mem, entry);
+    if (q->cache_on) q->cpu.cache = &q->cache;
+    reg_write(&q->cpu, 2, (q->mem.base + q->mem.size) & ~(uint32_t)0xf);
+    q->loaded = 1;
+}
+
+QuantaStatus quanta_load_elf(Quanta *q, const char *path) {
+    if (!q || !path) return QUANTA_ERR_INVAL;
+    uint32_t entry;
+    if (elf_load(path, &q->mem, &entry) != 0) return QUANTA_ERR_LOAD;
+    start_at(q, entry);
+    return QUANTA_OK;
+}
+
+QuantaStatus quanta_load_image(Quanta *q, uint32_t base, uint32_t size,
+                               const void *image, size_t len, uint32_t entry) {
+    if (!q || (len && !image) || len > size) return QUANTA_ERR_INVAL;
+    if (mem_init(&q->mem, base, size) != 0) return QUANTA_ERR_NOMEM;
+    if (len && mem_load(&q->mem, base, image, len) != 0) {
+        mem_free(&q->mem);
+        return QUANTA_ERR_RANGE;
+    }
+    start_at(q, entry);
+    return QUANTA_OK;
+}
+
+QuantaStatus quanta_enable_cache(Quanta *q, uint32_t size_bytes,
+                                 uint32_t assoc, uint32_t block_size) {
+    if (!q || q->cache_on) return QUANTA_ERR_INVAL;
+    if (cache_init(&q->cache, size_bytes, assoc, block_size) != 0) {
+        return QUANTA_ERR_INVAL;
+    }
+    q->cache_on = 1;
+    if (q->loaded) q->cpu.cache = &q->cache; /* attach if already running */
+    return QUANTA_OK;
+}
+
+void quanta_cache_report(const Quanta *q, FILE *out) {
+    if (q && q->cache_on) cache_report(&q->cache, out);
+}
+
+QuantaHalt quanta_step(Quanta *q) {
+    if (!q || !q->loaded) return QUANTA_RUN;
+    if (!q->cpu.halted) cpu_step(&q->cpu);
+    return map_halt(q->cpu.halt_reason);
+}
+
+QuantaHalt quanta_run(Quanta *q, uint64_t max_steps, uint64_t *steps_out) {
+    uint64_t cap = max_steps ? max_steps : QUANTA_DEFAULT_MAX_STEPS;
+    uint64_t steps = 0;
+    if (q && q->loaded) {
+        while (!q->cpu.halted && steps < cap) {
+            cpu_step(&q->cpu);
+            steps++;
+        }
+    }
+    if (steps_out) *steps_out = steps;
+    if (!q || !q->loaded) return QUANTA_RUN;
+    return q->cpu.halted ? map_halt(q->cpu.halt_reason) : QUANTA_HALT_STEP_LIMIT;
+}
+
+uint32_t quanta_reg(const Quanta *q, int i) {
+    if (!q || i < 0 || i > 31) return 0;
+    return reg_read(&q->cpu, (uint32_t)i);
+}
+
+void quanta_set_reg(Quanta *q, int i, uint32_t value) {
+    if (q && i >= 0 && i <= 31) reg_write(&q->cpu, (uint32_t)i, value);
+}
+
+uint32_t quanta_pc(const Quanta *q) { return q ? q->cpu.pc : 0; }
+void     quanta_set_pc(Quanta *q, uint32_t pc) { if (q) q->cpu.pc = pc; }
+
+QuantaStatus quanta_mem_read(const Quanta *q, uint32_t addr,
+                             void *dst, size_t len) {
+    uint32_t off;
+    QuantaStatus rc;
+    if (!q || (len && !dst)) return QUANTA_ERR_INVAL;
+    if ((rc = in_range(&q->mem, addr, len, &off)) != QUANTA_OK) return rc;
+    memcpy(dst, q->mem.data + off, len);
+    return QUANTA_OK;
+}
+
+QuantaStatus quanta_mem_write(Quanta *q, uint32_t addr,
+                              const void *src, size_t len) {
+    uint32_t off;
+    QuantaStatus rc;
+    if (!q || (len && !src)) return QUANTA_ERR_INVAL;
+    if ((rc = in_range(&q->mem, addr, len, &off)) != QUANTA_OK) return rc;
+    memcpy(q->mem.data + off, src, len);
+    return QUANTA_OK;
+}
+
+uint32_t quanta_read_u32(const Quanta *q, uint32_t addr, int *ok) {
+    uint8_t b[4];
+    if (quanta_mem_read(q, addr, b, sizeof b) != QUANTA_OK) {
+        if (ok) *ok = 0;
+        return 0;
+    }
+    if (ok) *ok = 1;
+    return (uint32_t)b[0]        | (uint32_t)b[1] << 8
+         | (uint32_t)b[2] << 16  | (uint32_t)b[3] << 24;
+}
+
+QuantaHalt quanta_halt_reason(const Quanta *q) {
+    if (!q || !q->cpu.halted) return QUANTA_RUN;
+    return map_halt(q->cpu.halt_reason);
+}
+
+uint32_t quanta_exit_code(const Quanta *q)  { return q ? q->cpu.exit_code : 0; }
+uint32_t quanta_fault_addr(const Quanta *q) { return q ? q->mem.fault_addr : 0; }
+uint32_t quanta_mem_base(const Quanta *q)   { return q ? q->mem.base : 0; }
+uint32_t quanta_mem_size(const Quanta *q)   { return q ? q->mem.size : 0; }
+
+const char *quanta_halt_str(QuantaHalt h) {
+    switch (h) {
+        case QUANTA_RUN:                  return "running";
+        case QUANTA_HALT_EXIT:            return "exit syscall";
+        case QUANTA_HALT_EBREAK:          return "ebreak";
+        case QUANTA_HALT_ILLEGAL_INSN:    return "illegal instruction";
+        case QUANTA_HALT_UNIMP_SYSTEM:    return "unimplemented system instruction";
+        case QUANTA_HALT_UNKNOWN_SYSCALL: return "unknown syscall";
+        case QUANTA_HALT_MEM_FAULT:       return "memory access out of range";
+        case QUANTA_HALT_STEP_LIMIT:      return "instruction-count limit";
+    }
+    return "unknown";
+}

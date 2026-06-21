@@ -17,6 +17,7 @@
 #   make clean      remove build artifacts
 
 CC      ?= gcc
+AR      ?= ar
 CFLAGS  ?= -std=c11 -Wall -Wextra -O2 -Isrc
 LDFLAGS ?=
 
@@ -25,18 +26,39 @@ RVCC      ?= riscv64-unknown-elf-gcc
 RVOBJDUMP ?= riscv64-unknown-elf-objdump
 RVCFLAGS  ?= -march=rv32i -mabi=ilp32 -nostdlib -nostartfiles -Ttext=0x80000000
 
-SRC := $(wildcard src/*.c)
-BIN := quanta
+SRC     := $(wildcard src/*.c)
+LIB_SRC := $(filter-out src/main.c,$(SRC))
+LIB_OBJ := $(LIB_SRC:.c=.o)
+LIB     := libquanta.a
+BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline embed debug clean
 
 all: $(BIN)
 
-$(BIN): $(SRC)
-	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
+# The emulator engine as a static library; the CLI and any embedding program
+# (see examples/) link against it. main.c is the CLI driver, kept out of the lib.
+$(LIB): $(LIB_OBJ)
+	$(AR) rcs $@ $^
+
+src/%.o: src/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Coarse but correct: any header change rebuilds every object.
+$(LIB_OBJ) src/main.o: $(wildcard src/*.h)
+
+$(BIN): src/main.o $(LIB)
+	$(CC) $(CFLAGS) -o $@ src/main.o $(LIB) $(LDFLAGS)
 
 run: $(BIN)
 	./$(BIN)
+
+# Build and run the minimal embedding example against the library.
+embed: examples/embed
+	./examples/embed
+
+examples/embed: examples/embed.c $(LIB)
+	$(CC) $(CFLAGS) -o $@ examples/embed.c $(LIB) $(LDFLAGS)
 
 # Build the sample assembly programs with the cross-toolchain. Every tests/*.S
 # becomes a tests/*.elf via the pattern rule below.
@@ -88,4 +110,4 @@ debug: CFLAGS := -std=c11 -Wall -Wextra -g -O0 -Isrc
 debug: clean $(BIN)
 
 clean:
-	rm -f $(BIN) tests/*.elf
+	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/*.elf
