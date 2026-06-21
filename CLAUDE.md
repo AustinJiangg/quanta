@@ -43,13 +43,15 @@ make check    # build and run the RV32I conformance suite (needs cross-toolchain
 make check-disasm  # cross-check the disassembler against objdump (needs cross-toolchain)
 make check-cache   # check the cache model on a locality workload (needs cross-toolchain)
 make check-pipeline # check the pipeline model on a hazard workload (needs cross-toolchain)
+make check-diff    # differential-test against qemu-riscv32 (needs qemu-user-static)
 make clean
 ```
 
 Run a compiled program with `./quanta <program.elf>`; with no argument the
 built-in demo runs instead. Add `--trace` (`./quanta --trace <program.elf>`) to
 narrate each executed instruction — PC, disassembly, and changed registers — to
-stderr. Add `--cache[=SIZE:WAYS:BLOCK]` (e.g. `--cache=1024:2:32`) to model a
+stderr. Add `--quiet` to suppress all driver output (banner, summary, register
+dump), leaving only the guest's own stdout — used by `make check-diff`. Add `--cache[=SIZE:WAYS:BLOCK]` (e.g. `--cache=1024:2:32`) to model a
 set-associative L1 over the run's data accesses and print a hit/miss summary at
 exit, and/or `--pipeline` to print a 5-stage cycle/CPI estimate. The overlays
 compose.
@@ -126,6 +128,10 @@ When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
 - `tests/check_cache.sh` — runs `test_stack` under two cache geometries and
   asserts results are unchanged and a smaller cache misses more
   (`make check-cache`).
+- `tests/check_diff.sh` — differential test: runs each sample ELF under
+  `quanta --quiet` and a reference simulator (qemu-riscv32 by default, override
+  with `REF=`) and asserts they agree on stdout and exit code (`make
+  check-diff`). Skips cleanly if the reference is absent.
 - `tests/hazard_slow.S` + `tests/hazard_fast.S` — the same array sum scheduled
   with and without a load-use hazard; `tests/check_pipeline.sh` runs both under
   `--pipeline` and asserts the reorder cut stalls and cycles without changing the
