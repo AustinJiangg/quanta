@@ -1,9 +1,18 @@
 # Build output
 /quanta
 /examples/embed
+/fuzz/fuzz_elf
+/fuzz/fuzz_decode
+/fuzz/*.replay
 *.o
 *.a
 *.out
+
+# Fuzzing artifacts
+crash-*
+leak-*
+timeout-*
+oom-*
 
 # Cross-compiled test artifacts
 tests/*.elf

@@ -15,6 +15,8 @@
 #   make check-pipeline  check the pipeline model on a hazard workload
 #   make check-diff   differential-test against a reference sim (qemu-riscv32)
 #   make sanitize     build with ASan+UBSan and run the suite through it
+#   make fuzz         build the libFuzzer harnesses (needs clang)
+#   make fuzz-replay  run the harnesses over the corpus under gcc+ASan/UBSan
 #   make debug      build with -g -O0 for stepping under gdb
 #   make clean      remove build artifacts
 
@@ -27,6 +29,10 @@ LDFLAGS ?=
 # emulator only; the guest ELFs are built by the cross-toolchain as usual).
 SANFLAGS := -fsanitize=address,undefined -fno-sanitize-recover=all
 
+# libFuzzer harnesses (fuzz/) build the engine sources under clang.
+FUZZ_CC      ?= clang
+FUZZ_TARGETS := fuzz/fuzz_elf fuzz/fuzz_decode
+
 # RISC-V cross-toolchain (override if yours is named differently).
 RVCC      ?= riscv64-unknown-elf-gcc
 RVOBJDUMP ?= riscv64-unknown-elf-objdump
@@ -38,7 +44,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-diff embed sanitize debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-diff embed sanitize fuzz fuzz-replay debug clean
 
 all: $(BIN)
 
@@ -131,5 +137,25 @@ sanitize:
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-diff
 
+# Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
+# the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`
+# instead links a plain main (fuzz/standalone.c) with gcc + ASan/UBSan and runs
+# each harness over the sample ELFs, so the harnesses stay exercised without
+# clang; CI runs the real libFuzzer build.
+fuzz: $(FUZZ_TARGETS)
+
+fuzz/fuzz_%: fuzz/fuzz_%.c $(LIB_SRC) $(wildcard src/*.h)
+	$(FUZZ_CC) -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined -Isrc \
+		-o $@ $< $(LIB_SRC)
+
+fuzz-replay: $(TEST_ELF)
+	@for h in fuzz_elf fuzz_decode; do \
+		$(CC) -std=c11 -g -O1 $(SANFLAGS) -Isrc -o fuzz/$$h.replay \
+			fuzz/$$h.c fuzz/standalone.c $(LIB_SRC) || exit 1; \
+		echo "replay $$h over $(words $(TEST_ELF)) sample ELF(s):"; \
+		./fuzz/$$h.replay $(TEST_ELF) && echo "  OK — $$h sanitizer-clean" || exit 1; \
+	done
+
 clean:
-	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/*.elf
+	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/*.elf \
+		$(FUZZ_TARGETS) fuzz/*.replay
