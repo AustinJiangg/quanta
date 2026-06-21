@@ -53,3 +53,20 @@ jobs:
 
       - name: Pipeline model
         run: make check-pipeline
+
+  differential:
+    runs-on: ubuntu-latest
+    name: differential (vs qemu-riscv32)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-toolchain and qemu-user
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf qemu-user-static
+
+      - name: Build
+        run: make
+
+      - name: Differential vs qemu-riscv32
+        run: make check-diff
