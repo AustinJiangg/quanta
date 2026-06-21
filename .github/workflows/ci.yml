@@ -1,0 +1,55 @@
+name: CI
+
+# Build the engine library and CLI with two compilers at two optimisation
+# levels, then run the whole suite — conformance, disassembler-vs-objdump, cache,
+# pipeline — plus the libquanta embedding example. Warnings are errors here, so
+# the tree must stay clean under -Wall -Wextra.
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        buildtype: [release, debug]
+    name: ${{ matrix.cc }} / ${{ matrix.buildtype }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The .S test programs are assembled by the RISC-V cross-toolchain;
+      # check-disasm also needs its objdump. Built -nostdlib, so no multilib
+      # libraries are required — just the assembler, linker, and driver.
+      - name: Install RISC-V cross-toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf
+
+      - name: Configure build
+        run: |
+          echo "CC=${{ matrix.cc }}" >> "$GITHUB_ENV"
+          base="-std=c11 -Wall -Wextra -Werror -Isrc"
+          if [ "${{ matrix.buildtype }}" = "debug" ]; then
+            echo "CFLAGS=$base -g -O0" >> "$GITHUB_ENV"
+          else
+            echo "CFLAGS=$base -O2" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build (libquanta + CLI)
+        run: make
+
+      - name: Embedding example
+        run: make embed
+
+      - name: RV32I conformance
+        run: make check
+
+      - name: Disassembler vs objdump
+        run: make check-disasm
+
+      - name: Cache model
+        run: make check-cache
+
+      - name: Pipeline model
+        run: make check-pipeline
