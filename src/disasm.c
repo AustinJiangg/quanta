@@ -206,6 +206,26 @@ void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
         return;
     }
 
+    case OP_AMO: {
+        /* RV32A: funct5 picks the op, the aq/rl bits become a mnemonic suffix.
+         * LR.W takes no rs2 ("lr.w rd,(rs1)"); SC/AMO* are "op rd,rs2,(rs1)". */
+        uint32_t f5 = inst >> 27;
+        const char *aqrl = (inst & (3u << 25)) == (3u << 25) ? ".aqrl"
+                         : (inst & (1u << 26)) ? ".aq"
+                         : (inst & (1u << 25)) ? ".rl" : "";
+        if (f3 != 0x2) { snprintf(buf, buflen, ".word 0x%08x", inst); return; }
+        if (f5 == 0x02) { snprintf(buf, buflen, "lr.w%s %s,(%s)", aqrl, d, s1); return; }
+        const char *m =
+            (f5 == 0x03) ? "sc.w"     : (f5 == 0x01) ? "amoswap.w" :
+            (f5 == 0x00) ? "amoadd.w" : (f5 == 0x04) ? "amoxor.w"  :
+            (f5 == 0x0c) ? "amoand.w" : (f5 == 0x08) ? "amoor.w"   :
+            (f5 == 0x10) ? "amomin.w" : (f5 == 0x14) ? "amomax.w"  :
+            (f5 == 0x18) ? "amominu.w": (f5 == 0x1c) ? "amomaxu.w" : NULL;
+        if (m) snprintf(buf, buflen, "%s%s %s,%s,(%s)", m, aqrl, d, s2, s1);
+        else   snprintf(buf, buflen, ".word 0x%08x", inst);
+        return;
+    }
+
     case OP_FENCE:
         if (f3 == 0x1) snprintf(buf, buflen, "fence.i");
         else           snprintf(buf, buflen, "fence");
