@@ -465,15 +465,29 @@ entry) waits on the devices in M13 — the mechanism is here, the sources are no
   `feat: implement trap entry and mret/sret`,
   `feat: route exceptions through traps`, `docs: document the trap model`.
 
-## M10 — RV32A atomics
+## M10 — RV32A atomics (DONE)
 
-- [ ] **Build:** `LR/SC` and the `AMO*` set (single-hart semantics).
-- [ ] **ISA:** RV32A.
-- [ ] **Concept:** atomic read-modify-write; load-reserved/store-conditional;
+The atomic extension the kernel's locks and C11 atomics are built on. RV32A gets
+its own major opcode (`0x2f`); `exec_amo` in `cpu.c` dispatches on the five-bit
+`funct5`, with funct3 fixing the 32-bit "word" width. The nine AMO* operations
+each atomically load the addressed word, combine it with rs2, store the result,
+and return the old value; LR.W/SC.W split that into a reservation pair — LR
+registers a word-granularity reservation, SC stores only while it still holds
+and reports 0/1 success. The aq/rl ordering bits are no-ops on a single in-order
+hart, and a misaligned atomic faults rather than being handled silently the way
+base accesses are. `tests/test_atomic.S` pins every AMO (old value and stored
+result, signed-vs-unsigned min/max) plus LR/SC both ways; being user-mode RV32A,
+it is the first extension test qemu can also run, so `make check-diff`
+cross-checks it. (Real multi-hart contention over the atomics waits on the SMP
+work in M19.)
+
+- [x] **Build:** `LR/SC` and the `AMO*` set (single-hart semantics).
+- [x] **ISA:** RV32A.
+- [x] **Concept:** atomic read-modify-write; load-reserved/store-conditional;
   why atomics are a separate extension the kernel requires.
-- [ ] **Done when:** an LR/SC spinlock and the AMOs pass a focused test —
+- [x] **Done when:** an LR/SC spinlock and the AMOs pass a focused test —
   required before any Linux boot.
-- [ ] **Commits:** `feat: add rv32a atomics`, `feat: disassemble rv32a`,
+- [x] **Commits:** `feat: add rv32a atomics`, `feat: disassemble rv32a`,
   `test: add rv32a conformance suite`.
 
 ## M11 — Optional extensions: RV32C, RV32F/D (deferrable)

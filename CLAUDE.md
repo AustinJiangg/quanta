@@ -17,10 +17,11 @@ flat little-endian memory. The core is a fetch/decode/execute loop.
 
 All roadmap milestones (M0–M7) are complete, and Part II is under way: the full
 RV32I base integer set, the RV32M multiply/divide extension, Zicsr/Zifencei (CSR
-access and `fence.i`, M8), and the privileged architecture (M/S/U privilege
-levels with exception/trap handling, M9) are implemented and pinned by a
-hand-written conformance suite (`make check`), an optional cache model sits in
-front of memory, and a `--pipeline` timing model estimates cycles and CPI.
+access and `fence.i`, M8), the privileged architecture (M/S/U privilege levels
+with exception/trap handling, M9), and RV32A atomics (M10) are implemented and
+pinned by a hand-written conformance suite (`make check`), an optional cache
+model sits in front of memory, and a `--pipeline` timing model estimates cycles
+and CPI.
 Quanta loads ELF32
 executables (`quanta program.elf`), services `write`/`exit` system calls through
 the ECALL path — the built-in SEE that runs until a guest installs its own trap
@@ -75,8 +76,8 @@ program.
 
 When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
 (the RV32M test uses `-march=rv32im`, the CSR test `-march=rv32i_zicsr_zifencei`,
-and the M9 privilege tests `-march=rv32i_zicsr`; the Makefile overrides
-`RVCFLAGS` for just those ELFs).
+the M9 privilege tests `-march=rv32i_zicsr`, and the RV32A test `-march=rv32ia`;
+the Makefile overrides `RVCFLAGS` for just those ELFs).
 
 ## Code layout
 
@@ -95,7 +96,10 @@ and the M9 privilege tests `-march=rv32i_zicsr`; the Makefile overrides
   field (M/S/U), the trap CSRs, and `raise_trap` — the single point exceptions
   (ECALL/EBREAK/illegal/misaligned/access-fault) funnel through to vector into a
   handler or, when no handler is installed, fall back to the built-in SEE.
-  `exec_mret`/`exec_sret` pop the stacked privilege to return.
+  `exec_mret`/`exec_sret` pop the stacked privilege to return. RV32A atomics
+  (LR/SC and the AMO*s) are `exec_amo` under the dedicated AMO opcode, backed by
+  a single-word LR reservation (`reserve_valid`/`reserve_addr`) that a matching
+  store voids.
 - `src/disasm.{h,c}` — RV32I disassembler: turns an instruction word back into
   objdump-style assembly (ABI names, common pseudo-instructions, absolute
   branch/jump targets). Mirrors `cpu_step`'s opcode switch over `decode.h`.
@@ -143,6 +147,10 @@ and the M9 privilege tests `-march=rv32i_zicsr`; the Makefile overrides
   M→U→S→U→M through delegation (`medeleg`), an S-mode handler, and `sret`. Both
   use machine CSRs, so they assemble with `-march=rv32i_zicsr` and stay out of
   `make check-diff`.
+- `tests/test_atomic.S` — the M10 RV32A suite: every AMO (old value + stored
+  result, signed-vs-unsigned min/max) plus LR/SC success and a broken-reservation
+  failure. Atomics are user-mode, so it assembles `-march=rv32ia` and *is*
+  differential-tested against qemu.
 - `tests/check_disasm.sh` — runs each sample ELF under `--trace` and diffs the
   disassembly against `objdump` (`make check-disasm`).
 - `tests/check_cache.sh` — runs `test_stack` under two cache geometries and
@@ -248,6 +256,15 @@ and the M9 privilege tests `-march=rv32i_zicsr`; the Makefile overrides
   *defined* values rather than trapping. Its test must be assembled with
   `-march=rv32im`, so the Makefile overrides `RVCFLAGS` for
   `tests/test_muldiv.elf` only.
+- RV32A (M10) atomics live in `exec_amo` under the AMO opcode (`0x2f`, funct3
+  `0x2`), mirrored in `disasm.c`. The aq/rl ordering bits are no-ops on a single
+  in-order hart. LR.W holds a word-granularity reservation
+  (`reserve_valid`/`reserve_addr`) that SC.W consumes and any store to the same
+  word voids; SC returns 0 on success, 1 on failure. Atomics fault on a
+  misaligned address (base load/store still handle misalignment silently). The
+  test is user-mode (`-march=rv32ia`) and differential-tested against qemu — its
+  SC-failure case overwrites the reserved word with a *different* value, so an
+  address-based reservation (ours) and a value-based one (qemu-user) agree.
 - `--trace` writes to stderr, leaving the guest's own stdout (`write`) clean;
   "changed registers" are recovered by diffing a register snapshot taken around
   `cpu_step`, so the core isn't instrumented. The disassembler prints the common
