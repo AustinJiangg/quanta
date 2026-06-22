@@ -92,6 +92,9 @@ tests/test_muldiv.elf: RVCFLAGS := $(subst rv32i,rv32im,$(RVCFLAGS))
 # the base assembler rejects. Enable both extensions for just this one ELF.
 tests/test_csr.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr_zifencei,$(RVCFLAGS))
 
+# The M9 privilege tests use the trap CSRs and mret/sret, which need Zicsr.
+tests/test_trap.elf tests/test_priv.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr,$(RVCFLAGS))
+
 # Run the RV32I conformance suite (tests/test_*.S) through the emulator. Each
 # test exits 0 on success or the number of its first failed check, which quanta
 # propagates as its own exit status; we use that to print PASS/FAIL per file.
@@ -126,10 +129,10 @@ check-pipeline: $(BIN) tests/hazard_slow.elf tests/hazard_fast.elf
 # by default; override with REF=...) on the sample programs. Skips cleanly if
 # the reference simulator is not installed.
 #
-# tests/test_csr.elf is excluded: it touches machine-mode CSRs (mscratch) and
-# writes a read-only counter, both of which user-mode qemu rejects with SIGILL
-# because we don't model privilege until M9. `make check` pins its semantics.
-DIFF_ELF := $(filter-out tests/test_csr.elf,$(TEST_ELF))
+# The privileged tests are excluded: they touch machine-mode CSRs and trap
+# state (mscratch, mtvec, mret, delegation) that user-mode qemu rejects with
+# SIGILL because it provides its own supervisor. `make check` pins them instead.
+DIFF_ELF := $(filter-out tests/test_csr.elf tests/test_trap.elf tests/test_priv.elf,$(TEST_ELF))
 
 check-diff: $(BIN) $(TEST_ELF)
 	@sh tests/check_diff.sh $(DIFF_ELF)
