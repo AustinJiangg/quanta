@@ -74,6 +74,8 @@ void cpu_init(CPU *cpu, Memory *mem, uint32_t entry_pc) {
     cpu->instret     = 0;
     cpu->priv        = PRIV_M; /* the hart resets into Machine mode */
     cpu->trapped     = 0;
+    cpu->reserve_valid = 0;
+    cpu->reserve_addr  = 0;
     memset(cpu->csr, 0, sizeof cpu->csr);
     /* misa advertises the base and extensions: MXL=1 (RV32), I, M, S, U. It is
      * informational here; reads see this, writes are accepted as WARL storage. */
@@ -87,6 +89,14 @@ uint32_t reg_read(const CPU *cpu, uint32_t i) {
 
 void reg_write(CPU *cpu, uint32_t i, uint32_t value) {
     if (i != 0) cpu->regs[i] = value; /* x0 stays zero */
+}
+
+/* RV32A: a store to the reserved word breaks any outstanding LR reservation, so
+ * a later SC.W to it fails. Modelled at word granularity, which is enough for a
+ * single hart — there are no other agents to race the reservation. */
+static void break_reservation(CPU *cpu, uint32_t addr) {
+    if (cpu->reserve_valid && (addr & ~0x3u) == cpu->reserve_addr)
+        cpu->reserve_valid = 0;
 }
 
 /* Execute OP-IMM: register/immediate arithmetic (ADDI, SLTI, shifts, ...). */
@@ -234,6 +244,7 @@ static void exec_store(CPU *cpu, uint32_t inst) {
     uint32_t addr = reg_read(cpu, rs1(inst)) + (uint32_t)imm_s(inst);
     uint32_t val  = reg_read(cpu, rs2(inst));
 
+    break_reservation(cpu, addr); /* RV32A: a plain store can void an LR/SC pair */
     if (cpu->cache) cache_access(cpu->cache, addr, 1); /* observe, don't alter */
 
     switch (funct3(inst)) {
@@ -421,6 +432,77 @@ static void exec_csr(CPU *cpu, uint32_t inst) {
     reg_write(cpu, rd(inst), old);
 }
 
+/* Execute RV32A: load-reserved / store-conditional and the atomic memory
+ * operations (AMO*). The AMO opcode is selected by funct3 == 0x2 (the 32-bit
+ * "word" width — RV64 adds a doubleword form), and funct5 (the top five bits)
+ * picks the operation. The aq/rl ordering bits below it are no-ops on a single
+ * in-order hart: there is no reordering or other agent for them to fence.
+ *
+ * An AMO atomically loads the word at rs1, combines it with rs2, and stores the
+ * result back, returning the *old* value in rd — a read-modify-write that no
+ * sequence of base loads/stores can do indivisibly. LR/SC split that across two
+ * instructions: LR loads and registers a reservation, SC stores only if the
+ * reservation still holds (returning 0 on success, 1 on failure). Atomics must
+ * be naturally aligned, so a misaligned address faults rather than being
+ * silently handled the way base accesses are. */
+static void exec_amo(CPU *cpu, uint32_t inst) {
+    if (funct3(inst) != 0x2) { /* only the word width exists in RV32A */
+        raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst);
+        return;
+    }
+    uint32_t funct5 = inst >> 27;
+    uint32_t addr   = reg_read(cpu, rs1(inst));
+
+    if (addr & 0x3) { /* atomics require natural alignment */
+        raise_trap(cpu, (funct5 == 0x02) ? CAUSE_LOAD_MISALIGNED
+                                          : CAUSE_STORE_MISALIGNED, addr);
+        return;
+    }
+    if (cpu->cache) cache_access(cpu->cache, addr, 1); /* observe the access */
+
+    if (funct5 == 0x02) { /* LR.W: load and hold a reservation on the word */
+        uint32_t v = mem_read32(cpu->mem, addr);
+        if (cpu->mem->fault) return; /* cpu_step turns the fault into a trap */
+        cpu->reserve_valid = 1;
+        cpu->reserve_addr  = addr;
+        reg_write(cpu, rd(inst), v);
+        return;
+    }
+
+    if (funct5 == 0x03) { /* SC.W: store iff the reservation still holds */
+        uint32_t fail = !(cpu->reserve_valid && cpu->reserve_addr == addr);
+        if (!fail) {
+            mem_write32(cpu->mem, addr, reg_read(cpu, rs2(inst)));
+            if (cpu->mem->fault) return;
+        }
+        cpu->reserve_valid = 0;          /* SC always clears the reservation */
+        reg_write(cpu, rd(inst), fail);  /* 0 = success, 1 = failure */
+        return;
+    }
+
+    /* AMO*: read the old value, combine with rs2, write the result back. */
+    uint32_t old = mem_read32(cpu->mem, addr);
+    if (cpu->mem->fault) return;
+    uint32_t b = reg_read(cpu, rs2(inst));
+    uint32_t res;
+    switch (funct5) {
+        case 0x01: res = b;                                       break; /* SWAP */
+        case 0x00: res = old + b;                                 break; /* ADD  */
+        case 0x04: res = old ^ b;                                 break; /* XOR  */
+        case 0x0c: res = old & b;                                 break; /* AND  */
+        case 0x08: res = old | b;                                 break; /* OR   */
+        case 0x10: res = ((int32_t)old < (int32_t)b) ? old : b;   break; /* MIN  */
+        case 0x14: res = ((int32_t)old > (int32_t)b) ? old : b;   break; /* MAX  */
+        case 0x18: res = (old < b) ? old : b;                     break; /* MINU */
+        case 0x1c: res = (old > b) ? old : b;                     break; /* MAXU */
+        default: raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return;
+    }
+    mem_write32(cpu->mem, addr, res);
+    if (cpu->mem->fault) return;
+    break_reservation(cpu, addr); /* the write voids a reservation on this word */
+    reg_write(cpu, rd(inst), old);
+}
+
 /* Return from an M-mode trap (MRET). Pop the stacked state mstatus saved on
  * entry: privilege returns to MPP, MIE is restored from MPIE, MPIE is set, and
  * MPP is reset to the least-privileged mode (U). Returns the PC to resume at —
@@ -547,6 +629,10 @@ void cpu_step(CPU *cpu) {
             exec_store(cpu, inst);
             break;
 
+        case OP_AMO:
+            exec_amo(cpu, inst);
+            break;
+
         case OP_FENCE:
             /* FENCE / FENCE.I: memory- and instruction-ordering hints. A single
              * hart that executes in program order, with no modelled instruction
@@ -562,9 +648,10 @@ void cpu_step(CPU *cpu) {
             break;
     }
 
-    if (cpu->mem->fault) { /* a load or store left the mapped region */
-        uint32_t cause = (opcode(inst) == OP_STORE) ? CAUSE_STORE_ACCESS
-                                                     : CAUSE_LOAD_ACCESS;
+    if (cpu->mem->fault) { /* a load, store, or atomic left the mapped region */
+        uint32_t op = opcode(inst);
+        uint32_t cause = (op == OP_STORE || op == OP_AMO) ? CAUSE_STORE_ACCESS
+                                                          : CAUSE_LOAD_ACCESS;
         raise_trap(cpu, cause, cpu->mem->fault_addr);
         return; /* don't commit PC past the faulting instruction */
     }

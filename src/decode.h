@@ -103,6 +103,7 @@ enum {
     OP_FENCE  = 0x0f, /* FENCE / FENCE.I          */
     OP_IMM    = 0x13, /* ADDI/SLTI/.../SRAI       */
     OP_REG    = 0x33, /* ADD/SUB/.../AND          */
+    OP_AMO    = 0x2f, /* RV32A: LR/SC and AMO*    */
     OP_SYSTEM = 0x73  /* ECALL/EBREAK/CSR         */
 };
 

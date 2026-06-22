@@ -57,6 +57,8 @@ typedef struct {
     uint64_t instret;       /* retired-instruction count; backs the counter CSRs */
     uint32_t priv;          /* current privilege: PRIV_U / PRIV_S / PRIV_M */
     int      trapped;       /* set within a step when a trap redirected the PC */
+    int      reserve_valid; /* RV32A: an LR.W set a reservation still held */
+    uint32_t reserve_addr;  /* RV32A: word address that reservation covers */
     uint32_t csr[4096];     /* CSR file: Zicsr counters + the M9 trap registers */
 } CPU;
 
