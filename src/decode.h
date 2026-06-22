@@ -107,15 +107,38 @@ enum {
 };
 
 /* ------------------------------------------------------------------------
- * Zicsr CSR addresses referenced by name in the core and the disassembler.
- * The unprivileged counters are read-only (their address's top two bits are
- * 0b11) and read back a live value; mscratch is a plain read/write CSR used
- * by the conformance test. The full privileged CSR set arrives with M9.
+ * CSR addresses referenced by name in the core and the disassembler.
+ *
+ * A CSR's 12-bit address is itself structured: bits [9:8] are the lowest
+ * privilege that may access it, and bits [11:10] == 0b11 mark it read-only.
+ * The unprivileged counters live in the read-only range and read back a live
+ * value; the M9 trap CSRs are the configuration and status surface of the
+ * privilege model — one M-mode set plus the S-mode mirrors that view a subset
+ * of the same state.
  * ------------------------------------------------------------------------ */
 enum {
-    CSR_MSCRATCH = 0x340,
+    /* Unprivileged counters (read-only; live views of instret). */
     CSR_CYCLE    = 0xc00, CSR_TIME  = 0xc01, CSR_INSTRET  = 0xc02,
-    CSR_CYCLEH   = 0xc80, CSR_TIMEH = 0xc81, CSR_INSTRETH = 0xc82
+    CSR_CYCLEH   = 0xc80, CSR_TIMEH = 0xc81, CSR_INSTRETH = 0xc82,
+
+    /* Supervisor trap setup / handling (sstatus/sie/sip are mstatus/mie/mip
+     * views, masked to the S-mode bits in csr_read/csr_write). */
+    CSR_SSTATUS    = 0x100, CSR_SIE     = 0x104, CSR_STVEC   = 0x105,
+    CSR_SCOUNTEREN = 0x106,
+    CSR_SSCRATCH   = 0x140, CSR_SEPC    = 0x141, CSR_SCAUSE  = 0x142,
+    CSR_STVAL      = 0x143, CSR_SIP     = 0x144,
+    CSR_SATP       = 0x180, /* paging stays off until M12; stored, not walked */
+
+    /* Machine information (read-only). */
+    CSR_MVENDORID = 0xf11, CSR_MARCHID = 0xf12, CSR_MIMPID = 0xf13,
+    CSR_MHARTID   = 0xf14,
+
+    /* Machine trap setup / handling. */
+    CSR_MSTATUS    = 0x300, CSR_MISA    = 0x301, CSR_MEDELEG = 0x302,
+    CSR_MIDELEG    = 0x303, CSR_MIE     = 0x304, CSR_MTVEC   = 0x305,
+    CSR_MCOUNTEREN = 0x306, CSR_MSTATUSH = 0x310,
+    CSR_MSCRATCH   = 0x340, CSR_MEPC    = 0x341, CSR_MCAUSE  = 0x342,
+    CSR_MTVAL      = 0x343, CSR_MIP     = 0x344
 };
 
 /* ABI register names (x0..x31), handy for register dumps and disassembly. */

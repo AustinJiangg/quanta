@@ -10,7 +10,9 @@
  * The architectural state of an RV32I hart is small: 32 general-purpose
  * 32-bit registers plus a program counter. With the Zicsr extension a sparse
  * file of control/status registers joins them — configuration and counters
- * read and written only by the CSR instructions, never by load/store.
+ * read and written only by the CSR instructions, never by load/store. The
+ * privileged architecture (M9) adds a current privilege level: the hart runs
+ * in Machine, Supervisor, or User mode, and a trap switches between them.
  * Everything the processor does is a function that maps one such state to the
  * next.
  *
@@ -18,6 +20,15 @@
  * writes are discarded. We enforce that in reg_write() rather than trusting
  * every instruction to respect it.
  */
+
+/* Privilege levels, encoded as the architecture numbers them (these values are
+ * also what mstatus.MPP/SPP and the CSR-address privilege field hold). There is
+ * no level 2. */
+enum {
+    PRIV_U = 0,  /* User       */
+    PRIV_S = 1,  /* Supervisor */
+    PRIV_M = 3   /* Machine    */
+};
 
 /*
  * Why the machine stopped. cpu_step() and the syscall layer record one of
@@ -44,7 +55,9 @@ typedef struct {
     HaltReason halt_reason; /* why it stopped (meaningful once halted) */
     uint32_t exit_code;     /* status the exit syscall passed in a0 */
     uint64_t instret;       /* retired-instruction count; backs the counter CSRs */
-    uint32_t csr[4096];     /* Zicsr control/status registers; see csr_read/write */
+    uint32_t priv;          /* current privilege: PRIV_U / PRIV_S / PRIV_M */
+    int      trapped;       /* set within a step when a trap redirected the PC */
+    uint32_t csr[4096];     /* CSR file: Zicsr counters + the M9 trap registers */
 } CPU;
 
 /* Initialise a CPU: zero all registers, set PC to the given entry point,
