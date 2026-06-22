@@ -13,7 +13,8 @@ discrete quantum of work.
 
 ## Status
 
-Milestone M7 — the final roadmap milestone; all of M0–M7 are now complete. The
+All of M0–M7 (the learning arc) are complete, and Part II — making Quanta
+production-grade on the way to booting an OS — is under way, now through M9. The
 fetch/decode/execute core runs the full RV32I base integer instruction set plus
 the RV32M multiply/divide extension, loads real ELF32
 executables (`quanta program.elf`), and services system calls — programs print with `write` and terminate with `exit`,
@@ -29,9 +30,11 @@ locals. An optional `--cache` flag models a configurable set-associative L1 over
 the run's data accesses and reports hit/miss statistics, without changing what
 the program computes. A `--pipeline` flag adds a 5-stage timing overlay that
 estimates cycle count and CPI from the instruction stream's load-use and control
-hazards. With M7 done the numbered milestones are complete; see the roadmap's
-"Beyond" section for open directions (floating point, a privileged/CSR subset, a
-branch predictor, a self-hosted assembler).
+hazards. Part II then adds an engineering track (a `libquanta` engine split, CI,
+sanitizer and fuzzing builds, differential testing against qemu) and a
+capability track: Zicsr/Zifencei CSR access (M8) and the M/S/U privileged
+architecture with exception/trap handling (M9). Next come RV32A atomics and Sv32
+virtual memory, on the road to booting an operating system.
 
 ## Tech stack
 
@@ -144,14 +147,15 @@ quanta/
 
 ## Roadmap
 
-Development proceeds in milestones (M0–M7), each a runnable step that also
-teaches one architecture concept — from an ELF loader and syscalls through full
-RV32I conformance, the RV32M extension, a cache model, and a pipeline timing
-model. M0–M7 are all complete (core loop, ELF loader, system calls, RV32I
-conformance, disassembler + trace mode, RV32M extension, cache model, pipeline
-timing model); the roadmap's "Beyond" section lists open directions. See
-[ROADMAP.md](ROADMAP.md) for the full plan, acceptance criteria, and learning
-path.
+Development proceeds in milestones, each a runnable step that also teaches one
+architecture concept. M0–M7 (the learning arc) are all complete — core loop, ELF
+loader, system calls, RV32I conformance, disassembler + trace mode, RV32M
+extension, cache model, and pipeline timing model. Part II then advances two
+tracks toward a production-grade, OS-booting emulator: an engineering track
+(`libquanta` split, CI, sanitizers, fuzzing, differential testing — E1–E5 done)
+and a capability track (Zicsr/Zifencei M8, the M/S/U privileged architecture M9,
+with RV32A atomics and Sv32 virtual memory next). See [ROADMAP.md](ROADMAP.md)
+for the full plan, acceptance criteria, and learning path.
 
 ## License
 

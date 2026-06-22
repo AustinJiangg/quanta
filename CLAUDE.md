@@ -16,13 +16,15 @@ learn computer architecture. It models a single hart: 32 registers, a PC, and a
 flat little-endian memory. The core is a fetch/decode/execute loop.
 
 All roadmap milestones (M0–M7) are complete, and Part II is under way: the full
-RV32I base integer set plus the RV32M multiply/divide and Zicsr/Zifencei (CSR
-access and `fence.i`, M8) extensions are implemented and pinned by a
+RV32I base integer set, the RV32M multiply/divide extension, Zicsr/Zifencei (CSR
+access and `fence.i`, M8), and the privileged architecture (M/S/U privilege
+levels with exception/trap handling, M9) are implemented and pinned by a
 hand-written conformance suite (`make check`), an optional cache model sits in
 front of memory, and a `--pipeline` timing model estimates cycles and CPI.
 Quanta loads ELF32
 executables (`quanta program.elf`), services `write`/`exit` system calls through
-the ECALL path, and returns the guest's exit status as its own. A hardcoded
+the ECALL path — the built-in SEE that runs until a guest installs its own trap
+handler — and returns the guest's exit status as its own. A hardcoded
 built-in demo runs when no ELF is given. A disassembler plus a `--trace` flag
 make execution observable, and `make check-disasm` pins the disassembly to
 `objdump`. An optional `--cache` flag models a configurable set-associative L1
@@ -72,9 +74,9 @@ program.
   emulator itself, since the built-in demo needs no ELF.
 
 When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
-(the RV32M test uses `-march=rv32im` and the CSR test
-`-march=rv32i_zicsr_zifencei`; the Makefile overrides `RVCFLAGS` for just those
-two ELFs).
+(the RV32M test uses `-march=rv32im`, the CSR test `-march=rv32i_zicsr_zifencei`,
+and the M9 privilege tests `-march=rv32i_zicsr`; the Makefile overrides
+`RVCFLAGS` for just those ELFs).
 
 ## Code layout
 
@@ -88,7 +90,12 @@ two ELFs).
   (multiply/divide) shares the OP opcode and lives in `exec_muldiv`, selected by
   `funct7 == 0x01`. Zicsr (CSR access) lives in `exec_csr`, reached from
   `exec_system` when SYSTEM carries a non-zero funct3; `csr_read`/`csr_write`
-  are the choke point the (still privilege-free) CSR file flows through.
+  are the choke point the CSR file flows through, now with privilege and
+  read-only checks. The M9 privileged architecture also lives here: a `priv`
+  field (M/S/U), the trap CSRs, and `raise_trap` — the single point exceptions
+  (ECALL/EBREAK/illegal/misaligned/access-fault) funnel through to vector into a
+  handler or, when no handler is installed, fall back to the built-in SEE.
+  `exec_mret`/`exec_sret` pop the stacked privilege to return.
 - `src/disasm.{h,c}` — RV32I disassembler: turns an instruction word back into
   objdump-style assembly (ABI names, common pseudo-instructions, absolute
   branch/jump targets). Mirrors `cpu_step`'s opcode switch over `decode.h`.
@@ -130,6 +137,12 @@ two ELFs).
 - `tests/test_stack.S` — exercises the loader-initialised stack (a non-leaf
   function spilling `ra` and callee-saved registers) and a small array-traversal
   workload; part of `make check`, and a seed for the M6 cache benchmark.
+- `tests/test_trap.S` + `tests/test_priv.S` — the M9 privilege suite. `test_trap`
+  installs an `mtvec` handler and takes three M-mode exceptions (ecall, ebreak,
+  illegal), checking `mcause`/`mepc` and `mret` resume; `test_priv` walks
+  M→U→S→U→M through delegation (`medeleg`), an S-mode handler, and `sret`. Both
+  use machine CSRs, so they assemble with `-march=rv32i_zicsr` and stay out of
+  `make check-diff`.
 - `tests/check_disasm.sh` — runs each sample ELF under `--trace` and diffs the
   disassembly against `objdump` (`make check-disasm`).
 - `tests/check_cache.sh` — runs `test_stack` under two cache geometries and
@@ -138,9 +151,10 @@ two ELFs).
 - `tests/check_diff.sh` — differential test: runs each sample ELF under
   `quanta --quiet` and a reference simulator (qemu-riscv32 by default, override
   with `REF=`) and asserts they agree on stdout and exit code (`make
-  check-diff`). Skips cleanly if the reference is absent. `tests/test_csr.elf`
-  is excluded (its machine-mode CSR use trips user-mode qemu's privilege
-  check); `make check` pins it instead.
+  check-diff`). Skips cleanly if the reference is absent. The privileged tests
+  (`test_csr`, `test_trap`, `test_priv`) are excluded — their machine-mode CSR
+  and trap use trips user-mode qemu's own supervisor; `make check` pins them
+  instead.
 - `fuzz/fuzz_elf.c`, `fuzz/fuzz_decode.c` — libFuzzer harnesses over the ELF
   loader and the decode/execute path; `fuzz/standalone.c` is a plain-main driver
   so they replay over a corpus under gcc (`make fuzz` / `make fuzz-replay`).
@@ -179,15 +193,18 @@ two ELFs).
   (`MEM_BASE`/`MEM_SIZE` in `main.c`); an ELF gets a region sized to its load
   image instead. BSS (`p_memsz > p_filesz`) reads back as zero because the
   region is zero-initialised at `mem_init`.
-- ECALL is a system call now, not a halt: it dispatches on the `a7` number
-  (`write`=64, `exit`=93, `exit_group`=94 — RISC-V Linux/newlib numbers), with
-  arguments in `a0`–`a2` and the result returned in `a0`. EBREAK, unknown
-  syscalls, and unimplemented SYSTEM instructions stop the machine instead. So
-  programs must terminate by calling `exit`; a bare `ecall` with a stale `a7`
-  (or running off the end of the code) trips an "unknown syscall" halt — which
-  is why the built-in demo and `tests/hello.S` end with an explicit `exit`.
-  Quanta returns the guest's exit code as its own process status (abnormal
-  stops return 1), which is how `make check` tells pass from fail.
+- ECALL/EBREAK now raise real exceptions (M9), but with a fallback: when the
+  guest has installed no trap handler (the resolved `*tvec` is still 0), they
+  fall back to the built-in SEE — the same `a7`-dispatched syscall layer as
+  before (`write`=64, `exit`=93, `exit_group`=94 — RISC-V Linux/newlib numbers;
+  args in `a0`–`a2`, result in `a0`), with EBREAK / unknown-syscall / illegal-
+  instruction stopping the machine. Once a guest sets `mtvec` (or `stvec` for a
+  delegated trap) these vector into its handler instead. So bare programs still
+  terminate by calling `exit`; a stale-`a7` `ecall` (or running off the code)
+  still trips an "unknown syscall" halt — which is why the demo and
+  `tests/hello.S` end with an explicit `exit`. Quanta returns the guest's exit
+  code as its own process status (abnormal stops return 1), which is how `make
+  check` tells pass from fail.
 - `run_until_halt` (in `main.c`) caps a run at 100M instructions as a runaway
   guard: a program that never calls `exit` stops there, reports the limit, and
   returns 1. Raise the cap if a workload legitimately needs more.
@@ -203,16 +220,28 @@ two ELFs).
   structural or cache-miss penalties — not a cycle-accurate simulation.
 - FENCE (MISC-MEM opcode `0x0f`) is a no-op — a single in-order hart has
   nothing to reorder — and so is FENCE.I (Zifencei), its instruction-stream
-  cousin, for the same reason (no modelled icache to flush). CSR instructions
-  (Zicsr, M8) are implemented: a SYSTEM word with a non-zero funct3 runs
-  `csrrw/s/c` and their immediate forms through `exec_csr`. Most CSRs are plain
+  cousin, for the same reason (no modelled icache to flush). WFI is likewise a
+  nop (no interrupt sources to wait for yet). CSR instructions (Zicsr, M8) run
+  `csrrw/s/c` and their immediate forms through `exec_csr`: most CSRs are plain
   WARL storage; the unprivileged counters (`cycle`/`time`/`instret` and their
-  high halves) read back the retired-instruction count, and writes to read-only
-  CSRs are dropped. Privilege levels and the trap CSRs (`mstatus`/`mtvec`/…)
-  are still to come (M9), so `mret`/`sret`/`wfi` and a reserved `funct3 == 4`
-  still halt as "unimplemented SYSTEM". Conformance stays on the hand-written
-  `make check` rather than the official `riscv-tests` (whose `-p` environment
-  needs the M9 trap support).
+  high halves) read back the retired-instruction count. `exec_csr` enforces the
+  access privilege encoded in CSR bits [9:8] and raises illegal-instruction on a
+  write to a read-only CSR (bits [11:10] == `0b11`) — except a `csrrs/csrrc` with
+  an `x0` source, which performs no write and so never trips that check.
+- Privilege and traps (M9): the hart tracks a current mode (`PRIV_M`/`S`/`U`,
+  resets to M) and `raise_trap` is the one path every synchronous exception
+  takes. It resolves the target mode via `medeleg` (a trap in S/U delegates to
+  S; a trap in M never delegates), stacks `MIE`/`MPIE`+`MPP` (or the S mirrors)
+  into `mstatus`, writes `*epc`/`*cause`/`*tval`, and vectors to `*tvec` (direct
+  mode; vectored is for interrupts, M13). `mret`/`sret` pop that state. The
+  S-mode CSRs `sstatus`/`sie`/`sip` are masked *views* of `mstatus`/`mie`/`mip`,
+  not separate storage. Key design point: **if the resolved `*tvec` is still 0,
+  no guest handler exists and the trap falls back to the built-in SEE** — which
+  is what keeps every pre-M9 program (none of which set `mtvec`) running
+  unchanged. Not yet modelled: interrupts (no devices until M13), `mcounteren`
+  gating of counter access from lower privilege, and Sv32 translation (`satp` is
+  stored, not walked, until M12). Conformance stays on the hand-written `make
+  check`; the official `riscv-tests` `-p` environment is now within reach (E6).
 - RV32M (M5) was the first extension wired in: it shares the OP opcode and
   is selected by `funct7 == 0x01` (`exec_muldiv` in `cpu.c`, mirrored in
   `disasm.c`). Divide-by-zero and the `INT_MIN / -1` signed overflow return

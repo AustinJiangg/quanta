@@ -430,18 +430,38 @@ and covered by `make check` instead. The official `riscv-tests` `-p` environment
 - [x] **Commits:** `feat: add csr register file and zicsr`,
   `feat: implement fence.i`, `docs: document csr support`.
 
-## M9 — Privileged architecture (M/S/U + traps)
+## M9 — Privileged architecture (M/S/U + traps) (DONE)
 
-- [ ] **Build:** privilege levels (M/S/U), the trap CSRs
+The privilege model and the trap mechanism the full-system phase is built on.
+The hart now tracks a current mode (M/S/U, resetting to M), and a single
+`raise_trap` in `cpu.c` is the choke point every synchronous exception flows
+through: it resolves the target mode by delegation (`medeleg` sends a trap taken
+in S/U down to S-mode; a trap taken in M never delegates), stacks the
+interrupt-enable and previous-privilege bits into `mstatus`, records
+`*epc`/`*cause`/`*tval`, and vectors to `*tvec`. `mret`/`sret` pop that stacked
+state to return, and `exec_csr` gained the privilege and read-only checks the
+CSR encoding implies. The M-mode trap CSRs are real storage; the S-mode set
+(`sstatus`/`sie`/`sip`) are masked views of their M counterparts. ECALL, EBREAK,
+illegal-instruction, and misaligned-fetch faults route through real traps — but
+with a deliberate hook: when no handler is installed (the resolved `*tvec` is
+still 0), a trap falls back to the built-in SEE, so every pre-M9 program keeps
+running unchanged while a guest that sets `mtvec`/`stvec` takes over its own
+traps. `tests/test_trap.S` pins the M-mode path (ecall/ebreak/illegal →
+`mcause`/`mepc` → `mret`) and `tests/test_priv.S` the M→U→S→U→M round trip
+through delegation and `sret`; both stay out of `make check-diff` (machine CSRs)
+and are held by `make check`. Interrupt *delivery* (vectored mode, `mip`-driven
+entry) waits on the devices in M13 — the mechanism is here, the sources are not.
+
+- [x] **Build:** privilege levels (M/S/U), the trap CSRs
   (`mstatus/mtvec/mepc/mcause/mie/mip/medeleg/mideleg` and the `s*` mirrors),
   exception and interrupt entry, `mret`/`sret`, and delegation. Route ECALL,
   EBREAK, illegal-instruction and misaligned faults through real traps.
-- [ ] **ISA:** the privileged-spec subset (no MMU yet).
-- [ ] **Concept:** the privilege model; precise traps; how interrupts and
+- [x] **ISA:** the privileged-spec subset (no MMU yet).
+- [x] **Concept:** the privilege model; precise traps; how interrupts and
   exceptions share a vector; delegation between modes.
-- [ ] **Done when:** a handler installed via `mtvec` catches a deliberate
+- [x] **Done when:** a handler installed via `mtvec` catches a deliberate
   exception, inspects `mcause/mepc`, and returns with `mret`.
-- [ ] **Commits:** `feat: add privilege levels and trap csrs`,
+- [x] **Commits:** `feat: add privilege levels and trap csrs`,
   `feat: implement trap entry and mret/sret`,
   `feat: route exceptions through traps`, `docs: document the trap model`.
 
