@@ -95,6 +95,9 @@ tests/test_csr.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr_zifencei,$(RVCFLAGS))
 # The M9 privilege tests use the trap CSRs and mret/sret, which need Zicsr.
 tests/test_trap.elf tests/test_priv.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr,$(RVCFLAGS))
 
+# tests/test_atomic.S uses the RV32A atomics, which the base assembler rejects.
+tests/test_atomic.elf: RVCFLAGS := $(subst rv32i,rv32ia,$(RVCFLAGS))
+
 # Run the RV32I conformance suite (tests/test_*.S) through the emulator. Each
 # test exits 0 on success or the number of its first failed check, which quanta
 # propagates as its own exit status; we use that to print PASS/FAIL per file.
