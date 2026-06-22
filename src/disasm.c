@@ -20,17 +20,46 @@
  * and the upper-immediate field.
  */
 
-/* objdump prints known CSRs by name; we model the handful the core touches. */
+/* objdump prints known CSRs by name; we model the ones the core touches —
+ * the unprivileged counters and the M9 machine/supervisor trap registers. */
 static const char *csr_name(uint32_t addr) {
     switch (addr) {
-        case CSR_MSCRATCH: return "mscratch";
         case CSR_CYCLE:    return "cycle";
         case CSR_TIME:     return "time";
         case CSR_INSTRET:  return "instret";
         case CSR_CYCLEH:   return "cycleh";
         case CSR_TIMEH:    return "timeh";
         case CSR_INSTRETH: return "instreth";
-        default:           return NULL;
+        /* Supervisor trap CSRs. */
+        case CSR_SSTATUS:    return "sstatus";
+        case CSR_SIE:        return "sie";
+        case CSR_STVEC:      return "stvec";
+        case CSR_SCOUNTEREN: return "scounteren";
+        case CSR_SSCRATCH:   return "sscratch";
+        case CSR_SEPC:       return "sepc";
+        case CSR_SCAUSE:     return "scause";
+        case CSR_STVAL:      return "stval";
+        case CSR_SIP:        return "sip";
+        case CSR_SATP:       return "satp";
+        /* Machine information and trap CSRs. */
+        case CSR_MVENDORID:  return "mvendorid";
+        case CSR_MARCHID:    return "marchid";
+        case CSR_MIMPID:     return "mimpid";
+        case CSR_MHARTID:    return "mhartid";
+        case CSR_MSTATUS:    return "mstatus";
+        case CSR_MISA:       return "misa";
+        case CSR_MEDELEG:    return "medeleg";
+        case CSR_MIDELEG:    return "mideleg";
+        case CSR_MIE:        return "mie";
+        case CSR_MTVEC:      return "mtvec";
+        case CSR_MCOUNTEREN: return "mcounteren";
+        case CSR_MSTATUSH:   return "mstatush";
+        case CSR_MSCRATCH:   return "mscratch";
+        case CSR_MEPC:       return "mepc";
+        case CSR_MCAUSE:     return "mcause";
+        case CSR_MTVAL:      return "mtval";
+        case CSR_MIP:        return "mip";
+        default:             return NULL;
     }
 }
 
@@ -257,6 +286,9 @@ void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
         if (f3 == 0) {
             if (f12 == 0x000)      snprintf(buf, buflen, "ecall");
             else if (f12 == 0x001) snprintf(buf, buflen, "ebreak");
+            else if (f12 == 0x302) snprintf(buf, buflen, "mret");
+            else if (f12 == 0x102) snprintf(buf, buflen, "sret");
+            else if (f12 == 0x105) snprintf(buf, buflen, "wfi");
             else                   snprintf(buf, buflen, ".word 0x%08x", inst);
         } else {
             disasm_csr(inst, f3, buf, buflen);
