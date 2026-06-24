@@ -304,7 +304,13 @@ void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
     case OP_SYSTEM: {
         uint32_t f12 = inst >> 20;
         if (f3 == 0) {
-            if (f12 == 0x000)      snprintf(buf, buflen, "ecall");
+            if ((inst >> 25) == 0x09) { /* SFENCE.VMA: bare, or with vaddr/asid */
+                if (rs1(inst) == 0 && rs2(inst) == 0)
+                    snprintf(buf, buflen, "sfence.vma");
+                else
+                    snprintf(buf, buflen, "sfence.vma %s,%s", s1, s2);
+            }
+            else if (f12 == 0x000) snprintf(buf, buflen, "ecall");
             else if (f12 == 0x001) snprintf(buf, buflen, "ebreak");
             else if (f12 == 0x302) snprintf(buf, buflen, "mret");
             else if (f12 == 0x102) snprintf(buf, buflen, "sret");
