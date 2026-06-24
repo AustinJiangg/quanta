@@ -2,6 +2,7 @@
 #include "decode.h"
 #include "syscall.h"
 #include "cache.h"
+#include "mmu.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -16,52 +17,18 @@
  * opcode, and advances PC. Unimplemented encodings trap and halt the machine.
  * ------------------------------------------------------------------------ */
 
-/* ------------------------------------------------------------------------
- * Privileged-architecture constants (M9).
- *
- * mstatus packs the trap-handling state into named bit fields; a trap stacks
- * the interrupt-enable and previous-privilege bits here and mret/sret pop them.
- * The S-mode CSRs (sstatus/sie/sip) are not separate registers but masked
- * windows onto mstatus/mie/mip, so the masks below pick out the bits S-mode is
- * allowed to see and change.
- * ------------------------------------------------------------------------ */
+/* sstatus/sie/sip are masked windows onto mstatus/mie/mip; these masks pick the
+ * bits S-mode may see and change. The mstatus bit fields and the exception
+ * cause codes they build on are shared with the MMU, so they live in cpu.h. */
 enum {
-    MSTATUS_SIE  = 1u << 1,   /* S-mode interrupt enable            */
-    MSTATUS_MIE  = 1u << 3,   /* M-mode interrupt enable            */
-    MSTATUS_SPIE = 1u << 5,   /* previous SIE, stacked on an S-trap */
-    MSTATUS_MPIE = 1u << 7,   /* previous MIE, stacked on an M-trap */
-    MSTATUS_SPP  = 1u << 8,   /* previous privilege for S (1 bit)   */
-    MSTATUS_MPP  = 3u << 11,  /* previous privilege for M (2 bits)  */
-    MSTATUS_MPRV = 1u << 17,  /* load/store as MPP (inert until paging, M12) */
-    MSTATUS_SUM  = 1u << 18,
-    MSTATUS_MXR  = 1u << 19,
-    MSTATUS_MPP_SHIFT = 11,
-
-    /* sstatus sees these mstatus bits; everything else reads 0 / ignores writes.
-     * (FS/XS/SD are float/extension state we don't model yet.) */
     SSTATUS_MASK = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP |
                    MSTATUS_SUM | MSTATUS_MXR,
-
-    /* sie/sip see only the S-mode interrupt bits (software/timer/external). */
     S_INT_MASK = (1u << 1) | (1u << 5) | (1u << 9)
 };
 
-/* Synchronous exception causes (mcause/scause with the interrupt bit clear).
- * The ecall causes are contiguous from U so `ECALL_U + priv` selects the right
- * one (priv is 0/1/3, and there is deliberately no cause 10). */
-enum {
-    CAUSE_INSN_MISALIGNED = 0,
-    CAUSE_INSN_ACCESS     = 1,
-    CAUSE_ILLEGAL_INSN    = 2,
-    CAUSE_BREAKPOINT      = 3,
-    CAUSE_LOAD_MISALIGNED = 4,
-    CAUSE_LOAD_ACCESS     = 5,
-    CAUSE_STORE_MISALIGNED= 6,
-    CAUSE_STORE_ACCESS    = 7,
-    CAUSE_ECALL_U         = 8,
-    CAUSE_ECALL_S         = 9,
-    CAUSE_ECALL_M         = 11
-};
+/* Defined below with the trap machinery, declared here so the memory-access
+ * instructions (which appear earlier) can raise page faults through it. */
+static void raise_trap(CPU *cpu, uint32_t cause, uint32_t tval);
 
 void cpu_init(CPU *cpu, Memory *mem, uint32_t entry_pc) {
     for (int i = 0; i < 32; i++) cpu->regs[i] = 0;
@@ -76,6 +43,7 @@ void cpu_init(CPU *cpu, Memory *mem, uint32_t entry_pc) {
     cpu->trapped     = 0;
     cpu->reserve_valid = 0;
     cpu->reserve_addr  = 0;
+    mmu_flush(cpu); /* invalidate the TLB */
     memset(cpu->csr, 0, sizeof cpu->csr);
     /* misa advertises the base and extensions: MXL=1 (RV32), I, M, S, U. It is
      * informational here; reads see this, writes are accepted as WARL storage. */
@@ -222,35 +190,43 @@ static uint32_t exec_branch(CPU *cpu, uint32_t inst) {
     return taken ? cpu->pc + (uint32_t)imm_b(inst) : cpu->pc + 4;
 }
 
-/* Execute LOAD: read memory into a register. */
+/* Execute LOAD: read memory into a register. The address is virtual; translate
+ * it first, raising a load page fault if the mapping is missing or unreadable. */
 static void exec_load(CPU *cpu, uint32_t inst) {
-    uint32_t addr = reg_read(cpu, rs1(inst)) + (uint32_t)imm_i(inst);
+    uint32_t va = reg_read(cpu, rs1(inst)) + (uint32_t)imm_i(inst);
+    uint32_t pa;
+    uint32_t fault = mmu_translate(cpu, va, ACC_LOAD, &pa);
+    if (fault) { raise_trap(cpu, fault, va); return; }
     uint32_t result = 0;
 
-    if (cpu->cache) cache_access(cpu->cache, addr, 0); /* observe, don't alter */
+    if (cpu->cache) cache_access(cpu->cache, pa, 0); /* observe, don't alter */
 
     switch (funct3(inst)) {
-        case 0x0: result = (uint32_t)(int8_t)mem_read8(cpu->mem, addr); break;  /* LB  */
-        case 0x1: result = (uint32_t)(int16_t)mem_read16(cpu->mem, addr); break;/* LH  */
-        case 0x2: result = mem_read32(cpu->mem, addr); break;                   /* LW  */
-        case 0x4: result = mem_read8(cpu->mem, addr); break;                    /* LBU */
-        case 0x5: result = mem_read16(cpu->mem, addr); break;                   /* LHU */
+        case 0x0: result = (uint32_t)(int8_t)mem_read8(cpu->mem, pa); break;  /* LB  */
+        case 0x1: result = (uint32_t)(int16_t)mem_read16(cpu->mem, pa); break;/* LH  */
+        case 0x2: result = mem_read32(cpu->mem, pa); break;                   /* LW  */
+        case 0x4: result = mem_read8(cpu->mem, pa); break;                    /* LBU */
+        case 0x5: result = mem_read16(cpu->mem, pa); break;                   /* LHU */
     }
     reg_write(cpu, rd(inst), result);
 }
 
-/* Execute STORE: write a register to memory. */
+/* Execute STORE: write a register to memory, translating the virtual address
+ * first (a store page fault if the page is missing or read-only). */
 static void exec_store(CPU *cpu, uint32_t inst) {
-    uint32_t addr = reg_read(cpu, rs1(inst)) + (uint32_t)imm_s(inst);
-    uint32_t val  = reg_read(cpu, rs2(inst));
+    uint32_t va  = reg_read(cpu, rs1(inst)) + (uint32_t)imm_s(inst);
+    uint32_t val = reg_read(cpu, rs2(inst));
+    uint32_t pa;
+    uint32_t fault = mmu_translate(cpu, va, ACC_STORE, &pa);
+    if (fault) { raise_trap(cpu, fault, va); return; }
 
-    break_reservation(cpu, addr); /* RV32A: a plain store can void an LR/SC pair */
-    if (cpu->cache) cache_access(cpu->cache, addr, 1); /* observe, don't alter */
+    break_reservation(cpu, pa); /* RV32A: a plain store can void an LR/SC pair */
+    if (cpu->cache) cache_access(cpu->cache, pa, 1); /* observe, don't alter */
 
     switch (funct3(inst)) {
-        case 0x0: mem_write8 (cpu->mem, addr, (uint8_t)val);  break; /* SB */
-        case 0x1: mem_write16(cpu->mem, addr, (uint16_t)val); break; /* SH */
-        case 0x2: mem_write32(cpu->mem, addr, val);           break; /* SW */
+        case 0x0: mem_write8 (cpu->mem, pa, (uint8_t)val);  break; /* SB */
+        case 0x1: mem_write16(cpu->mem, pa, (uint16_t)val); break; /* SH */
+        case 0x2: mem_write32(cpu->mem, pa, val);           break; /* SW */
     }
 }
 
@@ -301,6 +277,10 @@ static void csr_write(CPU *cpu, uint32_t addr, uint32_t val) {
         case CSR_SIP:
             cpu->csr[CSR_MIP] = (cpu->csr[CSR_MIP] & ~S_INT_MASK)
                               | (val & S_INT_MASK);
+            return;
+        case CSR_SATP:
+            cpu->csr[CSR_SATP] = val;
+            mmu_flush(cpu); /* a new address space invalidates cached translations */
             return;
         default:
             cpu->csr[addr] = val;
@@ -451,13 +431,18 @@ static void exec_amo(CPU *cpu, uint32_t inst) {
         return;
     }
     uint32_t funct5 = inst >> 27;
-    uint32_t addr   = reg_read(cpu, rs1(inst));
+    uint32_t va     = reg_read(cpu, rs1(inst));
 
-    if (addr & 0x3) { /* atomics require natural alignment */
+    if (va & 0x3) { /* atomics require natural alignment */
         raise_trap(cpu, (funct5 == 0x02) ? CAUSE_LOAD_MISALIGNED
-                                          : CAUSE_STORE_MISALIGNED, addr);
+                                          : CAUSE_STORE_MISALIGNED, va);
         return;
     }
+    /* Translate once: LR reads (sets A), SC and the AMOs write (set D). */
+    uint32_t addr;
+    uint32_t fault = mmu_translate(cpu, va,
+                                   (funct5 == 0x02) ? ACC_LOAD : ACC_STORE, &addr);
+    if (fault) { raise_trap(cpu, fault, va); return; }
     if (cpu->cache) cache_access(cpu->cache, addr, 1); /* observe the access */
 
     if (funct5 == 0x02) { /* LR.W: load and hold a reservation on the word */
@@ -549,6 +534,11 @@ static uint32_t exec_system(CPU *cpu, uint32_t inst) {
     uint32_t f3 = funct3(inst);
 
     if (f3 == 0) {
+        if ((inst >> 25) == 0x09) { /* SFENCE.VMA (funct7 = 0x09) */
+            if (cpu->priv < PRIV_S) raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst);
+            else mmu_flush(cpu); /* drop cached translations; the walk is canonical */
+            return cpu->pc + 4;
+        }
         switch (inst >> 20) { /* funct12 */
             case 0x000: /* ECALL: environment call from the current privilege */
                 raise_trap(cpu, CAUSE_ECALL_U + cpu->priv, 0);
@@ -580,8 +570,11 @@ void cpu_step(CPU *cpu) {
     cpu->mem->fault = 0;
     cpu->trapped = 0; /* set by raise_trap if this step vectors into a handler */
 
-    /* FETCH: read the 32-bit instruction word at PC. */
-    uint32_t inst = mem_read32(cpu->mem, cpu->pc);
+    /* FETCH: translate PC, then read the 32-bit instruction word there. */
+    uint32_t pc_pa;
+    uint32_t fc = mmu_translate(cpu, cpu->pc, ACC_FETCH, &pc_pa);
+    if (fc) { raise_trap(cpu, fc, cpu->pc); return; } /* instruction page fault */
+    uint32_t inst = mem_read32(cpu->mem, pc_pa);
     if (cpu->mem->fault) { /* unmapped fetch: trap before decoding garbage */
         raise_trap(cpu, CAUSE_INSN_ACCESS, cpu->pc);
         return;

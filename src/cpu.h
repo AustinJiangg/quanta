@@ -30,6 +30,60 @@ enum {
     PRIV_M = 3   /* Machine    */
 };
 
+/* mstatus bit fields: the trap-handling state mret/sret and traps stack and
+ * pop, plus the bits paging (M12) consults — MPRV redirects loads/stores to
+ * MPP's translation, SUM lets S-mode touch U-pages, MXR makes X-only pages
+ * readable. Shared with the MMU, which is why they live in the header. */
+enum {
+    MSTATUS_SIE  = 1u << 1,
+    MSTATUS_MIE  = 1u << 3,
+    MSTATUS_SPIE = 1u << 5,
+    MSTATUS_MPIE = 1u << 7,
+    MSTATUS_SPP  = 1u << 8,
+    MSTATUS_MPP  = 3u << 11,
+    MSTATUS_MPRV = 1u << 17,
+    MSTATUS_SUM  = 1u << 18,
+    MSTATUS_MXR  = 1u << 19,
+    MSTATUS_MPP_SHIFT = 11
+};
+
+/* Synchronous exception causes (mcause/scause with the interrupt bit clear).
+ * The ecall causes are contiguous from U so ECALL_U + priv selects the right
+ * one (priv is 0/1/3, and there is deliberately no cause 10); 12/13/15 are the
+ * Sv32 page faults. Shared with the MMU. */
+enum {
+    CAUSE_INSN_MISALIGNED  = 0,
+    CAUSE_INSN_ACCESS      = 1,
+    CAUSE_ILLEGAL_INSN     = 2,
+    CAUSE_BREAKPOINT       = 3,
+    CAUSE_LOAD_MISALIGNED  = 4,
+    CAUSE_LOAD_ACCESS      = 5,
+    CAUSE_STORE_MISALIGNED = 6,
+    CAUSE_STORE_ACCESS     = 7,
+    CAUSE_ECALL_U          = 8,
+    CAUSE_ECALL_S          = 9,
+    CAUSE_ECALL_M          = 11,
+    CAUSE_INSN_PAGE_FAULT  = 12,
+    CAUSE_LOAD_PAGE_FAULT  = 13,
+    CAUSE_STORE_PAGE_FAULT = 15
+};
+
+/* The kind of access being translated — selects the permission bit to check and
+ * which page-fault cause to raise. */
+typedef enum { ACC_FETCH, ACC_LOAD, ACC_STORE } AccessType;
+
+/* A software TLB entry: one cached VA-page -> PA-page translation, tagged by
+ * ASID and carrying the leaf PTE's permission bits so per-access permission
+ * checks still run on a hit. Flushed by sfence.vma and any satp write. */
+#define TLB_ENTRIES 16
+typedef struct {
+    int      valid;
+    uint32_t vpn;       /* va >> 12 */
+    uint32_t asid;
+    uint32_t ppn;       /* pa >> 12 */
+    uint32_t pte_flags; /* leaf PTE low byte: D A G U X W R V */
+} TlbEntry;
+
 /*
  * Why the machine stopped. cpu_step() and the syscall layer record one of
  * these in `halt_reason` whenever they set `halted`, so the embedder — the CLI
@@ -58,7 +112,9 @@ typedef struct {
     uint32_t priv;          /* current privilege: PRIV_U / PRIV_S / PRIV_M */
     int      trapped;       /* set within a step when a trap redirected the PC */
     int      reserve_valid; /* RV32A: an LR.W set a reservation still held */
-    uint32_t reserve_addr;  /* RV32A: word address that reservation covers */
+    uint32_t reserve_addr;  /* RV32A: physical word the reservation covers */
+    TlbEntry tlb[TLB_ENTRIES]; /* M12: cached Sv32 translations */
+    uint32_t tlb_next;      /* round-robin TLB replacement index */
     uint32_t csr[4096];     /* CSR file: Zicsr counters + the M9 trap registers */
 } CPU;
 
