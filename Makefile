@@ -92,8 +92,9 @@ tests/test_muldiv.elf: RVCFLAGS := $(subst rv32i,rv32im,$(RVCFLAGS))
 # the base assembler rejects. Enable both extensions for just this one ELF.
 tests/test_csr.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr_zifencei,$(RVCFLAGS))
 
-# The M9 privilege tests use the trap CSRs and mret/sret, which need Zicsr.
-tests/test_trap.elf tests/test_priv.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr,$(RVCFLAGS))
+# The M9/M12 privilege + paging tests use trap CSRs, mret/sret, satp and
+# sfence.vma, which need Zicsr.
+tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr,$(RVCFLAGS))
 
 # tests/test_atomic.S uses the RV32A atomics, which the base assembler rejects.
 tests/test_atomic.elf: RVCFLAGS := $(subst rv32i,rv32ia,$(RVCFLAGS))
@@ -135,7 +136,7 @@ check-pipeline: $(BIN) tests/hazard_slow.elf tests/hazard_fast.elf
 # The privileged tests are excluded: they touch machine-mode CSRs and trap
 # state (mscratch, mtvec, mret, delegation) that user-mode qemu rejects with
 # SIGILL because it provides its own supervisor. `make check` pins them instead.
-DIFF_ELF := $(filter-out tests/test_csr.elf tests/test_trap.elf tests/test_priv.elf,$(TEST_ELF))
+DIFF_ELF := $(filter-out tests/test_csr.elf tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf,$(TEST_ELF))
 
 check-diff: $(BIN) $(TEST_ELF)
 	@sh tests/check_diff.sh $(DIFF_ELF)
