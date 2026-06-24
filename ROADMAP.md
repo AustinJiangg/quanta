@@ -503,17 +503,35 @@ work in M19.)
 
 ### Stage 2 — Full-system substrate (M12–M14)
 
-## M12 — Sv32 virtual memory
+## M12 — Sv32 virtual memory (DONE)
 
-- [ ] **Build:** a two-level Sv32 page-table walker, a TLB, `satp`,
+The central architectural change of the full-system phase: addresses stop being
+physical. `src/mmu.c` adds the Sv32 two-level page-table walker, a small TLB, and
+the permission/A-D logic, and `cpu.c` now runs every instruction fetch and data
+address through `mmu_translate` before it reaches memory. (The translation layer
+lives in mmu.c rather than memory.c — it needs CPU state, satp/priv/mstatus,
+while memory.c stays a dumb physical array.) A walk turns a 32-bit VA into a
+physical one, honouring megapages, the U/SUM/MXR permission rules, and hardware
+accessed/dirty updates; a missing mapping or permission violation raises a
+precise page fault (cause 12/13/15) with the faulting VA in *tval. Paging is the
+identity in M-mode and Bare mode, so it is inert until a guest writes satp —
+every earlier test runs unchanged. The TLB caches fetch/load translations
+(stores always walk so the dirty bit lands on the real PTE) and is flushed by
+sfence.vma and any satp write. `tests/test_vm.S` builds a page table by hand,
+enables Sv32, drops to S-mode, and proves non-identity translation (two VAs
+aliased to one frame), the hardware dirty bit, and a caught load page fault; it
+uses satp, so it joins the privileged tests outside make check-diff. (Sv39 and
+its three-level walk are M18, after the RV64 transition.)
+
+- [x] **Build:** a two-level Sv32 page-table walker, a TLB, `satp`,
   `sfence.vma`, and page-fault traps. `memory.c` gains VA→PA translation — the
   central architectural change of the full-system phase.
-- [ ] **ISA:** Sv32 address translation.
-- [ ] **Concept:** virtual memory; page tables and the walk; TLBs; how paging
+- [x] **ISA:** Sv32 address translation.
+- [x] **Concept:** virtual memory; page tables and the walk; TLBs; how paging
   and the privilege model combine.
-- [ ] **Done when:** with paging enabled a user program runs in its virtual
+- [x] **Done when:** with paging enabled a user program runs in its virtual
   address space and an unmapped access faults precisely.
-- [ ] **Commits:** `feat: add sv32 page-table walk`, `feat: add a tlb`,
+- [x] **Commits:** `feat: add sv32 page-table walk`, `feat: add a tlb`,
   `feat: trap on page faults`, `docs: document virtual memory`.
 
 ## M13 — Platform devices and interrupts

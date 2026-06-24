@@ -18,10 +18,10 @@ flat little-endian memory. The core is a fetch/decode/execute loop.
 All roadmap milestones (M0–M7) are complete, and Part II is under way: the full
 RV32I base integer set, the RV32M multiply/divide extension, Zicsr/Zifencei (CSR
 access and `fence.i`, M8), the privileged architecture (M/S/U privilege levels
-with exception/trap handling, M9), and RV32A atomics (M10) are implemented and
-pinned by a hand-written conformance suite (`make check`), an optional cache
-model sits in front of memory, and a `--pipeline` timing model estimates cycles
-and CPI.
+with exception/trap handling, M9), RV32A atomics (M10), and Sv32 virtual memory
+(M12) are implemented and pinned by a hand-written conformance suite (`make
+check`), an optional cache model sits in front of memory, and a `--pipeline`
+timing model estimates cycles and CPI.
 Quanta loads ELF32
 executables (`quanta program.elf`), services `write`/`exit` system calls through
 the ECALL path — the built-in SEE that runs until a guest installs its own trap
@@ -76,8 +76,8 @@ program.
 
 When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
 (the RV32M test uses `-march=rv32im`, the CSR test `-march=rv32i_zicsr_zifencei`,
-the M9 privilege tests `-march=rv32i_zicsr`, and the RV32A test `-march=rv32ia`;
-the Makefile overrides `RVCFLAGS` for just those ELFs).
+the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
+`-march=rv32ia`; the Makefile overrides `RVCFLAGS` for just those ELFs).
 
 ## Code layout
 
@@ -99,7 +99,15 @@ the Makefile overrides `RVCFLAGS` for just those ELFs).
   `exec_mret`/`exec_sret` pop the stacked privilege to return. RV32A atomics
   (LR/SC and the AMO*s) are `exec_amo` under the dedicated AMO opcode, backed by
   a single-word LR reservation (`reserve_valid`/`reserve_addr`) that a matching
-  store voids.
+  store voids. Under M12, every fetch and data address is run through
+  `mmu_translate` before it reaches memory.
+- `src/mmu.{h,c}` — Sv32 virtual memory (M12): the two-level page-table walker,
+  a small software TLB (in the CPU struct), permission and A/D-bit handling, and
+  the page-fault decision. `mmu_translate(cpu, va, acc, &pa)` returns 0 or a
+  page-fault cause; `cpu.c` calls it in the fetch and load/store/AMO paths and
+  raises the cause as a trap. Translation is the identity in M-mode or Bare mode,
+  so it is inert until a guest writes `satp`. `mmu_flush` (called on `sfence.vma`
+  and satp writes) drops the TLB.
 - `src/disasm.{h,c}` — RV32I disassembler: turns an instruction word back into
   objdump-style assembly (ABI names, common pseudo-instructions, absolute
   branch/jump targets). Mirrors `cpu_step`'s opcode switch over `decode.h`.
@@ -151,6 +159,11 @@ the Makefile overrides `RVCFLAGS` for just those ELFs).
   result, signed-vs-unsigned min/max) plus LR/SC success and a broken-reservation
   failure. Atomics are user-mode, so it assembles `-march=rv32ia` and *is*
   differential-tested against qemu.
+- `tests/test_vm.S` — the M12 Sv32 suite: builds a page table by hand, enables
+  paging, and drops to S-mode, proving non-identity translation (two VAs aliased
+  to one frame), hardware dirty-bit update, and a precise load page fault caught
+  by an M-mode handler. Uses satp/supervisor CSRs, so `-march=rv32i_zicsr` and
+  out of `make check-diff`.
 - `tests/check_disasm.sh` — runs each sample ELF under `--trace` and diffs the
   disassembly against `objdump` (`make check-disasm`).
 - `tests/check_cache.sh` — runs `test_stack` under two cache geometries and
@@ -160,9 +173,9 @@ the Makefile overrides `RVCFLAGS` for just those ELFs).
   `quanta --quiet` and a reference simulator (qemu-riscv32 by default, override
   with `REF=`) and asserts they agree on stdout and exit code (`make
   check-diff`). Skips cleanly if the reference is absent. The privileged tests
-  (`test_csr`, `test_trap`, `test_priv`) are excluded — their machine-mode CSR
-  and trap use trips user-mode qemu's own supervisor; `make check` pins them
-  instead.
+  (`test_csr`, `test_trap`, `test_priv`, `test_vm`) are excluded — their
+  machine-mode CSR, trap, and paging use trips user-mode qemu's own supervisor;
+  `make check` pins them instead.
 - `fuzz/fuzz_elf.c`, `fuzz/fuzz_decode.c` — libFuzzer harnesses over the ELF
   loader and the decode/execute path; `fuzz/standalone.c` is a plain-main driver
   so they replay over a corpus under gcc (`make fuzz` / `make fuzz-replay`).
@@ -265,6 +278,22 @@ the Makefile overrides `RVCFLAGS` for just those ELFs).
   test is user-mode (`-march=rv32ia`) and differential-tested against qemu — its
   SC-failure case overwrites the reserved word with a *different* value, so an
   address-based reservation (ours) and a value-based one (qemu-user) agree.
+- Sv32 paging (M12) lives in `mmu.c`, not `memory.c` — translation needs CPU
+  state (satp/priv/mstatus), while `memory.c` stays a dumb physical array. Key
+  points: translation is the identity in M-mode or Bare mode, so paging is inert
+  until a guest sets `satp` (every pre-M12 test is unaffected). Page tables are
+  read *physically* by the walker, so they need no mapping. A/D bits are set in
+  hardware (A on any access, D on a store); the TLB therefore serves only
+  fetches and loads — stores always walk so the dirty bit lands on the real PTE
+  — and is flushed by `sfence.vma` and any `satp` write. `mstatus.MPRV` lets an
+  M-mode load/store translate as MPP; SUM/MXR gate S-mode access to user pages.
+  A walk failure (missing PTE, bad permission, misaligned superpage) returns the
+  page-fault cause, which `cpu.c` raises as a trap with the faulting VA in
+  `*tval`. Not modelled: the access-fault-vs-page-fault distinction for a
+  page-table read that leaves RAM (treated as a page fault), and ASID-scoped
+  flushes (`sfence.vma` drops the whole TLB). Like the other privileged tests,
+  `test_vm` can't run under user-mode qemu, so it has no differential safety
+  net — lean on `--trace` when changing the walker.
 - `--trace` writes to stderr, leaving the guest's own stdout (`write`) clean;
   "changed registers" are recovered by diffing a register snapshot taken around
   `cpu_step`, so the core isn't instrumented. The disassembler prints the common
