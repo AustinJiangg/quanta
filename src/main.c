@@ -10,8 +10,8 @@
  * Quanta driver — a thin client over libquanta.
  *
  * Usage:
- *   quanta [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]] [--pipeline]
- *          [--signature=FILE] [program.elf]
+ *   quanta [--version] [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]]
+ *          [--pipeline] [--signature=FILE] [program.elf]
  *
  * With a path, Quanta loads that RV32I ELF executable and runs it from its
  * entry point. With no argument, it runs a tiny built-in demo program — a
@@ -156,6 +156,10 @@ int main(int argc, char **argv) {
     const char *path = NULL;
     const char *sigfile = NULL; /* --signature=FILE: arch-test signature dump */
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
+            printf("quanta %s\n", quanta_version());
+            return 0;
+        }
         if (strcmp(argv[i], "--trace") == 0) {
             trace = 1;
         } else if (strcmp(argv[i], "--quiet") == 0) {
@@ -179,14 +183,14 @@ int main(int argc, char **argv) {
             }
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
-            fprintf(stderr, "usage: %s [--trace] [--quiet] "
+            fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] "
                     "[--signature=FILE] [program.elf]\n", argv[0]);
             return 2;
         } else if (path == NULL) {
             path = argv[i];
         } else {
-            fprintf(stderr, "usage: %s [--trace] [--quiet] "
+            fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] "
                     "[--signature=FILE] [program.elf]\n", argv[0]);
             return 2;

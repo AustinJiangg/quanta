@@ -1,0 +1,124 @@
+.\" Manual page for quanta. View with: man ./docs/quanta.1
+.TH QUANTA 1 "2026-06-28" "quanta 0.1.0" "User Commands"
+.SH NAME
+quanta \- from-scratch RISC-V (RV32) instruction-set emulator
+.SH SYNOPSIS
+.B quanta
+.RB [ \-\-version ]
+.RB [ \-\-trace ]
+.RB [ \-\-quiet ]
+.RB [ \-\-cache [ =\fISIZE\fR:\fIWAYS\fR:\fIBLOCK\fR ]]
+.RB [ \-\-pipeline ]
+.RB [ \-\-signature=\fIFILE\fR ]
+.RI [ program.elf ]
+.SH DESCRIPTION
+.B quanta
+is a single-hart RISC-V emulator: 32 registers, a program counter, and a flat
+little-endian memory driven by a fetch/decode/execute loop. It implements the
+RV32I base integer ISA plus the M (multiply/divide), A (atomics), and
+Zicsr/Zifencei extensions, the M/S/U privileged architecture with trap handling,
+and Sv32 virtual memory.
+.PP
+Given
+.IR program.elf ,
+quanta loads that static little-endian RV32
+.B ET_EXEC
+image and runs it from its entry point, servicing the
+.BR write (2)
+and
+.BR exit (2)
+system calls through the built-in execution environment until the guest installs
+its own trap handler. With no argument, a small built-in demo program runs
+instead \(em a toolchain-free smoke test. The guest's exit status becomes
+quanta's own (see
+.BR "EXIT STATUS" ).
+.SH OPTIONS
+.TP
+.B \-\-version
+Print the version (\fBquanta\fR \fIX.Y.Z\fR) to standard output and exit.
+.TP
+.B \-\-trace
+Narrate each executed instruction to standard error: the PC, the raw word, its
+disassembly, the registers it changed, and the redirect target on a taken
+branch, jump, or trap. The guest's own output on standard output stays clean.
+.TP
+.B \-\-quiet
+Suppress all driver output (banner, summary, reports, register dump), leaving
+only what the guest itself writes \(em so the output lines up byte-for-byte with
+a reference simulator for differential testing.
+.TP
+.BR \-\-cache [ =\fISIZE\fR:\fIWAYS\fR:\fIBLOCK\fR ]
+Model a set-associative LRU L1 cache over the run's data accesses and print a
+hit/miss summary at exit. The geometry defaults to
+.BR 1024:2:32 ;
+all three values must be powers of two with
+.IR "SIZE = sets * ways * block" .
+This is an observability layer and never changes results.
+.TP
+.B \-\-pipeline
+Print a 5-stage pipeline cycle/CPI estimate at exit, charging load-use and
+control-hazard stalls under a forwarding, predict-not-taken model. Also an
+observability layer; it composes with
+.BR \-\-cache .
+.TP
+.BI \-\-signature= FILE
+Dump the architectural-test signature region (the words between the
+.B begin_signature
+and
+.B end_signature
+ELF symbols, lowest address first, one eight-digit hex word per line) to
+.IR FILE ,
+or to standard output for
+.BR \- .
+This makes quanta a drop-in target for the RISC-V architectural tests.
+.SH EXIT STATUS
+.TP
+.B 0
+The guest exited cleanly with status 0, or
+.B \-\-version
+was given.
+.TP
+.IR n " (1\(en255)"
+The guest exited via the
+.BR exit (2)
+syscall with that status (its low 8 bits).
+.TP
+.B 1
+An abnormal stop \(em ebreak with no debugger, an illegal instruction, an
+unknown syscall, an out-of-range memory access, the instruction-count safety
+limit, a failed program load, or a signature-dump error.
+.TP
+.B 2
+A command-line usage error (unknown option, malformed
+.B \-\-cache
+geometry, missing
+.B \-\-signature
+file, or too many arguments).
+.SH EXAMPLES
+.TP
+Run a compiled program:
+.B quanta program.elf
+.TP
+Trace execution, matching \fBobjdump \-d\fR mnemonics:
+.B quanta \-\-trace program.elf
+.TP
+Estimate cache and pipeline behaviour:
+.B quanta \-\-cache=2048:4:64 \-\-pipeline program.elf
+.SH FILES
+.TP
+.I program.elf
+A static, little-endian RV32
+.B ET_EXEC
+executable (built, for example, with
+.BR "\-nostdlib \-nostartfiles \-Ttext=0x80000000" ).
+.SH SEE ALSO
+.BR objdump (1),
+.BR qemu-riscv32 (1).
+The full design notes and roadmap ship with the source in
+.B CLAUDE.md
+and
+.BR ROADMAP.md .
+.SH AUTHOR
+Quanta is a learning project; see the repository at
+.UR https://github.com/AustinJiangg/quanta
+.UE .

@@ -20,6 +20,7 @@
 #   make fuzz-replay  run the harnesses over the corpus under gcc+ASan/UBSan
 #   make coverage     instrument with gcov, run the suite, report line coverage
 #   make analyze      static analysis (cppcheck + clang-tidy, when installed)
+#   make install      install the CLI, libquanta, headers, and the man page
 #   make debug      build with -g -O0 for stepping under gdb
 #   make clean      remove build artifacts
 
@@ -27,6 +28,10 @@ CC      ?= gcc
 AR      ?= ar
 CFLAGS  ?= -std=c11 -Wall -Wextra -O2 -Isrc
 LDFLAGS ?=
+
+# Install location (override: make install PREFIX=/usr DESTDIR=/tmp/stage).
+PREFIX  ?= /usr/local
+DESTDIR ?=
 
 # AddressSanitizer + UBSan for the `sanitize` target (instruments the host
 # emulator only; the guest ELFs are built by the cross-toolchain as usual).
@@ -47,14 +52,16 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
 # The emulator engine as a static library; the CLI and any embedding program
 # (see examples/) link against it. main.c is the CLI driver, kept out of the lib.
+# 'D' makes the archive deterministic (zeroed mtime/uid/gid); together with
+# objects that embed no __DATE__/__TIME__, a rebuild is byte-identical.
 $(LIB): $(LIB_OBJ)
-	$(AR) rcs $@ $^
+	$(AR) rcsD $@ $^
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -205,6 +212,21 @@ coverage:
 # (tests/cppcheck-suppress.txt, .clang-tidy).
 analyze:
 	@sh tests/analyze.sh
+
+# Install the CLI, the engine library + public header, and the man page under
+# $(DESTDIR)$(PREFIX). DESTDIR supports staged/packaging builds.
+install: $(BIN) $(LIB)
+	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib \
+		$(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/share/man/man1
+	install -m 755 $(BIN) $(DESTDIR)$(PREFIX)/bin/
+	install -m 644 $(LIB) $(DESTDIR)$(PREFIX)/lib/
+	install -m 644 src/quanta.h $(DESTDIR)$(PREFIX)/include/
+	install -m 644 docs/quanta.1 $(DESTDIR)$(PREFIX)/share/man/man1/
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/$(BIN) $(DESTDIR)$(PREFIX)/lib/$(LIB) \
+		$(DESTDIR)$(PREFIX)/include/quanta.h \
+		$(DESTDIR)$(PREFIX)/share/man/man1/quanta.1
 
 clean:
 	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/*.elf \

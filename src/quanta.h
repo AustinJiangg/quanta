@@ -20,6 +20,18 @@ extern "C" {
  * header just wraps it behind a stable interface.
  */
 
+/* --- version (Semantic Versioning, https://semver.org) --- */
+
+#define QUANTA_VERSION_MAJOR 0
+#define QUANTA_VERSION_MINOR 1
+#define QUANTA_VERSION_PATCH 0
+#define QUANTA_VERSION_STRING "0.1.0"
+
+/* The library version as "MAJOR.MINOR.PATCH" (== QUANTA_VERSION_STRING), for
+ * when only the linked runtime is at hand rather than the headers — e.g. the
+ * CLI's --version. */
+const char *quanta_version(void);
+
 /* Opaque emulator instance. Create with quanta_create(), free with
  * quanta_destroy(). */
 typedef struct Quanta Quanta;

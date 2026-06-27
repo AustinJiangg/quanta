@@ -419,13 +419,23 @@ suite does not drive. New CI jobs run both on every push.
 - [x] **Commits:** `chore: add coverage reporting`,
   `chore: add static analysis ci`.
 
-### E8 — Release engineering
+### E8 — Release engineering (DONE)
 
-- [ ] **Build:** SemVer, a CHANGELOG, a `--version` flag, tagged GitHub
+Quanta now ships as a versioned, documented artifact. The version is defined
+once as `QUANTA_VERSION_*` in `src/quanta.h` (Semantic Versioning), surfaced by
+`quanta --version` and the `quanta_version()` API, and kept in step with a
+`CHANGELOG.md` (Keep a Changelog) and the git tag. A `quanta.1` man page
+documents the CLI, and `make install` lays the binary, the engine library, the
+public header, and the man page under `$(DESTDIR)$(PREFIX)`. Builds are
+reproducible: the static archive is created deterministically (`ar D`) and the
+objects embed no `__DATE__`/`__TIME__`, so `libquanta.a` is byte-identical across
+rebuilds. The first release is tagged `v0.1.0` (M0–M12, E1–E8).
+
+- [x] **Build:** SemVer, a CHANGELOG, a `--version` flag, tagged GitHub
   releases, a man page, reproducible builds.
-- [ ] **Why:** a production project ships versioned, documented artefacts.
-- [ ] **Done when:** `quanta --version` works and a tagged v0.x release exists.
-- [ ] **Commits:** `feat: add --version`,
+- [x] **Why:** a production project ships versioned, documented artefacts.
+- [x] **Done when:** `quanta --version` works and a tagged v0.x release exists.
+- [x] **Commits:** `feat: add --version`,
   `chore: add changelog and release tagging`.
 
 ### E9 — GDB remote stub

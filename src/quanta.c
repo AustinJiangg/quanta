@@ -9,6 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The library version string; the QUANTA_VERSION_* macros in quanta.h are the
+ * single source of truth (kept in sync with the CHANGELOG and the git tag). */
+const char *quanta_version(void) {
+    return QUANTA_VERSION_STRING;
+}
+
 /* A generous runaway guard for quanta_run(max_steps == 0): high enough for real
  * workloads (array loops, deep call chains), low enough that a program that
  * never halts still stops in about a second instead of hanging. */

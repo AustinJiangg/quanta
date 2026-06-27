@@ -59,6 +59,7 @@ make fuzz          # build the libFuzzer harnesses (needs clang)
 make fuzz-replay   # run the harnesses over the corpus under gcc (needs cross-toolchain)
 make coverage      # gcov-instrument, run the suite, report line coverage (needs cross-toolchain; lcov optional)
 make analyze       # static analysis: cppcheck + clang-tidy (CI adds scan-build)
+make install       # install the CLI, libquanta, headers, and man page (PREFIX=/usr/local)
 make clean
 ```
 
@@ -357,6 +358,12 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   decode cases (e.g. RV32 LOAD/STORE widths that are RV64-only) currently fall
   through as no-ops rather than trapping illegal-instruction — a known, untested
   leniency, not yet tightened.
+- Versioning/release (E8): the version lives once in `src/quanta.h`
+  (`QUANTA_VERSION_*` + `quanta_version()`), surfaced by `quanta --version`; bump
+  it together with `CHANGELOG.md` and the `vX.Y.Z` git tag. `make install` is
+  `PREFIX`/`DESTDIR`-based; `libquanta.a` is archived with `ar D` so a rebuild is
+  byte-identical (the objects embed no `__DATE__`/`__TIME__`) — don't reintroduce
+  build timestamps.
 
 ## .claude/
 

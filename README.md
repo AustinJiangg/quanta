@@ -14,7 +14,9 @@ discrete quantum of work.
 ## Status
 
 All of M0–M7 (the learning arc) are complete, and Part II — making Quanta
-production-grade on the way to booting an OS — is under way, now through M9. The
+production-grade on the way to booting an OS — is well under way: the capability
+track runs through Sv32 virtual memory (M12) and the engineering track through
+release engineering (E1–E8), with the first release tagged `v0.1.0`. The
 fetch/decode/execute core runs the full RV32I base integer instruction set plus
 the RV32M multiply/divide extension, loads real ELF32
 executables (`quanta program.elf`), and services system calls — programs print with `write` and terminate with `exit`,
@@ -33,8 +35,9 @@ the run's data accesses and reports hit/miss statistics, without changing what
 the program computes. A `--pipeline` flag adds a 5-stage timing overlay that
 estimates cycle count and CPI from the instruction stream's load-use and control
 hazards. Part II then adds an engineering track (a `libquanta` engine split, CI,
-sanitizer and fuzzing builds, differential testing against qemu) and a
-capability track: Zicsr/Zifencei CSR access (M8), the M/S/U privileged
+sanitizer and fuzzing builds, differential testing against qemu, coverage and
+static-analysis gates, and versioned releases with a man page and `make install`)
+and a capability track: Zicsr/Zifencei CSR access (M8), the M/S/U privileged
 architecture with exception/trap handling (M9), RV32A atomics (M10), and Sv32
 virtual memory (M12). Next come platform devices and interrupts, on the road to
 booting an operating system.
@@ -90,6 +93,12 @@ composes with `--cache` and `--trace`):
 ./quanta --pipeline path/to/program.elf
 ```
 
+Print the version:
+
+```sh
+./quanta --version          # quanta 0.1.0
+```
+
 Other targets:
 
 ```sh
@@ -102,6 +111,9 @@ make check-disasm  # cross-check the disassembler against objdump
 make check-cache   # check the cache model on a locality workload
 make check-pipeline # check the pipeline model on a hazard workload
 make check-diff    # differential-test against qemu-riscv32
+make coverage      # gcov/lcov line-coverage report
+make analyze       # cppcheck + clang-tidy static analysis
+make install       # install quanta, libquanta, headers, and the man page
 make clean         # remove build artifacts
 ```
 
@@ -145,8 +157,10 @@ quanta/
 │   ├── check_pipeline.sh      # pipeline model checks (run by `make check-pipeline`)
 │   ├── check_arch.sh          # official riscv-arch-test conformance (make check-arch)
 │   └── arch/                  # Quanta target for riscv-arch-test (model_test.h, link.ld)
+├── docs/quanta.1            # man page (installed by `make install`)
 ├── Makefile
 ├── README.md
+├── CHANGELOG.md             # release history (Keep a Changelog)
 ├── ROADMAP.md               # milestone-based development plan / learning path
 ├── CLAUDE.md                # context for Claude Code sessions
 └── .claude/                 # pre-approved commands + /commit helper
@@ -159,11 +173,12 @@ architecture concept. M0–M7 (the learning arc) are all complete — core loop,
 loader, system calls, RV32I conformance, disassembler + trace mode, RV32M
 extension, cache model, and pipeline timing model. Part II then advances two
 tracks toward a production-grade, OS-booting emulator: an engineering track
-(`libquanta` split, CI, sanitizers, fuzzing, differential testing — E1–E5 done)
-and a capability track (Zicsr/Zifencei M8, the M/S/U privileged architecture M9,
-RV32A atomics M10, Sv32 virtual memory M12, with platform devices and a device
-tree next). See [ROADMAP.md](ROADMAP.md) for the full plan, acceptance criteria,
-and learning path.
+(`libquanta` split, CI, sanitizers, fuzzing, differential testing, coverage and
+static-analysis gates, versioned releases — E1–E8 done) and a capability track
+(Zicsr/Zifencei M8, the M/S/U privileged architecture M9, RV32A atomics M10, Sv32
+virtual memory M12, with platform devices and a device tree next). See
+[ROADMAP.md](ROADMAP.md) for the full plan, acceptance criteria, and learning
+path.
 
 ## License
 
