@@ -19,7 +19,9 @@ fetch/decode/execute core runs the full RV32I base integer instruction set plus
 the RV32M multiply/divide extension, loads real ELF32
 executables (`quanta program.elf`), and services system calls — programs print with `write` and terminate with `exit`,
 whose status the emulator returns as its own exit code. A hand-written
-conformance suite (`make check`) covers every instruction group. A built-in
+conformance suite (`make check`) covers every instruction group, and the
+official RISC-V architectural tests (`make check-arch`) pin RV32I, RV32M, and
+Zifencei against the suite's own reference signatures. A built-in
 demo runs when no ELF is given, so the emulator stays usable without the
 cross-toolchain. A disassembler and a `--trace` mode make execution
 observable: `quanta --trace program.elf` narrates each instruction with its
@@ -95,9 +97,11 @@ make               # build ./quanta
 make debug         # build with -g -O0 for gdb
 make tests         # build the sample RISC-V programs (needs the cross-toolchain)
 make check         # build and run the RV32I conformance suite
+make check-arch    # run the official riscv-arch-test conformance suite
 make check-disasm  # cross-check the disassembler against objdump
 make check-cache   # check the cache model on a locality workload
 make check-pipeline # check the pipeline model on a hazard workload
+make check-diff    # differential-test against qemu-riscv32
 make clean         # remove build artifacts
 ```
 
@@ -129,7 +133,7 @@ quanta/
 │   ├── memory.h / memory.c    # flat little-endian address space
 │   ├── elf.h / elf.c          # minimal ELF32 loader
 │   ├── syscall.h / syscall.c  # ECALL handling: write + exit syscalls
-│   └── main.c                 # driver: load an ELF (or demo), --trace/--cache
+│   └── main.c                 # driver: load an ELF (or demo), --trace/--cache/--signature
 ├── tests/
 │   ├── hello.S                # arithmetic demo (mirrors the built-in program)
 │   ├── hello_world.S          # syscall demo: prints via write, then exits
@@ -138,7 +142,9 @@ quanta/
 │   ├── hazard_slow.S / hazard_fast.S  # pipeline hazard demo (make check-pipeline)
 │   ├── check_disasm.sh        # disassembler vs objdump (run by `make check-disasm`)
 │   ├── check_cache.sh         # cache model checks (run by `make check-cache`)
-│   └── check_pipeline.sh      # pipeline model checks (run by `make check-pipeline`)
+│   ├── check_pipeline.sh      # pipeline model checks (run by `make check-pipeline`)
+│   ├── check_arch.sh          # official riscv-arch-test conformance (make check-arch)
+│   └── arch/                  # Quanta target for riscv-arch-test (model_test.h, link.ld)
 ├── Makefile
 ├── README.md
 ├── ROADMAP.md               # milestone-based development plan / learning path

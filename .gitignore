@@ -18,6 +18,9 @@ oom-*
 tests/*.elf
 tests/*.bin
 
+# Architectural-test suite: cached clone + compiled work (make check-arch)
+/build/
+
 # Debug / editor / OS cruft
 *.dSYM/
 .vscode/

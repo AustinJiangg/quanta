@@ -361,14 +361,34 @@ every ISA change that follows.
   `test: diff-test quanta against qemu-riscv32`,
   `chore: run differential test in ci`.
 
-### E6 — Official conformance (riscv-arch-test)
+### E6 — Official conformance (riscv-arch-test) (DONE)
 
-- [ ] **Build:** run the official architectural test suite, replacing/augmenting
-  the hand-written `make check`. Needs the minimal trap/CSR support from M8/M9.
-- [ ] **Why:** the recognised bar for "this really is RV32I/M/A/...".
-- [ ] **Done when:** RV32I (then IMAC…) signatures match the reference.
-- [ ] **Commits:** `test: run riscv-arch-test for rv32i`,
-  `docs: document conformance`.
+The official architectural tests, run as `make check-arch`. Each test computes a
+signature the simulator dumps and the suite compares against a golden reference —
+the recognised bar for "this really is RV32I/M/...". A new `quanta --signature`
+flag (backed by an `elf_symbol` lookup for the begin/end_signature markers) makes
+Quanta a drop-in target, like spike's `--test-signature`; `tests/arch/` holds the
+model glue (a SEE-`exit` halt) and link script, and `tests/check_arch.sh` builds,
+runs, and diffs each test. Crucially this needs **no reference model**: rather
+than the full RISCOF + Sail/Spike flow (none of which is installable in this
+environment), it pins the suite's frozen `old-framework-2.x` branch, which
+*commits* the golden signatures its maintainers generated — so the check is
+offline, needing only the cross-compiler and a one-time clone. Quanta passes
+every test in the families it implements: RV32I (37), RV32M (8), and Zifencei
+(1). Out of scope, with reasons in `tests/arch/README.md`: C/F/K (unimplemented,
+M11); the `privilege` family (it traps on *misaligned* access, which Quanta
+handles in hardware — a spec-permitted choice — rather than trapping); and the
+`jalr-01` wart (`la x0,5b`, rejected by modern binutils). `make check-diff` stays
+the qemu differential net; this is the conformance net. A CI job runs it on every
+push.
+
+- [x] **Build:** run the official architectural test suite, augmenting the
+  hand-written `make check`. Needs the minimal trap/CSR support from M8/M9.
+- [x] **Why:** the recognised bar for "this really is RV32I/M/A/...".
+- [x] **Done when:** RV32I (then IMAC…) signatures match the reference.
+- [x] **Commits:** `feat: dump arch-test signature with --signature`,
+  `test: run riscv-arch-test conformance suite`,
+  `chore: run riscv-arch-test in ci`, `docs: document arch-test conformance`.
 
 ### E7 — Coverage and static analysis
 

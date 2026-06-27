@@ -71,6 +71,25 @@ jobs:
       - name: Differential vs qemu-riscv32
         run: make check-diff
 
+  conformance:
+    runs-on: ubuntu-latest
+    name: conformance (riscv-arch-test)
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only the cross-toolchain is needed: check-arch clones the test suite
+      # itself (it ships the reference signatures, so no reference model).
+      - name: Install RISC-V cross-toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf
+
+      - name: Build
+        run: make
+
+      - name: Official architectural conformance
+        run: make check-arch
+
   sanitizers:
     runs-on: ubuntu-latest
     name: sanitizers (asan+ubsan)

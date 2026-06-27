@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ------------------------------------------------------------------------
  * ELF32 on-disk layout.
@@ -35,6 +36,8 @@ enum {
     EI_NIDENT   = 16,
     ELF_EHSIZE  = 52,  /* size of the ELF32 header                 */
     ELF_PHSIZE  = 32,  /* size of one ELF32 program header         */
+    ELF_SHSIZE  = 40,  /* size of one ELF32 section header         */
+    ELF_SYMSIZE = 16,  /* size of one ELF32 symbol-table entry     */
 
     EI_CLASS    = 4,   /* e_ident index: file class                */
     EI_DATA     = 5,   /* e_ident index: data encoding             */
@@ -43,7 +46,9 @@ enum {
 
     ET_EXEC     = 2,   /* executable file                          */
     EM_RISCV    = 243, /* RISC-V                                   */
-    PT_LOAD     = 1    /* loadable segment                         */
+    PT_LOAD     = 1,   /* loadable segment                         */
+
+    SHT_SYMTAB  = 2    /* section type: symbol table               */
 };
 
 /* Little-endian reads from a raw byte buffer; byte 0 is least significant. */
@@ -265,6 +270,109 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry) {
 
     *entry = e_entry;
     rc = 0;
+
+out:
+    free(buf);
+    return rc;
+}
+
+/* ------------------------------------------------------------------------
+ * Symbol-table lookup (for --signature).
+ *
+ * Running an image needs only the program headers, but locating a named
+ * symbol means reading the *section* table — specifically the symbol table
+ * (SHT_SYMTAB) and the string table it links to for the names. As in
+ * elf_load we read each field explicitly with the little-endian helpers
+ * rather than overlaying structs, and bounds-check every offset against the
+ * file length so a stripped or malformed object fails cleanly instead of
+ * reading out of bounds.
+ *
+ * Section-header field offsets (ELF32, 40 bytes each):
+ *   sh_type    4  u32 section type (SHT_SYMTAB = symbol table)
+ *   sh_offset  16 u32 byte offset of the section in the file
+ *   sh_size    20 u32 section size in bytes
+ *   sh_link    24 u32 for a symbol table, the linked string-table section
+ *   sh_entsize 36 u32 size of one entry (16 for a symbol table)
+ *
+ * Symbol-table entry field offsets (ELF32, 16 bytes each):
+ *   st_name    0  u32 byte offset of the name in the linked string table
+ *   st_value   4  u32 the symbol's value (its address, for our globals)
+ * ------------------------------------------------------------------------ */
+int elf_symbol(const char *path, const char *name, uint32_t *out) {
+    size_t len;
+    uint8_t *buf = read_file(path, &len);
+    if (!buf) {
+        return -1;
+    }
+
+    int rc = -1;
+    if (check_header(buf, len) != 0) {
+        goto out;
+    }
+
+    uint32_t shoff     = rd_u32(buf + 32);
+    uint16_t shentsize = rd_u16(buf + 46);
+    uint16_t shnum     = rd_u16(buf + 48);
+    if (shoff == 0 || shnum == 0 || shentsize < ELF_SHSIZE) {
+        goto out; /* stripped or section-less: no symbols to find */
+    }
+
+    for (uint16_t i = 0; i < shnum; i++) {
+        size_t sh = (size_t)shoff + (size_t)i * shentsize;
+        if (sh + ELF_SHSIZE > len) {
+            goto out;
+        }
+        const uint8_t *s = buf + sh;
+        if (rd_u32(s + 4) != SHT_SYMTAB) {
+            continue;
+        }
+
+        uint32_t sym_off  = rd_u32(s + 16);
+        uint32_t sym_size = rd_u32(s + 20);
+        uint32_t link     = rd_u32(s + 24);  /* string-table section index */
+        uint32_t entsize  = rd_u32(s + 36);
+        if (entsize < ELF_SYMSIZE || link >= shnum) {
+            goto out;
+        }
+        if ((size_t)sym_off + sym_size > len) {
+            goto out;
+        }
+
+        /* The string table this symbol table names its entries through. */
+        size_t lsh = (size_t)shoff + (size_t)link * shentsize;
+        if (lsh + ELF_SHSIZE > len) {
+            goto out;
+        }
+        uint32_t str_off  = rd_u32(buf + lsh + 16);
+        uint32_t str_size = rd_u32(buf + lsh + 20);
+        if ((size_t)str_off + str_size > len) {
+            goto out;
+        }
+
+        for (uint32_t off = 0; off + ELF_SYMSIZE <= sym_size; off += entsize) {
+            const uint8_t *e = buf + sym_off + off;
+            uint32_t st_name = rd_u32(e + 0);
+            if (st_name >= str_size) {
+                continue;
+            }
+            /* The name must be NUL-terminated within the string table before
+             * we hand it to strcmp; a truncated table must not run us off the
+             * end of the buffer. */
+            const char *sym = (const char *)(buf + str_off + st_name);
+            size_t avail = str_size - st_name, n = 0;
+            while (n < avail && sym[n] != '\0') {
+                n++;
+            }
+            if (n == avail) {
+                continue; /* unterminated */
+            }
+            if (strcmp(sym, name) == 0) {
+                *out = rd_u32(e + 4); /* st_value */
+                rc = 0;
+                goto out;
+            }
+        }
+    }
 
 out:
     free(buf);

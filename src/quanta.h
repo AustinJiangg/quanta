@@ -66,6 +66,15 @@ QuantaStatus quanta_load_elf(Quanta *q, const char *path);
 QuantaStatus quanta_load_image(Quanta *q, uint32_t base, uint32_t size,
                                const void *image, size_t len, uint32_t entry);
 
+/* Resolve a symbol's address by name from the ELF at `path`, writing it to
+ * `*addr`. Returns QUANTA_OK if found, QUANTA_ERR_LOAD if the file has no such
+ * symbol or no symbol table, QUANTA_ERR_INVAL on a NULL argument. Reads the
+ * file directly and needs no loaded instance — a convenience for harnesses and
+ * tools (e.g. the CLI's --signature dump locating begin_signature/end_signature
+ * for the RISC-V architectural tests). */
+QuantaStatus quanta_elf_symbol(const char *path, const char *name,
+                               uint32_t *addr);
+
 /* --- optional cache model --- */
 
 /* Attach a set-associative LRU cache over data accesses (geometry as the

@@ -82,6 +82,12 @@ QuantaStatus quanta_load_elf(Quanta *q, const char *path) {
     return QUANTA_OK;
 }
 
+QuantaStatus quanta_elf_symbol(const char *path, const char *name,
+                               uint32_t *addr) {
+    if (!path || !name || !addr) return QUANTA_ERR_INVAL;
+    return elf_symbol(path, name, addr) == 0 ? QUANTA_OK : QUANTA_ERR_LOAD;
+}
+
 QuantaStatus quanta_load_image(Quanta *q, uint32_t base, uint32_t size,
                                const void *image, size_t len, uint32_t entry) {
     if (!q || (len && !image) || len > size) return QUANTA_ERR_INVAL;

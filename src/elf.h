@@ -30,4 +30,13 @@
  * On failure `*mem` is left unallocated and `*entry` is left unset. */
 int elf_load(const char *path, Memory *mem, uint32_t *entry);
 
+/* Look up a symbol by name in the ELF at `path`, writing its address (st_value)
+ * to `*out`. Returns 0 if found, -1 otherwise (parse error, a stripped object
+ * with no symbol table, or no such symbol). Unlike elf_load this reads the
+ * file's section and symbol tables — which running an image does not need — so
+ * it is a separate, quiet pass that does not require the image to be loaded.
+ * The --signature dump uses it to locate the begin_signature/end_signature
+ * markers that the RISC-V architectural tests bracket their result region with. */
+int elf_symbol(const char *path, const char *name, uint32_t *out);
+
 #endif /* QUANTA_ELF_H */

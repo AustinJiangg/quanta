@@ -14,6 +14,7 @@
 #   make check-cache   check the cache model on a locality workload
 #   make check-pipeline  check the pipeline model on a hazard workload
 #   make check-diff   differential-test against a reference sim (qemu-riscv32)
+#   make check-arch   run the official riscv-arch-test conformance suite
 #   make sanitize     build with ASan+UBSan and run the suite through it
 #   make fuzz         build the libFuzzer harnesses (needs clang)
 #   make fuzz-replay  run the harnesses over the corpus under gcc+ASan/UBSan
@@ -44,7 +45,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-diff embed sanitize fuzz fuzz-replay debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-diff check-arch embed sanitize fuzz fuzz-replay debug clean
 
 all: $(BIN)
 
@@ -141,6 +142,15 @@ DIFF_ELF := $(filter-out tests/test_csr.elf tests/test_trap.elf tests/test_priv.
 check-diff: $(BIN) $(TEST_ELF)
 	@sh tests/check_diff.sh $(DIFF_ELF)
 
+# Official RISC-V architectural conformance. Build each riscv-arch-test program
+# with the Quanta target (tests/arch/), run it under --signature, and diff the
+# result against the suite's committed reference signatures — the recognised bar
+# for "this really is RV32I/M/...". The suite ships the golden signatures, so no
+# reference model is needed; the harness fetches it into build/ on first run and
+# skips cleanly without the cross-toolchain or network. See tests/arch/README.md.
+check-arch: $(BIN)
+	@sh tests/check_arch.sh
+
 debug: CFLAGS := -std=c11 -Wall -Wextra -g -O0 -Isrc
 debug: clean $(BIN)
 
@@ -176,3 +186,4 @@ fuzz-replay: $(TEST_ELF)
 clean:
 	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/*.elf \
 		$(FUZZ_TARGETS) fuzz/*.replay
+	rm -rf build/arch-work

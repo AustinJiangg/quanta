@@ -20,8 +20,10 @@ RV32I base integer set, the RV32M multiply/divide extension, Zicsr/Zifencei (CSR
 access and `fence.i`, M8), the privileged architecture (M/S/U privilege levels
 with exception/trap handling, M9), RV32A atomics (M10), and Sv32 virtual memory
 (M12) are implemented and pinned by a hand-written conformance suite (`make
-check`), an optional cache model sits in front of memory, and a `--pipeline`
-timing model estimates cycles and CPI.
+check`) plus the official RISC-V architectural tests (`make check-arch`, run
+offline against the suite's own committed reference signatures), an optional
+cache model sits in front of memory, and a `--pipeline` timing model estimates
+cycles and CPI.
 Quanta loads ELF32
 executables (`quanta program.elf`), services `write`/`exit` system calls through
 the ECALL path — the built-in SEE that runs until a guest installs its own trap
@@ -48,6 +50,7 @@ make check-disasm  # cross-check the disassembler against objdump (needs cross-t
 make check-cache   # check the cache model on a locality workload (needs cross-toolchain)
 make check-pipeline # check the pipeline model on a hazard workload (needs cross-toolchain)
 make check-diff    # differential-test against qemu-riscv32 (needs qemu-user-static)
+make check-arch    # official riscv-arch-test conformance (needs cross-toolchain + clone)
 make sanitize      # build with ASan+UBSan and run the suite (needs cross-toolchain)
 make fuzz          # build the libFuzzer harnesses (needs clang)
 make fuzz-replay   # run the harnesses over the corpus under gcc (needs cross-toolchain)
@@ -61,7 +64,9 @@ stderr. Add `--quiet` to suppress all driver output (banner, summary, register
 dump), leaving only the guest's own stdout — used by `make check-diff`. Add `--cache[=SIZE:WAYS:BLOCK]` (e.g. `--cache=1024:2:32`) to model a
 set-associative L1 over the run's data accesses and print a hit/miss summary at
 exit, and/or `--pipeline` to print a 5-stage cycle/CPI estimate. The overlays
-compose.
+compose. Add `--signature=FILE` to dump the architectural-test signature region
+(the words between the `begin_signature`/`end_signature` ELF symbols, in the
+suite's reference format) — what makes Quanta a drop-in `make check-arch` target.
 
 Debugging the emulator: `make debug && gdb ./quanta`. Note the two-level
 structure — gdb debugs the emulator (x86), which internally "runs" a RISC-V
@@ -123,7 +128,10 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
 - `src/elf.{h,c}` — minimal ELF32 loader: parses the header and program
   headers, copies `PT_LOAD` segments to their virtual addresses, returns the
   entry point. Fields are read with explicit little-endian helpers (no struct
-  overlay), so it stays host-endianness-independent.
+  overlay), so it stays host-endianness-independent. A separate, defensively
+  bounds-checked `elf_symbol` pass reads the section + symbol tables to resolve a
+  symbol by name (running an image never needs it) — used by `--signature` to
+  locate `begin_signature`/`end_signature`, and surfaced as `quanta_elf_symbol`.
 - `src/syscall.{h,c}` — the system-call layer (the "kernel" side of ECALL):
   dispatches on the `a7` syscall number and implements `write` and `exit` per
   the RISC-V Linux/newlib ABI.
@@ -135,9 +143,10 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   `QuantaStatus`/`QuantaHalt` enums. Built as `libquanta.a`; the CLI and
   `examples/embed.c` are clients of it.
 - `src/main.c` — the CLI driver, a thin client over `quanta.h`: argument parsing,
-  the `--trace` narration, and the `--pipeline`/`--cache` overlays, all driving
-  the machine through the public API (no engine internals). Loads an ELF named on
-  the command line, or runs the built-in demo when none is given.
+  the `--trace` narration, the `--pipeline`/`--cache` overlays, and the
+  `--signature` arch-test dump, all driving the machine through the public API
+  (no engine internals). Loads an ELF named on the command line, or runs the
+  built-in demo when none is given.
 - `examples/embed.c` — minimal embedding example: ~30 lines that load and run a
   guest through `libquanta` (`make embed`).
 - `tests/hello.S` — sample RV32I assembly, mirrors the built-in demo.
@@ -176,6 +185,14 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   (`test_csr`, `test_trap`, `test_priv`, `test_vm`) are excluded — their
   machine-mode CSR, trap, and paging use trips user-mode qemu's own supervisor;
   `make check` pins them instead.
+- `tests/arch/` + `tests/check_arch.sh` — the official architectural conformance
+  (`make check-arch`, E6). `check_arch.sh` clones the pinned riscv-arch-test
+  `old-framework-2.x` branch into `build/`, builds each test with the framework
+  header plus `tests/arch/`'s `model_test.h` (SEE-`exit` halt) and `link.ld`,
+  runs it under `quanta --signature`, and diffs against the suite's *committed*
+  reference signatures — so no Sail/Spike reference model is needed. Covers the
+  families Quanta passes fully (RV32I, RV32M, Zifencei); skips cleanly without the
+  toolchain or network. See `tests/arch/README.md` for the scope and exclusions.
 - `fuzz/fuzz_elf.c`, `fuzz/fuzz_decode.c` — libFuzzer harnesses over the ELF
   loader and the decode/execute path; `fuzz/standalone.c` is a plain-main driver
   so they replay over a corpus under gcc (`make fuzz` / `make fuzz-replay`).
@@ -261,8 +278,9 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   is what keeps every pre-M9 program (none of which set `mtvec`) running
   unchanged. Not yet modelled: interrupts (no devices until M13), `mcounteren`
   gating of counter access from lower privilege, and Sv32 translation (`satp` is
-  stored, not walked, until M12). Conformance stays on the hand-written `make
-  check`; the official `riscv-tests` `-p` environment is now within reach (E6).
+  stored, not walked, until M12). Conformance is pinned by the hand-written `make
+  check` and the official architectural tests (`make check-arch`, E6 — see the
+  arch-test gotcha below).
 - RV32M (M5) was the first extension wired in: it shares the OP opcode and
   is selected by `funct7 == 0x01` (`exec_muldiv` in `cpu.c`, mirrored in
   `disasm.c`). Divide-by-zero and the `INT_MIN / -1` signed overflow return
@@ -300,6 +318,19 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   pseudo-instructions (`li`/`mv`/`j`/`ret`/`beqz`/…) so its output lines up with
   `objdump -d`, which `make check-disasm` enforces; sharing `decode.h` with the
   executor keeps the two from drifting apart.
+- Official conformance (`make check-arch`, E6) deliberately does **not** use the
+  full RISCOF + Sail/Spike flow — none of which is installable here. Instead it
+  pins riscv-arch-test's frozen `old-framework-2.x` branch, which *commits* the
+  golden reference signatures, so the check is offline (only the cross-compiler +
+  a one-time clone). Non-obvious build facts when touching `tests/check_arch.sh`:
+  the framework needs **`-DXLEN=32`** (the bare `XLEN` macro it keys `MASK` off,
+  distinct from the builtin `__riscv_xlen`) and **`_zicsr`** in `-march` (its
+  startup touches CSRs). Excluded, by design: the `privilege` family (its
+  `misalign-*` tests expect a trap, but Quanta handles misaligned access in
+  hardware — a spec-permitted choice — so the signatures differ), C/F/K
+  (unimplemented, M11), and `jalr-01` (`la x0,5b`, a binutils wart). `--signature`
+  self-resolves `begin_signature`/`end_signature` from the ELF, so the halt only
+  has to exit cleanly. Full rationale in `tests/arch/README.md`.
 
 ## .claude/
 

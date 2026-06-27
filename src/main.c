@@ -10,7 +10,8 @@
  * Quanta driver — a thin client over libquanta.
  *
  * Usage:
- *   quanta [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [program.elf]
+ *   quanta [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]] [--pipeline]
+ *          [--signature=FILE] [program.elf]
  *
  * With a path, Quanta loads that RV32I ELF executable and runs it from its
  * entry point. With no argument, it runs a tiny built-in demo program — a
@@ -104,6 +105,48 @@ static uint64_t run_until_halt(Quanta *q, int trace, Pipeline *pipe) {
     return steps;
 }
 
+/* Dump the RISC-V architectural-test signature region to `sigfile` ("-" for
+ * stdout): the words in [begin_signature, end_signature), one per line as eight
+ * lowercase hex digits, lowest address first — the format the official suite's
+ * reference signatures use. A test fills that region as it runs and brackets it
+ * with the two global symbols, which we resolve from the ELF; by the time the
+ * machine halts the region holds the result to compare. This makes Quanta a
+ * drop-in target for the suite (cf. spike's --test-signature). Returns 0 on
+ * success, -1 on error (no such symbols, a malformed region, or a bad write). */
+static int dump_signature(const char *path, Quanta *q, const char *sigfile) {
+    uint32_t begin, end;
+    if (quanta_elf_symbol(path, "begin_signature", &begin) != QUANTA_OK ||
+        quanta_elf_symbol(path, "end_signature", &end) != QUANTA_OK) {
+        fprintf(stderr, "signature: %s defines no begin_signature/"
+                        "end_signature region\n", path);
+        return -1;
+    }
+    if (end < begin || ((end - begin) & 3u) != 0) {
+        fprintf(stderr, "signature: malformed region [0x%08x, 0x%08x)\n",
+                begin, end);
+        return -1;
+    }
+
+    FILE *f = (strcmp(sigfile, "-") == 0) ? stdout : fopen(sigfile, "w");
+    if (!f) {
+        fprintf(stderr, "signature: cannot open %s\n", sigfile);
+        return -1;
+    }
+    int rc = 0;
+    for (uint32_t a = begin; a < end; a += 4) {
+        int ok = 0;
+        uint32_t w = quanta_read_u32(q, a, &ok);
+        if (!ok) {
+            fprintf(stderr, "signature: 0x%08x is outside guest memory\n", a);
+            rc = -1;
+            break;
+        }
+        fprintf(f, "%08x\n", w);
+    }
+    if (f == stdout) fflush(stdout); else fclose(f);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     int trace = 0;
     int quiet = 0;
@@ -111,6 +154,7 @@ int main(int argc, char **argv) {
     int pipe_on = 0;
     uint32_t csize = 1024, cways = 2, cblock = 32; /* default L1 geometry */
     const char *path = NULL;
+    const char *sigfile = NULL; /* --signature=FILE: arch-test signature dump */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--trace") == 0) {
             trace = 1;
@@ -127,18 +171,24 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--pipeline") == 0) {
             pipe_on = 1;
+        } else if (strncmp(argv[i], "--signature=", 12) == 0) {
+            sigfile = argv[i] + 12;
+            if (sigfile[0] == '\0') {
+                fprintf(stderr, "--signature needs a file (or '-' for stdout)\n");
+                return 2;
+            }
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             fprintf(stderr, "usage: %s [--trace] [--quiet] "
-                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [program.elf]\n",
-                    argv[0]);
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] "
+                    "[--signature=FILE] [program.elf]\n", argv[0]);
             return 2;
         } else if (path == NULL) {
             path = argv[i];
         } else {
             fprintf(stderr, "usage: %s [--trace] [--quiet] "
-                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [program.elf]\n",
-                    argv[0]);
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] "
+                    "[--signature=FILE] [program.elf]\n", argv[0]);
             return 2;
         }
     }
@@ -193,6 +243,22 @@ int main(int argc, char **argv) {
     uint64_t steps = run_until_halt(q, trace, pipe_on ? &pipe : NULL);
 
     QuantaHalt halt = quanta_halt_reason(q);
+
+    /* Optional architectural-test signature dump. It runs whatever the halt
+     * reason — the test has already populated the region by the time it stops —
+     * and is independent of the human-readable reporting below, so it composes
+     * with --quiet (the harness wants only the file). The built-in demo has no
+     * ELF, hence no signature symbols to locate. */
+    int sig_failed = 0;
+    if (sigfile) {
+        if (demo) {
+            fprintf(stderr, "--signature needs an ELF program, not the demo\n");
+            sig_failed = 1;
+        } else {
+            sig_failed = dump_signature(path, q, sigfile) != 0;
+        }
+    }
+
     if (!quiet) {
         if (halt == QUANTA_HALT_EXIT) {
             printf("Program exited with code %u after %llu instruction(s).\n\n",
@@ -236,6 +302,7 @@ int main(int argc, char **argv) {
      * passing conformance test (exit 0) from a failing one. */
     int status = (halt == QUANTA_HALT_EXIT)
         ? (int)(quanta_exit_code(q) & 0xffu) : 1;
+    if (sig_failed && status == 0) status = 1; /* surface a dump failure */
     quanta_destroy(q);
     return status;
 }
