@@ -11,7 +11,8 @@ of each one. Treat the checkboxes as a progress tracker.
 
 Legend: **Build** = what to implement · **ISA** = instructions/mechanisms ·
 **Concept** = the architecture idea to internalise · **Done when** = acceptance
-check · **Commits** = suggested commit breakdown.
+check · **Commits** = an illustrative breakdown of the work (land it as a single
+commit — see "How to use this roadmap").
 
 ---
 
@@ -636,6 +637,9 @@ its three-level walk are M18, after the RV64 transition.)
 ## How to use this roadmap
 
 - Do one milestone at a time; keep `main` runnable at every step.
+- Land each milestone as a single commit (code + tests + docs together); the
+  per-milestone **Commits:** lines are an illustrative breakdown of the work, not
+  a target to split commits along.
 - In Part II, keep the E-line green continuously and let the Spike differential
   harness (E5) gate every ISA change; advance the M-line one milestone at a time.
 - Write the test before or alongside the feature where M3+ calls for it.

@@ -6,6 +6,9 @@
 - **Conventional Commits**, kept short: `<type>: <imperative summary>`,
   lowercase, no trailing period, max 50 chars. Types: feat, fix, docs,
   refactor, chore, test, perf.
+- **One commit per feature.** Land a feature as a single commit — code, tests,
+  and docs together — not separate feat/test/docs/chore commits. Split only when
+  the changes are genuinely independent units of work.
 - **Commit locally, push manually.** Never run `git push` on the user's
   behalf — they decide when to push.
 
