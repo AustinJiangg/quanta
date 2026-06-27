@@ -12,7 +12,7 @@
 /* A generous runaway guard for quanta_run(max_steps == 0): high enough for real
  * workloads (array loops, deep call chains), low enough that a program that
  * never halts still stops in about a second instead of hanging. */
-#define QUANTA_DEFAULT_MAX_STEPS (100u * 1000u * 1000u)
+#define QUANTA_DEFAULT_MAX_STEPS (100ULL * 1000 * 1000)
 
 /*
  * The handle owns every piece of the machine. CPU holds a borrowed pointer to
@@ -152,7 +152,8 @@ QuantaStatus quanta_mem_read(const Quanta *q, uint32_t addr,
     uint32_t off;
     QuantaStatus rc;
     if (!q || (len && !dst)) return QUANTA_ERR_INVAL;
-    if ((rc = in_range(&q->mem, addr, len, &off)) != QUANTA_OK) return rc;
+    rc = in_range(&q->mem, addr, len, &off);
+    if (rc != QUANTA_OK) return rc;
     memcpy(dst, q->mem.data + off, len);
     return QUANTA_OK;
 }
@@ -162,7 +163,8 @@ QuantaStatus quanta_mem_write(Quanta *q, uint32_t addr,
     uint32_t off;
     QuantaStatus rc;
     if (!q || (len && !src)) return QUANTA_ERR_INVAL;
-    if ((rc = in_range(&q->mem, addr, len, &off)) != QUANTA_OK) return rc;
+    rc = in_range(&q->mem, addr, len, &off);
+    if (rc != QUANTA_OK) return rc;
     memcpy(q->mem.data + off, src, len);
     return QUANTA_OK;
 }

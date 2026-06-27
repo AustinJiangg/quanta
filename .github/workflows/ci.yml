@@ -144,3 +144,61 @@ jobs:
             timeout-*
             oom-*
           if-no-files-found: ignore
+
+  coverage:
+    runs-on: ubuntu-latest
+    name: coverage (gcov/lcov)
+    steps:
+      - uses: actions/checkout@v4
+
+      # The instrumented suite still drives the guest ELFs, so the cross-toolchain
+      # is needed; lcov turns the .gcda into a report and HTML.
+      - name: Install cross-toolchain and lcov
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf lcov
+
+      # Instrumented rebuild + whole suite; tests/coverage.sh prints the per-file
+      # table and aggregate to the log — the per-PR coverage report — and writes
+      # the HTML under build/coverage/html.
+      - name: Build instrumented, run suite, report coverage
+        run: make coverage
+
+      - name: Upload HTML coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: build/coverage/html
+          if-no-files-found: ignore
+
+  static-analysis:
+    runs-on: ubuntu-latest
+    name: static analysis (cppcheck/clang-tidy/scan-build)
+    steps:
+      - uses: actions/checkout@v4
+
+      # Analyzers only — they read src/ directly (cppcheck, clang-tidy) or wrap a
+      # host build (scan-build), so no cross-toolchain is needed. clang-tools
+      # provides scan-build and pulls in clang for clang-tidy's analysis.
+      - name: Install analyzers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck clang-tidy clang-tools
+
+      - name: cppcheck + clang-tidy
+        run: make analyze
+
+      # The clang static analyzer over a real build. --status-bugs makes a
+      # finding fail the job; the HTML report is uploaded on failure.
+      - name: clang static analyzer (scan-build)
+        run: |
+          make clean
+          scan-build --status-bugs -o build/scan make
+
+      - name: Upload scan-build report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-build-report
+          path: build/scan
+          if-no-files-found: ignore

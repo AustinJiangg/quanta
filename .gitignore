@@ -14,6 +14,11 @@ leak-*
 timeout-*
 oom-*
 
+# Coverage artifacts (make coverage); the report itself lives under /build/
+*.gcno
+*.gcda
+*.gcov
+
 # Cross-compiled test artifacts
 tests/*.elf
 tests/*.bin

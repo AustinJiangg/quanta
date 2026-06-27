@@ -391,14 +391,32 @@ push.
   `test: run riscv-arch-test conformance suite`,
   `chore: run riscv-arch-test in ci`, `docs: document arch-test conformance`.
 
-### E7 — Coverage and static analysis
+### E7 — Coverage and static analysis (DONE)
 
-- [ ] **Build:** gcov/lcov coverage reporting plus a clang-tidy + scan-build +
+Two CI nets that measure and police the code itself. `make coverage` does a
+clean gcov-instrumented rebuild (`--coverage`) and runs the whole functional
+suite plus the embedding example so the `.gcda` counts accumulate across every
+program; `tests/coverage.sh` then summarises line coverage, preferring lcov (an
+HTML report under `build/coverage`, uploaded as a CI artifact) and falling back
+to plain gcov on a bare box. `make analyze` runs cppcheck and clang-tidy over
+`src/` — each skipping cleanly when its tool is absent, like the qemu
+differential — and CI adds scan-build (the clang static analyzer) over a full
+build. The analyzers are configured to pass *clean*, not merely run: the curated
+`.clang-tidy` disables only genuine noise — the C11 Annex K `*_s`-function nag
+(glibc ships no such functions), include-cleaner, and the missing-default-case
+check that fights an emulator's exhaustive fixed-width decode switches — each
+with a written reason, while the real findings were fixed in the code (64-bit
+size-macro arithmetic, a checked `fseek` replacing `rewind`, and hoisting two
+assignments out of `if` conditions). Coverage currently sits at ~81% of lines
+and 93% of functions, the gaps being mostly CLI and error paths the conformance
+suite does not drive. New CI jobs run both on every push.
+
+- [x] **Build:** gcov/lcov coverage reporting plus a clang-tidy + scan-build +
   cppcheck pass in CI.
-- [ ] **Why:** measure what the tests miss; catch defects before runtime.
-- [ ] **Done when:** coverage is reported per PR; static analysis is clean or
+- [x] **Why:** measure what the tests miss; catch defects before runtime.
+- [x] **Done when:** coverage is reported per PR; static analysis is clean or
   baselined.
-- [ ] **Commits:** `chore: add coverage reporting`,
+- [x] **Commits:** `chore: add coverage reporting`,
   `chore: add static analysis ci`.
 
 ### E8 — Release engineering

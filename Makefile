@@ -18,6 +18,8 @@
 #   make sanitize     build with ASan+UBSan and run the suite through it
 #   make fuzz         build the libFuzzer harnesses (needs clang)
 #   make fuzz-replay  run the harnesses over the corpus under gcc+ASan/UBSan
+#   make coverage     instrument with gcov, run the suite, report line coverage
+#   make analyze      static analysis (cppcheck + clang-tidy, when installed)
 #   make debug      build with -g -O0 for stepping under gdb
 #   make clean      remove build artifacts
 
@@ -45,7 +47,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-diff check-arch embed sanitize fuzz fuzz-replay debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze debug clean
 
 all: $(BIN)
 
@@ -183,7 +185,29 @@ fuzz-replay: $(TEST_ELF)
 		./fuzz/$$h.replay $(TEST_ELF) && echo "  OK — $$h sanitizer-clean" || exit 1; \
 	done
 
+# Code coverage. Do a clean instrumented rebuild (gcov's --coverage, like the
+# sanitize target's clean rebuild), run the functional suite plus the embedding
+# example to exercise the engine, then summarise line coverage. The .gcda files
+# accumulate across every quanta invocation, so coverage is the union of the
+# whole suite. tests/coverage.sh prefers lcov (HTML under build/coverage) and
+# falls back to gcov. Instruments the host emulator, never the guest ELFs.
+COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
+
+coverage:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline
+	@sh tests/coverage.sh
+
+# Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),
+# each skipping cleanly when absent — like check-diff without qemu. CI installs
+# them and additionally runs scan-build over a full build (see ci.yml). A clean
+# pass means no analyzer flagged a defect outside the baselined suppressions
+# (tests/cppcheck-suppress.txt, .clang-tidy).
+analyze:
+	@sh tests/analyze.sh
+
 clean:
 	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/*.elf \
-		$(FUZZ_TARGETS) fuzz/*.replay
-	rm -rf build/arch-work
+		$(FUZZ_TARGETS) fuzz/*.replay \
+		src/*.gcno src/*.gcda examples/*.gcno examples/*.gcda
+	rm -rf build/arch-work build/coverage

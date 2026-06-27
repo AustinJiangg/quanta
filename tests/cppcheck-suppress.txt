@@ -1,0 +1,9 @@
+# cppcheck suppressions baseline for Quanta (see tests/analyze.sh, make analyze).
+# Format: one suppression per line, as `id`, `id:file`, or `id:file:line`.
+# Prefer a precise `id:file:line` (or an inline `// cppcheck-suppress id` at the
+# site) over a blanket `id`, so the baseline stays honest as the code changes.
+# Keep this list empty when the code can simply be fixed instead; any entry below
+# should carry a one-line reason.
+# NOTE: cppcheck rejects a bare "#" line, so keep comment lines non-empty.
+
+# (none yet)

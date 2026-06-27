@@ -1,0 +1,37 @@
+# clang-tidy configuration for Quanta (used by `make analyze` / tests/analyze.sh
+# and the CI static-analysis job).
+#
+# Focused on real-defect checks for a C11 codebase: the clang static analyzer
+# plus the bug-prone, performance, portability, and misc families. The
+# C++-oriented families (modernize-*, cppcoreguidelines-*) and the high-noise
+# stylistic ones (readability-* magic numbers and short identifiers — both
+# pervasive and idiomatic in an ISA emulator) are left off by design.
+#
+# WarningsAsErrors makes every enabled check gate CI. To accept a specific line,
+# annotate it with a trailing // NOLINT(check-name) and a reason, rather than
+# loosening the list here.
+#
+# Disabled checks, each for a concrete reason (not to paper over a real defect):
+#   insecureAPI.DeprecatedOrUnsafeBufferHandling — demands the C11 Annex K *_s
+#     functions (fprintf_s, memcpy_s, ...) which glibc does not implement and the
+#     committee deprecated; impractical for portable C.
+#   misc-include-cleaner — wants an explicit #include for every transitively used
+#     symbol; pure noise for a small stdlib-only project.
+#   bugprone-switch-missing-default-case — the executor dispatches on fixed-width
+#     instruction fields (funct3/funct7); those switches are exhaustive or treat
+#     reserved encodings as no-ops, so a default is dead code here.
+#   bugprone-easily-swappable-parameters — flags the (uint32_t addr, uint32_t
+#     val) memory/CSR signatures pervasive in an ISA emulator.
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  performance-*,
+  portability-*,
+  misc-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -misc-include-cleaner,
+  -bugprone-switch-missing-default-case,
+  -bugprone-easily-swappable-parameters
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'src/.*\.h$'

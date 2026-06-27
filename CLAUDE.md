@@ -57,6 +57,8 @@ make check-arch    # official riscv-arch-test conformance (needs cross-toolchain
 make sanitize      # build with ASan+UBSan and run the suite (needs cross-toolchain)
 make fuzz          # build the libFuzzer harnesses (needs clang)
 make fuzz-replay   # run the harnesses over the corpus under gcc (needs cross-toolchain)
+make coverage      # gcov-instrument, run the suite, report line coverage (needs cross-toolchain; lcov optional)
+make analyze       # static analysis: cppcheck + clang-tidy (CI adds scan-build)
 make clean
 ```
 
@@ -203,6 +205,13 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   with and without a load-use hazard; `tests/check_pipeline.sh` runs both under
   `--pipeline` and asserts the reorder cut stalls and cycles without changing the
   result (`make check-pipeline`).
+- `tests/coverage.sh` — collects gcov line coverage after an instrumented build
+  (`make coverage`): prefers lcov (HTML under `build/coverage`) and falls back to
+  plain gcov. Observability only, like the cache/pipeline overlays.
+- `tests/analyze.sh` + `.clang-tidy` + `tests/cppcheck-suppress.txt` — static
+  analysis (`make analyze`): cppcheck and clang-tidy over `src/`, each skipping
+  cleanly when absent. The `.clang-tidy` check list and the cppcheck suppressions
+  are the baseline that keeps the analyzers passing clean; CI adds scan-build.
 
 ## Code style
 
@@ -334,6 +343,20 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   (unimplemented, M11), and `jalr-01` (`la x0,5b`, a binutils wart). `--signature`
   self-resolves `begin_signature`/`end_signature` from the ELF, so the halt only
   has to exit cleanly. Full rationale in `tests/arch/README.md`.
+- Coverage (`make coverage`) instruments the *host* emulator, not the guest
+  ELFs — the same split as `make sanitize` — and is observability only. Two tool
+  quirks bit once and are worked around in `tests/coverage.sh`: lcov 2.0's
+  per-file `--list` table miscomputes rates (use `--summary`, which is correct),
+  and gcov's grand-total line has no `File` header (don't misattribute it).
+- Static analysis (`make analyze`) is kept *clean*, not just run: `.clang-tidy`
+  disables only justified noise (the Annex K `*_s` nag — glibc has none —
+  include-cleaner, and missing-default on the exhaustive decode switches), with
+  `WarningsAsErrors` gating the rest; real findings are fixed in code, not
+  suppressed. cppcheck rejects a bare `#` line in its suppressions file, so keep
+  comment lines non-empty in `tests/cppcheck-suppress.txt`. The reserved-`funct3`
+  decode cases (e.g. RV32 LOAD/STORE widths that are RV64-only) currently fall
+  through as no-ops rather than trapping illegal-instruction — a known, untested
+  leniency, not yet tightened.
 
 ## .claude/
 

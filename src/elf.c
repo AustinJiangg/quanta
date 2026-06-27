@@ -84,7 +84,11 @@ static uint8_t *read_file(const char *path, size_t *len) {
         fclose(f);
         return NULL;
     }
-    rewind(f);
+    if (fseek(f, 0, SEEK_SET) != 0) { /* rewind(), but with error detection */
+        fprintf(stderr, "elf: cannot rewind %s\n", path);
+        fclose(f);
+        return NULL;
+    }
 
     uint8_t *buf = malloc((size_t)size);
     if (!buf) {
@@ -138,12 +142,12 @@ static int check_header(const uint8_t *buf, size_t len) {
 
 /* Cap on the guest memory we'll allocate for one image, so a malformed or
  * hostile ELF can't ask us to calloc the world. */
-#define ELF_MEM_MAX (256u * 1024u * 1024u)
+#define ELF_MEM_MAX (256ULL * 1024 * 1024)
 
 /* Stack headroom reserved above the load image. The ISA reset state has no
  * stack; the loader sets this space aside and main() points sp at the top of
  * the region, so the stack can grow downward into it. */
-#define GUEST_STACK_SIZE (64u * 1024u)
+#define GUEST_STACK_SIZE (64ULL * 1024)
 
 int elf_load(const char *path, Memory *mem, uint32_t *entry) {
     size_t len;
