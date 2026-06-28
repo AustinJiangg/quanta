@@ -19,7 +19,8 @@ learn computer architecture. It models a single hart: 32 registers, a PC, and a
 flat little-endian memory. The core is a fetch/decode/execute loop.
 
 All roadmap milestones (M0–M7) are complete, and Part II is under way: the full
-RV32I base integer set, the RV32M multiply/divide extension, Zicsr/Zifencei (CSR
+RV32I base integer set, the RV32M multiply/divide extension, the RV32C compressed
+extension (M11), Zicsr/Zifencei (CSR
 access and `fence.i`, M8), the privileged architecture (M/S/U privilege levels
 with exception/trap handling, M9), RV32A atomics (M10), Sv32 virtual memory
 (M12), a full-system device platform with interrupt delivery (a CLINT
@@ -99,9 +100,10 @@ program.
   emulator itself, since the built-in demo needs no ELF.
 
 When writing test programs for RV32I, always pass `-march=rv32i -mabi=ilp32`
-(the RV32M test uses `-march=rv32im`, the CSR test `-march=rv32i_zicsr_zifencei`,
-the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
-`-march=rv32ia`; the Makefile overrides `RVCFLAGS` for just those ELFs).
+(the RV32M test uses `-march=rv32im`, the RV32C test `-march=rv32ic`, the CSR
+test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
+`-march=rv32i_zicsr`, and the RV32A test `-march=rv32ia`; the Makefile overrides
+`RVCFLAGS` for just those ELFs).
 
 ## Code layout
 
@@ -124,6 +126,12 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   immediate-decoding helpers, the opcode map, and ABI register names, all
   `static inline`. The executor and the disassembler decode through this, so
   they can't disagree about an instruction's layout.
+- `src/rvc.{h,c}` — the RV32C compressed-instruction expander (M11):
+  `rvc_expand(uint16_t)` widens a 16-bit instruction to the exact 32-bit
+  instruction it abbreviates (or `RVC_ILLEGAL` for a reserved/F-D encoding), so
+  the existing decode/execute and disassembly paths run it unchanged. The single
+  source of truth for what a compressed instruction means, shared by `cpu.c`
+  (fetch) and `disasm.c` (which prints the same expanded mnemonic objdump shows).
 - `src/cpu.{h,c}` — CPU state and the instruction core. Each instruction group
   has its own `exec_*` function; decoding comes from `decode.h`. RV32M
   (multiply/divide) shares the OP opcode and lives in `exec_muldiv`, selected by
@@ -153,7 +161,10 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   and satp writes) drops the TLB.
 - `src/disasm.{h,c}` — RV32I disassembler: turns an instruction word back into
   objdump-style assembly (ABI names, common pseudo-instructions, absolute
-  branch/jump targets). Mirrors `cpu_step`'s opcode switch over `decode.h`.
+  branch/jump targets). Mirrors `cpu_step`'s opcode switch over `decode.h`. A
+  compressed (RV32C) halfword is detected by its low two bits, expanded via
+  `rvc_expand`, and disassembled as the 32-bit form — objdump prints the same
+  expanded mnemonic (with one compressed-only twist: `c.mv` shows as `mv`).
 - `src/cache.{h,c}` — optional set-associative LRU cache model. A pure
   observability layer: `cpu_step`'s load/store paths feed it data addresses, it
   tallies hits/misses, but the bytes still come from `memory.c`, so results are
@@ -213,6 +224,11 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
 - `tests/test_framework.h` + `tests/test_*.S` — the RV32I conformance suite:
   per-group assertion programs that exit 0 on success or the failing check's
   id. `make check` runs them and reads quanta's propagated exit code.
+- `tests/test_rvc.S` — the M11 RV32C suite: checks each compressed instruction's
+  *semantics* with explicit `c.*` instructions (the x8..x15 forms for c.sub/c.lw/
+  c.beqz/…), proving the expansions' immediate scrambles and fields. Plain
+  user-mode integer code, so it assembles `-march=rv32ic` and *is* differential-
+  tested against qemu, which also implements C.
 - `tests/test_stack.S` — exercises the loader-initialised stack (a non-leaf
   function spilling `ra` and callee-saved registers) and a small array-traversal
   workload; part of `make check`, and a seed for the M6 cache benchmark.
@@ -393,6 +409,20 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   *defined* values rather than trapping. Its test must be assembled with
   `-march=rv32im`, so the Makefile overrides `RVCFLAGS` for
   `tests/test_muldiv.elf` only.
+- RV32C (M11) is handled by *expansion*, not a second decoder: `rvc_expand`
+  (`rvc.c`) widens a 16-bit instruction to its 32-bit equivalent, and the normal
+  decode/execute and disasm run unchanged. Key consequences of variable length:
+  (1) `cpu_step` fetches a **halfword first** and decides the length from its low
+  two bits (`!= 0b11` is compressed); a 32-bit instruction's upper half is
+  translated separately because it can straddle a page. (2) The PC advances by
+  the real length `ilen` (2 or 4) — which is also why the branch fall-through and
+  the JAL/JALR **link** address use `ilen`, not a hardcoded `+4` (the easy bug:
+  a not-taken compressed branch must fall to `pc+2`). (3) Instruction alignment
+  relaxes to IALIGN=16, so the misaligned-fetch check is `pc & 1`, not `& 3`, and
+  `misa` advertises C. The disassembler prints the expanded mnemonic (objdump
+  does too), special-casing only `c.mv` (→ `mv`, since a 32-bit `add rd,x0,rs`
+  stays `add`). `--trace` shows compressed instructions as 4 hex digits. The test
+  assembles `-march=rv32ic` and is differential-tested against qemu.
 - RV32A (M10) atomics live in `exec_amo` under the AMO opcode (`0x2f`, funct3
   `0x2`), mirrored in `disasm.c`. The aq/rl ordering bits are no-ops on a single
   in-order hart. LR.W holds a word-granularity reservation

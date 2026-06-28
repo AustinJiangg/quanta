@@ -100,6 +100,11 @@ tests/%.elf: tests/%.S
 # pure base integer. Everything else in RVCFLAGS is carried over unchanged.
 tests/test_muldiv.elf: RVCFLAGS := $(subst rv32i,rv32im,$(RVCFLAGS))
 
+# tests/test_rvc.S exercises the RV32C compressed extension, so it needs the C
+# extension enabled. It is plain user-mode integer code, so qemu (which also
+# implements C) cross-checks it via make check-diff.
+tests/test_rvc.elf: RVCFLAGS := $(subst rv32i,rv32ic,$(RVCFLAGS))
+
 # tests/test_csr.S uses the Zicsr CSR instructions and Zifencei's fence.i, which
 # the base assembler rejects. Enable both extensions for just this one ELF.
 tests/test_csr.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr_zifencei,$(RVCFLAGS))

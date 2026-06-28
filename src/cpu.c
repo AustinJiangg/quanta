@@ -1,5 +1,6 @@
 #include "cpu.h"
 #include "decode.h"
+#include "rvc.h"
 #include "syscall.h"
 #include "sbi.h"
 #include "cache.h"
@@ -58,9 +59,9 @@ void cpu_init(CPU *cpu, Memory *mem, uint32_t entry_pc) {
     cpu->reserve_addr  = 0;
     mmu_flush(cpu); /* invalidate the TLB */
     memset(cpu->csr, 0, sizeof cpu->csr);
-    /* misa advertises the base and extensions: MXL=1 (RV32), I, M, S, U. It is
-     * informational here; reads see this, writes are accepted as WARL storage. */
-    cpu->csr[CSR_MISA] = (1u << 30) | (1u << 8) | (1u << 12) |
+    /* misa advertises the base and extensions: MXL=1 (RV32), C, I, M, S, U. It
+     * is informational here; reads see this, writes are accepted as WARL storage. */
+    cpu->csr[CSR_MISA] = (1u << 30) | (1u << 2) | (1u << 8) | (1u << 12) |
                          (1u << 18) | (1u << 20);
 }
 
@@ -186,8 +187,10 @@ static void exec_op(CPU *cpu, uint32_t inst) {
     reg_write(cpu, rd(inst), result);
 }
 
-/* Execute BRANCH: conditional PC change. Returns the next PC. */
-static uint32_t exec_branch(CPU *cpu, uint32_t inst) {
+/* Execute BRANCH: conditional PC change. Returns the next PC — the branch target
+ * when taken, else the fall-through (pc + the instruction's length, which is 2
+ * for a compressed branch and 4 otherwise). */
+static uint32_t exec_branch(CPU *cpu, uint32_t inst, uint32_t ilen) {
     uint32_t a = reg_read(cpu, rs1(inst));
     uint32_t b = reg_read(cpu, rs2(inst));
     int taken = 0;
@@ -200,7 +203,7 @@ static uint32_t exec_branch(CPU *cpu, uint32_t inst) {
         case 0x6: taken = (a <  b); break;                       /* BLTU */
         case 0x7: taken = (a >= b); break;                       /* BGEU */
     }
-    return taken ? cpu->pc + (uint32_t)imm_b(inst) : cpu->pc + 4;
+    return taken ? cpu->pc + (uint32_t)imm_b(inst) : cpu->pc + ilen;
 }
 
 /* Execute LOAD: read memory into a register. The address is virtual; translate
@@ -684,16 +687,35 @@ void cpu_step(CPU *cpu) {
         if (take_interrupt(cpu)) return;
     }
 
-    /* FETCH: translate PC, then read the 32-bit instruction word there. */
-    uint32_t pc_pa;
-    uint32_t fc = mmu_translate(cpu, cpu->pc, ACC_FETCH, &pc_pa);
+    /* FETCH: read the low halfword first. Its low two bits decide the length:
+     * a value other than 0b11 is a 16-bit compressed instruction (RV32C),
+     * expanded here to the 32-bit instruction it stands for; 0b11 introduces a
+     * 32-bit instruction whose upper halfword may lie in the next page, so it is
+     * translated separately. Either way decode/execute below is unchanged. */
+    uint32_t lo_pa;
+    uint32_t fc = mmu_translate(cpu, cpu->pc, ACC_FETCH, &lo_pa);
     if (fc) { raise_trap(cpu, fc, cpu->pc); return; } /* instruction page fault */
-    uint32_t inst = mem_read32(cpu->mem, pc_pa);
+    uint16_t lo = mem_read16(cpu->mem, lo_pa);
     if (cpu->mem->fault) { /* unmapped fetch: trap before decoding garbage */
         raise_trap(cpu, CAUSE_INSN_ACCESS, cpu->pc);
         return;
     }
-    uint32_t next_pc = cpu->pc + 4; /* default: fall through to next word */
+
+    uint32_t inst, ilen;
+    if ((lo & 0x3u) != 0x3u) {           /* 16-bit compressed instruction */
+        inst = rvc_expand(lo);
+        ilen = 2;
+        if (inst == RVC_ILLEGAL) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, lo); return; }
+    } else {                             /* 32-bit instruction: fetch upper half */
+        uint32_t hi_pa;
+        uint32_t fch = mmu_translate(cpu, cpu->pc + 2, ACC_FETCH, &hi_pa);
+        if (fch) { raise_trap(cpu, fch, cpu->pc + 2); return; }
+        uint16_t hi = mem_read16(cpu->mem, hi_pa);
+        if (cpu->mem->fault) { raise_trap(cpu, CAUSE_INSN_ACCESS, cpu->pc + 2); return; }
+        inst = (uint32_t)lo | ((uint32_t)hi << 16);
+        ilen = 4;
+    }
+    uint32_t next_pc = cpu->pc + ilen; /* default: fall through to the next insn */
 
     /* DECODE + EXECUTE: dispatch on the opcode field. */
     switch (opcode(inst)) {
@@ -713,19 +735,19 @@ void cpu_step(CPU *cpu) {
             reg_write(cpu, rd(inst), cpu->pc + (uint32_t)imm_u(inst));
             break;
 
-        case OP_JAL: /* jump and link */
-            reg_write(cpu, rd(inst), cpu->pc + 4);
+        case OP_JAL: /* jump and link (link address is the next instruction) */
+            reg_write(cpu, rd(inst), cpu->pc + ilen);
             next_pc = cpu->pc + (uint32_t)imm_j(inst);
             break;
 
         case OP_JALR: /* jump and link register */
-            reg_write(cpu, rd(inst), cpu->pc + 4);
+            reg_write(cpu, rd(inst), cpu->pc + ilen);
             /* target = (rs1 + imm) with the low bit cleared */
             next_pc = (reg_read(cpu, rs1(inst)) + (uint32_t)imm_i(inst)) & ~1u;
             break;
 
         case OP_BRANCH:
-            next_pc = exec_branch(cpu, inst);
+            next_pc = exec_branch(cpu, inst, ilen);
             break;
 
         case OP_LOAD:
@@ -766,7 +788,8 @@ void cpu_step(CPU *cpu) {
     if (cpu->trapped) return; /* a trap redirected the PC; the insn didn't retire */
     if (cpu->halted)  return; /* the built-in SEE stopped the machine */
 
-    if (next_pc & 0x3) { /* control transfer to a misaligned target */
+    if (next_pc & 0x1) { /* control transfer to a misaligned target (IALIGN=16
+                          * with RV32C: only an odd target is misaligned) */
         raise_trap(cpu, CAUSE_INSN_MISALIGNED, next_pc);
         return;
     }

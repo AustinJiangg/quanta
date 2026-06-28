@@ -66,7 +66,11 @@ static const uint32_t demo_program[] = {
  * untouched. */
 static void trace_step(Quanta *q) {
     uint32_t pc   = quanta_pc(q);
-    uint32_t inst = quanta_read_u32(q, pc, NULL);
+    uint32_t raw  = quanta_read_u32(q, pc, NULL);
+    /* The low two bits give the length: a 16-bit compressed instruction (RV32C)
+     * unless they are 0b11. Show only the bytes that belong to it. */
+    uint32_t ilen = ((raw & 0x3u) == 0x3u) ? 4u : 2u;
+    uint32_t inst = (ilen == 2) ? (raw & 0xffffu) : raw;
     uint32_t before[32];
     for (int i = 0; i < 32; i++) before[i] = quanta_reg(q, i);
 
@@ -75,11 +79,12 @@ static void trace_step(Quanta *q) {
 
     quanta_step(q);
 
-    fprintf(stderr, "%08x:  %08x  %-24s", pc, inst, text);
+    if (ilen == 2) fprintf(stderr, "%08x:  %04x      %-24s", pc, inst, text);
+    else           fprintf(stderr, "%08x:  %08x  %-24s", pc, inst, text);
     for (int i = 1; i < 32; i++) /* x0 is hardwired; it can never change */
         if (quanta_reg(q, i) != before[i])
             fprintf(stderr, " %s=0x%08x", quanta_reg_name(i), quanta_reg(q, i));
-    if (quanta_pc(q) != pc + 4) /* taken branch, jump, or trap */
+    if (quanta_pc(q) != pc + ilen) /* taken branch, jump, or trap */
         fprintf(stderr, " ->0x%08x", quanta_pc(q));
     fprintf(stderr, "\n");
 }
@@ -98,9 +103,13 @@ static uint64_t run_until_halt(Quanta *q, int trace, Pipeline *pipe) {
         uint32_t inst = pipe ? quanta_read_u32(q, pc, NULL) : 0;
         if (trace) trace_step(q);
         else       quanta_step(q);
-        /* Feed the timing model the retired instruction and whether control
-         * left the fall-through path (a taken branch or a jump). */
-        if (pipe) pipeline_observe(pipe, inst, quanta_pc(q) != pc + 4);
+        /* Feed the timing model the retired instruction and whether control left
+         * the fall-through path (a taken branch or a jump). The fall-through is
+         * pc + the instruction's length (2 for a compressed instruction). */
+        if (pipe) {
+            uint32_t ilen = ((inst & 0x3u) == 0x3u) ? 4u : 2u;
+            pipeline_observe(pipe, inst, quanta_pc(q) != pc + ilen);
+        }
         steps++;
     }
     return steps;

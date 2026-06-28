@@ -9,6 +9,16 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **RV32C compressed instructions** — the compressed extension, handled by
+  expanding each 16-bit instruction to the 32-bit one it abbreviates (`rvc.c`),
+  so the existing decode/execute and disassembly run unchanged. The fetch is now
+  variable-length (a halfword decides the length, the upper half of a 32-bit
+  instruction translated separately for page straddles), the PC advances by the
+  true instruction length — fixing the branch fall-through and JAL/JALR link to
+  use it rather than a hardcoded `+4` — alignment relaxes to IALIGN=16, and
+  `misa` advertises C. The disassembler prints the expanded mnemonics objdump
+  shows. Pinned by `make check` and `make check-disasm`, and differential-tested
+  against qemu via `make check-diff`. (M11)
 - **SBI supervisor-timer delivery** — `sbi_set_timer` now drives a real
   supervisor timer interrupt: the firmware records the deadline and, when the
   CLINT reaches it, raises the supervisor timer pending bit (STIP) for the OS to

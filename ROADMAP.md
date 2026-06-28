@@ -561,16 +561,35 @@ work in M19.)
 - [x] **Commits:** `feat: add rv32a atomics`, `feat: disassemble rv32a`,
   `test: add rv32a conformance suite`.
 
-## M11 — Optional extensions: RV32C, RV32F/D (deferrable)
+## M11 — Optional extensions: RV32C done, RV32F/D deferred
 
-- [ ] **Build:** RV32C (expand the 16-bit encodings) and/or RV32F/D (an `fcsr`,
-  rounding modes, the F/D op set via softfloat for host-independent results).
-- [ ] **ISA:** RV32C, RV32F, RV32D.
-- [ ] **Concept:** compressed encodings and code density; the float register
-  file and the hard-float vs soft-float ABI split.
-- [ ] **Done when:** as the chosen guest demands — defer by building the kernel
-  without C and userspace soft-float; a full glibc GC userspace needs both.
-- [ ] **Commits:** `feat: add rv32c compressed`, `feat: add rv32f/d float`.
+RV32C is in: the compressed extension, the first to break the project's
+one-instruction-is-four-bytes assumption. Rather than teach the executor and
+disassembler a second format, `src/rvc.c` *expands* — a 16-bit instruction is
+widened to the exact 32-bit instruction it abbreviates, and the existing
+decode/execute and disassembly paths handle it unchanged, so the expander is the
+single source of truth shared by both. The fetch in `cpu.c` now reads a halfword
+first, branches on its low two bits (0b11 = a 32-bit instruction whose upper half
+may sit in the next page; otherwise a compressed one), and advances the PC by the
+instruction's true length — which also fixed the `+4` baked into the branch
+fall-through and the JAL/JALR link, now the actual `ilen` (2 or 4). Alignment
+relaxes to IALIGN=16 (only odd targets fault), and `misa` advertises C.
+`tests/test_rvc.S` checks every compressed instruction's semantics and, being
+plain user-mode code, is differential-tested against qemu (which also implements
+C); `make check-disasm` pins the compressed disassembly against objdump, which
+renders the same expanded mnemonics. RV32F/D stay deferred — they need an `fcsr`,
+rounding modes, and a softfloat op set for host-independent results, and no
+chosen guest demands them yet.
+
+- [x] **Build:** RV32C (expand the 16-bit encodings). RV32F/D (an `fcsr`,
+  rounding modes, the F/D op set via softfloat) remain deferred.
+- [x] **ISA:** RV32C. (RV32F, RV32D deferred.)
+- [x] **Concept:** compressed encodings and code density; variable-length fetch
+  and the IALIGN=16 alignment relaxation. (The float register file and the
+  hard-float vs soft-float ABI split come with F/D.)
+- [x] **Done when:** as the chosen guest demands — RV32C lands now (most kernels
+  build with it); userspace soft-float defers F/D until a glibc GC guest needs it.
+- [x] **Commits:** `feat: add rv32c compressed`. (`feat: add rv32f/d float` later.)
 
 ### Stage 2 — Full-system substrate (M12–M14)
 

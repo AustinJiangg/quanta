@@ -1,5 +1,6 @@
 #include "disasm.h"
 #include "decode.h"
+#include "rvc.h"
 
 #include <stdio.h>
 
@@ -124,6 +125,26 @@ static void disasm_csr(uint32_t inst, uint32_t f3, char *buf, size_t buflen) {
 }
 
 void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
+    /* A compressed (16-bit) instruction is the low halfword when its low two
+     * bits are not 0b11. Expand it to the 32-bit instruction it abbreviates and
+     * disassemble that — objdump prints the same expanded mnemonic. */
+    if ((inst & 0x3u) != 0x3u) {
+        uint32_t x = rvc_expand((uint16_t)inst);
+        if (x == RVC_ILLEGAL) {
+            snprintf(buf, buflen, ".short 0x%04x", inst & 0xffffu);
+            return;
+        }
+        /* C.MV expands to `add rd, x0, rs2`; objdump renders that as `mv` only
+         * for the compressed form (a 32-bit add with a zero source stays `add`),
+         * so handle it here before the shared 32-bit path. */
+        if (opcode(x) == OP_REG && funct3(x) == 0 && funct7(x) == 0 && rs1(x) == 0) {
+            snprintf(buf, buflen, "mv %s,%s",
+                     reg_abi_name(rd(x)), reg_abi_name(rs2(x)));
+            return;
+        }
+        inst = x;
+    }
+
     uint32_t op = opcode(inst);
     uint32_t f3 = funct3(inst);
     uint32_t f7 = funct7(inst);
