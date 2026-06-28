@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 /*
@@ -12,7 +13,8 @@
  *
  * Usage:
  *   quanta [--version] [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]]
- *          [--pipeline] [--gdb[=PORT]] [--signature=FILE] [program.elf]
+ *          [--pipeline] [--memory=SIZE] [--gdb[=PORT]] [--signature=FILE]
+ *          [program.elf]
  *
  * With a path, Quanta loads that RV32I ELF executable and runs it from its
  * entry point. With no argument, it runs a tiny built-in demo program — a
@@ -56,6 +58,27 @@ static const uint32_t demo_program[] = {
     0x00000513, /* addi a0, zero, 0   -> exit status 0     */
     0x00000073  /* ecall              -> exit(0)           */
 };
+
+/* Parse a byte count with an optional K/M/G (1024-based) suffix, e.g. "8M" or
+ * "0x10000". Writes the result to *out; returns 0 on success, -1 on a malformed
+ * value or a count that overflows the 32-bit address space. */
+static int parse_size(const char *s, uint32_t *out) {
+    if (!s || !*s) return -1;
+    char *end;
+    unsigned long long v = strtoull(s, &end, 0);
+    unsigned long long mul = 1;
+    switch (*end) {
+        case 'K': case 'k': mul = 1024ULL;               end++; break;
+        case 'M': case 'm': mul = 1024ULL * 1024;        end++; break;
+        case 'G': case 'g': mul = 1024ULL * 1024 * 1024; end++; break;
+        default: break;
+    }
+    if (*end != '\0') return -1;
+    v *= mul;
+    if (v == 0 || v > 0xffffffffULL) return -1;
+    *out = (uint32_t)v;
+    return 0;
+}
 
 /* Execute one instruction and narrate it to stderr: the PC, the raw word, its
  * disassembly, and any register the step changed (with the new value), plus the
@@ -165,6 +188,7 @@ int main(int argc, char **argv) {
     int gdb_on = 0;
     int gdb_port = 1234;            /* the conventional gdbserver/qemu port */
     uint32_t csize = 1024, cways = 2, cblock = 32; /* default L1 geometry */
+    uint32_t mem_req = 0;          /* --memory: minimum guest RAM (0 = image-sized) */
     const char *path = NULL;
     const char *sigfile = NULL; /* --signature=FILE: arch-test signature dump */
     for (int i = 1; i < argc; i++) {
@@ -187,6 +211,13 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--pipeline") == 0) {
             pipe_on = 1;
+        } else if (strncmp(argv[i], "--memory=", 9) == 0) {
+            if (parse_size(argv[i] + 9, &mem_req) != 0) {
+                fprintf(stderr, "bad --memory size '%s' "
+                        "(want bytes with an optional K/M/G suffix, e.g. 8M)\n",
+                        argv[i] + 9);
+                return 2;
+            }
         } else if (strcmp(argv[i], "--gdb") == 0) {
             gdb_on = 1;
         } else if (strncmp(argv[i], "--gdb=", 6) == 0) {
@@ -206,15 +237,15 @@ int main(int argc, char **argv) {
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
-                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--gdb[=PORT]] "
-                    "[--signature=FILE] [program.elf]\n", argv[0]);
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] "
+                    "[--gdb[=PORT]] [--signature=FILE] [program.elf]\n", argv[0]);
             return 2;
         } else if (path == NULL) {
             path = argv[i];
         } else {
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
-                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--gdb[=PORT]] "
-                    "[--signature=FILE] [program.elf]\n", argv[0]);
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] "
+                    "[--gdb[=PORT]] [--signature=FILE] [program.elf]\n", argv[0]);
             return 2;
         }
     }
@@ -232,7 +263,7 @@ int main(int argc, char **argv) {
     QuantaStatus st = demo
         ? quanta_load_image(q, MEM_BASE, MEM_SIZE,
                             demo_program, sizeof demo_program, MEM_BASE)
-        : quanta_load_elf(q, path);
+        : quanta_load_elf_ex(q, path, mem_req);
     if (st != QUANTA_OK) {
         if (demo) fprintf(stderr, "failed to load demo program\n");
         quanta_destroy(q);

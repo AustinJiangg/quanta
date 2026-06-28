@@ -149,7 +149,7 @@ static int check_header(const uint8_t *buf, size_t len) {
  * the region, so the stack can grow downward into it. */
 #define GUEST_STACK_SIZE (64ULL * 1024)
 
-int elf_load(const char *path, Memory *mem, uint32_t *entry) {
+int elf_load(const char *path, Memory *mem, uint32_t *entry, uint32_t min_size) {
     size_t len;
     uint8_t *buf = read_file(path, &len);
     if (!buf) {
@@ -233,6 +233,9 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry) {
         goto out;
     }
     uint64_t span = image + GUEST_STACK_SIZE;
+    if (min_size > span) {
+        span = min_size; /* caller wants spare RAM above the image (an OS guest) */
+    }
     if (span > ELF_MEM_MAX || (uint64_t)lo + span > 0x100000000ULL) {
         fprintf(stderr, "elf: image plus stack does not fit guest memory\n");
         goto out;

@@ -42,8 +42,13 @@ architecture with exception/trap handling (M9), RV32A atomics (M10), Sv32
 virtual memory (M12), and a full-system device platform with interrupt delivery —
 a CLINT timer/IPI, a PLIC, and a 16550 UART reached over MMIO (M13). A GDB remote
 stub (`quanta --gdb=PORT`, E9) lets a stock `gdb` attach over TCP to read and
-write registers and memory, set breakpoints, single-step, and continue. Next come
-a device tree and a bare-metal SBI, on the road to booting an operating system.
+write registers and memory, set breakpoints, single-step, and continue. On top of
+those, the loader hands the guest a flattened device tree at boot (M14), Quanta
+services an S-mode guest's `ecall`s as M-mode SBI firmware (console, timer, system
+reset, M15), and a small from-scratch teaching kernel (`tests/os/`) boots on all
+of it — Sv32 paging, an `stvec` trap handler, timer preemption, and a userspace
+process making `write`/`exit` syscalls — to userspace (`make check-os`, M16). Next
+is the RV64GC transition that unlocks mainstream operating systems.
 
 ## Tech stack
 
@@ -115,6 +120,16 @@ riscv64-unknown-elf-gdb path/to/program.elf
 (gdb) continue
 ```
 
+Boot the small teaching kernel — it brings up Sv32 paging, drops to a userspace
+process, is preempted by the supervisor timer, and shuts down via the SBI.
+`--memory` sizes the guest RAM region beyond the kernel image so it has space to
+manage (bytes, with a `K`/`M`/`G` suffix):
+
+```sh
+make tests/os/kernel.elf
+./quanta --memory=8M tests/os/kernel.elf
+```
+
 Print the version:
 
 ```sh
@@ -171,18 +186,21 @@ quanta/
 │   ├── elf.h / elf.c          # minimal ELF32 loader
 │   ├── syscall.h / syscall.c  # ECALL handling: write + exit syscalls
 │   ├── gdbstub.h / gdbstub.c  # GDB remote-protocol stub over TCP (--gdb)
-│   └── main.c                 # driver: load an ELF (or demo), --trace/--cache/--gdb/--signature
+│   └── main.c                 # driver: load an ELF (or demo), --trace/--cache/--gdb/--memory/--signature
 ├── tests/
 │   ├── hello.S                # arithmetic demo (mirrors the built-in program)
 │   ├── hello_world.S          # syscall demo: prints via write, then exits
 │   ├── test_framework.h       # CHECK/exit-code harness for conformance tests
 │   ├── test_*.S               # RV32I conformance suite (run by `make check`)
+│   ├── os/                    # M16 teaching kernel: boots to userspace (make check-os)
 │   ├── hazard_slow.S / hazard_fast.S  # pipeline hazard demo (make check-pipeline)
 │   ├── check_disasm.sh        # disassembler vs objdump (run by `make check-disasm`)
 │   ├── check_cache.sh         # cache model checks (run by `make check-cache`)
 │   ├── check_pipeline.sh      # pipeline model checks (run by `make check-pipeline`)
 │   ├── check_gdb.sh / gdb_client.py  # GDB-stub RSP client checks (make check-gdb)
 │   ├── check_devices.sh       # MMIO device + interrupt checks (make check-devices)
+│   ├── check_sbi.sh           # bare-metal S-mode SBI checks (make check-sbi)
+│   ├── check_os.sh            # boot the M16 teaching kernel (make check-os)
 │   ├── check_arch.sh          # official riscv-arch-test conformance (make check-arch)
 │   └── arch/                  # Quanta target for riscv-arch-test (model_test.h, link.ld)
 ├── docs/quanta.1            # man page (installed by `make install`)

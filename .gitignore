@@ -22,6 +22,7 @@ oom-*
 # Cross-compiled test artifacts
 tests/*.elf
 tests/*.bin
+tests/os/*.elf
 
 # Architectural-test suite: cached clone + compiled work (make check-arch)
 /build/

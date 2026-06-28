@@ -54,7 +54,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-os check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -117,6 +117,25 @@ tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf tests/test_irq.elf tes
 # tests/test_atomic.S uses the RV32A atomics, which the base assembler rejects.
 tests/test_atomic.elf: RVCFLAGS := $(subst rv32i,rv32ia,$(RVCFLAGS))
 
+# M16 teaching kernel (tests/os/): a freestanding S-mode kernel that boots and
+# runs a userspace process — the integration of M8-M15. Unlike the conformance
+# tests it is multi-file C + asm with its own startup and linker script, so it
+# gets a dedicated rule rather than the tests/%.elf pattern, and builds rv32imac
+# (paging + atomics + compressed). The user payload is embedded as a copyable,
+# position-independent blob (see tests/os/kernel.ld). One gcc call compiles the
+# sources and links them under the script. The kernel identity-maps its own RAM
+# as one RWX region (simplest for a teaching kernel), so the flat image is
+# honestly RWX; --no-warn-rwx-segments quiets ld's note about that.
+KOS_SRC    := tests/os/boot.S tests/os/kernel.c tests/os/user.S
+KOS_ELF    := tests/os/kernel.elf
+KOS_CFLAGS := -march=rv32imac_zicsr -mabi=ilp32 -mcmodel=medany -nostdlib \
+              -nostartfiles -ffreestanding -fno-builtin -Wall -Wextra -O2 -g \
+              -Wl,--no-warn-rwx-segments
+
+$(KOS_ELF): $(KOS_SRC) tests/os/kernel.ld
+	$(RVCC) $(KOS_CFLAGS) -T tests/os/kernel.ld -o $@ $(KOS_SRC)
+	@echo "Built $@ — boot with: ./quanta --memory=8M $@"
+
 # Run the RV32I conformance suite (tests/test_*.S) through the emulator. Each
 # test exits 0 on success or the number of its first failed check, which quanta
 # propagates as its own exit status; we use that to print PASS/FAIL per file.
@@ -164,6 +183,13 @@ check-devices: $(BIN) tests/test_irq.elf
 check-sbi: $(BIN) tests/test_sbi.elf
 	@sh tests/check_sbi.sh
 
+# Boot the M16 teaching kernel and assert M16's "done when": it reached
+# userspace (the user process printed via the write syscall), the supervisor
+# timer preempted it, and it shut down cleanly (exit 0 via SBI system_reset).
+# The kernel manages the spare RAM that --memory carves out above its image.
+check-os: $(BIN) $(KOS_ELF)
+	@sh tests/check_os.sh
+
 # Differential test: compare quanta against a reference simulator (qemu-riscv32
 # by default; override with REF=...) on the sample programs. Skips cleanly if
 # the reference simulator is not installed.
@@ -200,7 +226,7 @@ sanitize:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
-		check-devices check-sbi check-diff
+		check-devices check-sbi check-os check-diff
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
 # the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`
@@ -231,7 +257,7 @@ COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
 
 coverage:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-os
 	@sh tests/coverage.sh
 
 # Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),
@@ -259,7 +285,7 @@ uninstall:
 		$(DESTDIR)$(PREFIX)/share/man/man1/quanta.1
 
 clean:
-	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/*.elf \
+	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/*.elf tests/os/*.elf \
 		$(FUZZ_TARGETS) fuzz/*.replay \
 		src/*.gcno src/*.gcda examples/*.gcno examples/*.gcda
 	rm -rf build/arch-work build/coverage

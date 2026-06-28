@@ -72,6 +72,13 @@ void quanta_destroy(Quanta *q);
  * initialise sp to the top of the region. */
 QuantaStatus quanta_load_elf(Quanta *q, const char *path);
 
+/* As quanta_load_elf, but grow the guest region to at least `min_mem` bytes when
+ * the image plus its stack is smaller. The spare RAM lands above the image for
+ * the guest to manage (an OS sizing page tables and user pages), and the boot
+ * device tree's /memory node reports the true size. `min_mem` == 0 is exactly
+ * quanta_load_elf. */
+QuantaStatus quanta_load_elf_ex(Quanta *q, const char *path, uint32_t min_mem);
+
 /* Load a raw code/data image: map `size` bytes at `base`, copy `len` bytes of
  * `image` there, set PC to `entry`, and initialise sp to the top of the region.
  * Useful for embedding hand-assembled programs. */

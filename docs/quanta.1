@@ -9,6 +9,7 @@ quanta \- from-scratch RISC-V (RV32) instruction-set emulator
 .RB [ \-\-quiet ]
 .RB [ \-\-cache [ =\fISIZE\fR:\fIWAYS\fR:\fIBLOCK\fR ]]
 .RB [ \-\-pipeline ]
+.RB [ \-\-memory=\fISIZE\fR ]
 .RB [ \-\-gdb [ =\fIPORT\fR ]]
 .RB [ \-\-signature=\fIFILE\fR ]
 .RI [ program.elf ]
@@ -20,7 +21,10 @@ RV32I base integer ISA plus the M (multiply/divide), A (atomics), and
 Zicsr/Zifencei extensions, the M/S/U privileged architecture with trap handling,
 and Sv32 virtual memory. It also models a small platform reached through
 memory-mapped I/O \(em a CLINT timer, a PLIC, and a 16550 UART \(em and delivers
-timer, software, and external interrupts.
+timer, software, and external interrupts. At boot it hands the guest a flattened
+device tree (\fBa0\fR = hart id, \fBa1\fR = DTB pointer) describing that hardware,
+and it services an S-mode guest's environment calls as M-mode SBI firmware
+(console, timer, and system reset), so a supervisor kernel can run on it.
 .PP
 Given
 .IR program.elf ,
@@ -63,6 +67,20 @@ Print a 5-stage pipeline cycle/CPI estimate at exit, charging load-use and
 control-hazard stalls under a forwarding, predict-not-taken model. Also an
 observability layer; it composes with
 .BR \-\-cache .
+.TP
+.BI \-\-memory= SIZE
+Size the guest RAM region to at least
+.I SIZE
+bytes (an optional
+.BR K ,
+.BR M ,
+or
+.B G
+suffix multiplies by 1024, 1024\(mu1024, or 1024\(mu1024\(mu1024). When the ELF
+image plus its stack is smaller, the spare RAM lands above the image for an
+OS-style guest to manage, and the boot device tree's
+.B /memory
+node reports the true size. Omitted, the region is sized to the image as before.
 .TP
 .BR \-\-gdb [ =\fIPORT\fR ]
 Start a GDB remote stub on TCP

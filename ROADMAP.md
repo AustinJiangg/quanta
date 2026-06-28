@@ -731,15 +731,47 @@ interrupts, each re-armed via SBI `set_timer`, then a clean SRST shutdown.
 - [x] **Commits:** `feat: add an sbi implementation`,
   `test: boot a bare-metal s-mode program`.
 
-## M16 — Boot a small RV32 OS
+## M16 — Boot a small RV32 OS (DONE)
 
-- [ ] **Build:** boot a real RV32 kernel — a teaching kernel or a buildroot RV32
-  Linux + initramfs — through to userspace.
-- [ ] **ISA:** none new — the integration milestone for Stages 1–2.
-- [ ] **Concept:** what "booting" entails end to end; where emulator bugs hide
+The integration milestone: a small teaching kernel (`tests/os/`) that boots on
+Quanta and runs a userspace process, exercising everything M8–M15 built at once —
+which is where bugs the per-feature tests miss would surface (none did; the
+pieces had each been pinned). Rather than port a third-party kernel, it is
+written from scratch, keeping the project's ethos (the same call made for the SBI
+in M15) and ensuring every bug it could hit is Quanta's own, not a port's. A
+mainstream RV32 Linux is deferred: it needs a Linux/glibc cross-toolchain (only a
+newlib bare-metal one is to hand) and far more RAM and run length — and the
+roadmap already routes mainstream OSes through the RV64 transition (M17/M18).
+
+The one engine prerequisite was a way to give a guest more RAM than its own
+image: `elf_load` grew a `min_size`, surfaced as `quanta_load_elf_ex` and the
+CLI's `--memory=SIZE` flag, so the loader leaves spare RAM above the image for
+the kernel to manage — and the boot DTB's `/memory` node reports the true size,
+so the guest discovers it. The kernel is `boot.S` (an M-mode stub that delegates
+user traps to S-mode, leaves `mtvec` 0 so its own SBI `ecall`s reach Quanta, and
+`mret`s into `kmain`; plus the S-mode trap vector and the user-entry trampoline),
+`kernel.c` (the C kernel), `user.S` (a position-independent U-mode blob the kernel
+copies into a page), and `kernel.ld`. `kmain` reads its RAM from the device tree
+(M14), hands out physical pages from the spare RAM, builds an Sv32 address space
+(M12 — megapage identity map for the kernel and the CLINT/UART MMIO, plus a
+user code and stack page mapped low with the U bit), installs an `stvec` handler,
+sets `sstatus.SUM` so it can read the user's buffers, arms a periodic deadline via
+SBI `set_timer` (M15), and `sret`s into user mode (M9). The user prints with the
+`write` syscall, is preempted three times by the supervisor timer (M13/M15), then
+`exit`s — and the kernel shuts the machine down via SBI `system_reset`. Console
+output goes straight to the mapped 16550 UART, proving MMIO through Sv32. Pinned
+by `make check-os` (and run under `make sanitize`/`make coverage`); being an
+S-mode paging+MMIO guest, it stays out of `make check-diff` like the other
+privileged tests.
+
+- [x] **Build:** boot a real RV32 kernel — a teaching kernel or a buildroot RV32
+  Linux + initramfs — through to userspace. *(A from-scratch teaching kernel;
+  mainstream Linux deferred to the RV64 phase, M17/M18.)*
+- [x] **ISA:** none new — the integration milestone for Stages 1–2.
+- [x] **Concept:** what "booting" entails end to end; where emulator bugs hide
   that unit tests miss.
-- [ ] **Done when:** the guest boots to a shell or runs a userspace process.
-- [ ] **Commits:** `test: boot a small rv32 os`, `docs: document booting an os`.
+- [x] **Done when:** the guest boots to a shell or runs a userspace process.
+- [x] **Commits:** `feat: boot a small rv32 teaching kernel`.
 
 ### Stage 4 — Mainstream OS (triggers RV64) (M17–M19)
 

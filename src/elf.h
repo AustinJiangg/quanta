@@ -21,14 +21,21 @@
 /* Load the ELF32 executable at `path`, reporting its entry point in `*entry`.
  *
  * On success `*mem` is allocated and initialised to span the program's load
- * image — from the lowest PT_LOAD virtual address to the highest — every
- * PT_LOAD segment is copied to its virtual address, and the caller owns `*mem`
- * and must mem_free() it. `*mem` need not be initialised on entry; the loader
- * discovers the load address from the ELF rather than assuming a fixed base.
+ * image — from the lowest PT_LOAD virtual address to the highest — plus stack
+ * headroom; every PT_LOAD segment is copied to its virtual address, and the
+ * caller owns `*mem` and must mem_free() it. `*mem` need not be initialised on
+ * entry; the loader discovers the load address from the ELF rather than assuming
+ * a fixed base.
+ *
+ * `min_size` raises the region to at least that many bytes when the image plus
+ * its stack is smaller — the spare RAM lands above the image, which an OS-style
+ * guest manages itself (page tables, user pages). The device tree's /memory node
+ * reports the actual size, so the guest discovers it. Pass 0 for the old
+ * image-sized behaviour.
  *
  * Returns 0 on success, or -1 on any error (a diagnostic is printed to stderr).
  * On failure `*mem` is left unallocated and `*entry` is left unset. */
-int elf_load(const char *path, Memory *mem, uint32_t *entry);
+int elf_load(const char *path, Memory *mem, uint32_t *entry, uint32_t min_size);
 
 /* Look up a symbol by name in the ELF at `path`, writing its address (st_value)
  * to `*out`. Returns 0 if found, -1 otherwise (parse error, a stripped object

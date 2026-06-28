@@ -9,6 +9,23 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **Boot a small RV32 OS** — a from-scratch teaching kernel (`tests/os/`) that
+  boots on Quanta and runs a userspace process, the integration of everything
+  M8–M15 built. An M-mode boot stub delegates user traps to Supervisor mode and
+  `mret`s into a C kernel that reads its RAM from the device tree (M14), hands out
+  physical pages, builds an Sv32 address space (M12 — a megapage identity map for
+  the kernel and the CLINT/UART MMIO, plus user code/stack pages mapped low),
+  installs an `stvec` trap handler, arms preemption through SBI `set_timer` (M15),
+  and `sret`s into a U-mode process (M9). The user prints with the `write`
+  syscall, is preempted by the supervisor timer (M13/M15), and `exit`s, after
+  which the kernel shuts down via SBI `system_reset`. Console output drives the
+  mapped 16550 UART, proving MMIO through Sv32. Pinned by `make check-os`. (M16)
+- **`--memory=SIZE` flag** — size the guest RAM region independently of the ELF
+  image (`quanta --memory=8M program.elf`, suffixes K/M/G), so an OS-style guest
+  has spare RAM above its image to manage. The spare lands above the load image
+  and the boot device tree's `/memory` node reports the true size. Surfaced in the
+  engine as `quanta_load_elf_ex`; `--memory` omitted is the previous image-sized
+  behaviour. (M16)
 - **RV32C compressed instructions** — the compressed extension, handled by
   expanding each 16-bit instruction to the 32-bit one it abbreviates (`rvc.c`),
   so the existing decode/execute and disassembly run unchanged. The fetch is now

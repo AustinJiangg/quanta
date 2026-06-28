@@ -119,13 +119,17 @@ static void setup_boot(Quanta *q) {
     reg_write(&q->cpu, 11, addr);                        /* a1 = DTB pointer */
 }
 
-QuantaStatus quanta_load_elf(Quanta *q, const char *path) {
+QuantaStatus quanta_load_elf_ex(Quanta *q, const char *path, uint32_t min_mem) {
     if (!q || !path) return QUANTA_ERR_INVAL;
     uint32_t entry;
-    if (elf_load(path, &q->mem, &entry) != 0) return QUANTA_ERR_LOAD;
+    if (elf_load(path, &q->mem, &entry, min_mem) != 0) return QUANTA_ERR_LOAD;
     start_at(q, entry);
     setup_boot(q);   /* hand the guest a device tree per the RISC-V boot contract */
     return QUANTA_OK;
+}
+
+QuantaStatus quanta_load_elf(Quanta *q, const char *path) {
+    return quanta_load_elf_ex(q, path, 0);
 }
 
 QuantaStatus quanta_elf_symbol(const char *path, const char *name,

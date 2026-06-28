@@ -26,8 +26,10 @@ with exception/trap handling, M9), RV32A atomics (M10), Sv32 virtual memory
 (M12), a full-system device platform with interrupt delivery (a CLINT
 timer/IPI, a PLIC, and a 16550 UART reached through MMIO, M13), and a flattened
 device tree handed to the guest at boot per the RISC-V `a0`=hartid/`a1`=DTB
-convention (M14), and an SBI firmware interface that services an S-mode guest's
-`ecall`s (console, timer, system reset, M15) are implemented
+convention (M14), an SBI firmware interface that services an S-mode guest's
+`ecall`s (console, timer, system reset, M15), and a small from-scratch teaching
+kernel that boots to userspace on all of it (`tests/os/`, `make check-os`, M16)
+are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
@@ -44,7 +46,10 @@ adds a 5-stage timing overlay estimating cycles and CPI from load-use and contro
 hazards — both pure overlays that never change results (`make check-cache`,
 `make check-pipeline`). A `--gdb[=PORT]` flag starts a GDB remote stub so a stock
 `gdb` attaches over TCP to step, break, and inspect a guest (`make check-gdb`;
-embeddable as `quanta_gdb_serve` in `gdbstub.h`, E9). The full milestone plan and
+embeddable as `quanta_gdb_serve` in `gdbstub.h`, E9). A `--memory=SIZE` flag sizes
+the guest RAM region independently of the ELF image, so an OS-style guest has
+spare RAM above its image to manage (the boot DTB's `/memory` node reports the
+true size). The full milestone plan and
 learning path live in `ROADMAP.md` — consult it for what comes next and tick
 boxes there as milestones land.
 
@@ -63,6 +68,7 @@ make check-pipeline # check the pipeline model on a hazard workload (needs cross
 make check-gdb     # drive the gdb remote stub with a self-contained client (needs python3)
 make check-devices # check the MMIO devices and interrupt delivery (needs cross-toolchain)
 make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-toolchain)
+make check-os      # boot the M16 teaching kernel to userspace (needs cross-toolchain)
 make check-diff    # differential-test against qemu-riscv32 (needs qemu-user-static)
 make check-arch    # official riscv-arch-test conformance (needs cross-toolchain + clone)
 make sanitize      # build with ASan+UBSan and run the suite (needs cross-toolchain)
@@ -83,7 +89,11 @@ set-associative L1 over the run's data accesses and print a hit/miss summary at
 exit, and/or `--pipeline` to print a 5-stage cycle/CPI estimate. The overlays
 compose. Add `--gdb[=PORT]` (default 1234) to start a GDB remote stub and wait
 for a debugger to `target remote :PORT`; it drives execution itself, so it does
-not combine with `--trace`/`--pipeline`. Add `--signature=FILE` to dump the
+not combine with `--trace`/`--pipeline`. Add `--memory=SIZE` (bytes, with an
+optional `K`/`M`/`G` suffix, e.g. `--memory=8M`) to grow the guest RAM region
+beyond its ELF image — spare RAM lands above the image for an OS-style guest to
+manage, and the boot DTB advertises the real size (`tests/os/` needs it). Add
+`--signature=FILE` to dump the
 architectural-test signature region (the words between the
 `begin_signature`/`end_signature` ELF symbols, in the suite's reference format) —
 what makes Quanta a drop-in `make check-arch` target.
@@ -181,6 +191,9 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   bounds-checked `elf_symbol` pass reads the section + symbol tables to resolve a
   symbol by name (running an image never needs it) — used by `--signature` to
   locate `begin_signature`/`end_signature`, and surfaced as `quanta_elf_symbol`.
+  `elf_load` takes a `min_size`: the region spans at least that many bytes, so a
+  caller (the `--memory` flag, via `quanta_load_elf_ex`) can leave spare RAM above
+  the image for an OS-style guest to manage; the DTB `/memory` node reports it.
 - `src/syscall.{h,c}` — the system-call layer (the "kernel" side of ECALL):
   dispatches on the `a7` syscall number and implements `write` and `exit` per
   the RISC-V Linux/newlib ABI. Reached by the SEE for `ecall`s from M/U mode; an
@@ -273,6 +286,29 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   interrupts (each handler re-arms), then shuts down via SRST. Proves the
   firmware STIP relay end to end. `-march=rv32i_zicsr`, out of `make check-diff`,
   pinned by `make check`.
+- `tests/os/` — the M16 teaching kernel: a small from-scratch S-mode kernel that
+  boots on Quanta and runs a userspace process, integrating M8–M15. `boot.S` is
+  the M-mode entry (delegate user traps to S via `medeleg`/`mideleg`, leave
+  `mtvec` 0 so the kernel's own SBI `ecall`s reach Quanta, `mret` into `kmain`),
+  the S-mode trap vector (`trap_entry`, a full register save/restore around the C
+  `trap_handler`, swapping the kernel trap stack in via `sscratch`), and the
+  user-entry trampoline (`enter_user`). `kernel.c` (C) reads RAM from the DTB,
+  bump-allocates physical pages from the spare RAM above its image, builds an Sv32
+  address space (megapage identity map for the kernel + CLINT/UART MMIO, a U-mode
+  code and stack page mapped low), installs `stvec`, sets `sstatus.SUM` to read
+  the user's buffers, arms SBI `set_timer` preemption, and `sret`s to user;
+  `trap_handler` services the U-mode `write`/`exit` syscalls and counts the timer
+  ticks (disarming after three). `user.S` is a position-independent U-mode blob
+  the kernel copies into a page; `kernel.ld` is the flat link script at
+  `0x80000000`. Built `-march=rv32imac_zicsr -nostdlib` in one `gcc` call (its own
+  rule, not the `tests/%.elf` pattern). Run with `./quanta --memory=8M
+  tests/os/kernel.elf`; pinned by `make check-os` (and run under `make
+  sanitize`/`make coverage`), out of `make check-diff` like the other privileged
+  tests.
+- `tests/check_os.sh` — boots the M16 kernel under `--memory=8M` and asserts
+  M16's "done when": paging came up, the userspace process printed via the `write`
+  syscall, the supervisor timer preempted it the expected number of times, and the
+  kernel shut down cleanly (exit 0). `make check-os`.
 - `tests/check_disasm.sh` — runs each sample ELF under `--trace` and diffs the
   disassembly against `objdump` (`make check-disasm`).
 - `tests/check_cache.sh` — runs `test_stack` under two cache geometries and
@@ -509,6 +545,26 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   unless a guest calls SBI `set_timer` (so `test_irq`'s machine-timer path, which
   arms the CLINT via MMIO and never touches the SBI, is unaffected). `test_stimer`
   pins the whole shuttle.
+- Booting an OS (M16, `tests/os/`): the teaching kernel is *entered in M-mode*
+  (Quanta's loader enters every ELF in M-mode), and its `boot.S` does the
+  drop-to-S itself — the same pattern `test_sbi`/`test_stimer` use — rather than
+  Quanta entering it in S-mode. Two consequences a foreign kernel would trip on
+  but this one is built around: (1) the kernel must leave `mtvec` 0, because the
+  SBI is available only while no M-mode handler is installed (M15); its own SBI
+  `ecall`s (cause 9, *not* in its `medeleg`) reach Quanta as firmware, while
+  delegated U-mode `ecall`s (cause 8) and the supervisor timer (`mideleg` bit 5)
+  go to its `stvec`. (2) The supervisor timer fires in U-mode regardless of
+  `sstatus.SIE` (the running privilege is below S), and is masked inside the
+  handler because trap entry clears `SIE` — so the kernel keeps interrupts off in
+  S-mode and gets no nested traps without any extra masking. The kernel reads its
+  user's `write` buffer directly through the user VAs by setting `sstatus.SUM`
+  (S-mode access to U pages), so no software page-table walk is needed. RAM beyond
+  the image comes from `--memory`; the free pool is `[_end, dtb)` page-aligned, so
+  it never collides with the boot device tree Quanta parks at the top of RAM. It
+  boots even without `--memory` (the 64 KiB stack headroom holds the four
+  page-table/user pages), just with little spare RAM. `--trace` is the debugging
+  tool when changing it — there is no qemu differential net for an S-mode paging
+  guest.
 - `--trace` writes to stderr, leaving the guest's own stdout (`write`) clean;
   "changed registers" are recovered by diffing a register snapshot taken around
   `cpu_step`, so the core isn't instrumented. The disassembler prints the common
