@@ -37,8 +37,11 @@ make execution observable, and `make check-disasm` pins the disassembly to
 over the run's data accesses and reports hit/miss statistics, and `--pipeline`
 adds a 5-stage timing overlay estimating cycles and CPI from load-use and control
 hazards — both pure overlays that never change results (`make check-cache`,
-`make check-pipeline`). The full milestone plan and learning path live in `ROADMAP.md` —
-consult it for what comes next and tick boxes there as milestones land.
+`make check-pipeline`). A `--gdb[=PORT]` flag starts a GDB remote stub so a stock
+`gdb` attaches over TCP to step, break, and inspect a guest (`make check-gdb`;
+embeddable as `quanta_gdb_serve` in `gdbstub.h`, E9). The full milestone plan and
+learning path live in `ROADMAP.md` — consult it for what comes next and tick
+boxes there as milestones land.
 
 ## Build / run / debug
 
@@ -52,6 +55,7 @@ make check    # build and run the RV32I conformance suite (needs cross-toolchain
 make check-disasm  # cross-check the disassembler against objdump (needs cross-toolchain)
 make check-cache   # check the cache model on a locality workload (needs cross-toolchain)
 make check-pipeline # check the pipeline model on a hazard workload (needs cross-toolchain)
+make check-gdb     # drive the gdb remote stub with a self-contained client (needs python3)
 make check-diff    # differential-test against qemu-riscv32 (needs qemu-user-static)
 make check-arch    # official riscv-arch-test conformance (needs cross-toolchain + clone)
 make sanitize      # build with ASan+UBSan and run the suite (needs cross-toolchain)
@@ -70,9 +74,12 @@ stderr. Add `--quiet` to suppress all driver output (banner, summary, register
 dump), leaving only the guest's own stdout — used by `make check-diff`. Add `--cache[=SIZE:WAYS:BLOCK]` (e.g. `--cache=1024:2:32`) to model a
 set-associative L1 over the run's data accesses and print a hit/miss summary at
 exit, and/or `--pipeline` to print a 5-stage cycle/CPI estimate. The overlays
-compose. Add `--signature=FILE` to dump the architectural-test signature region
-(the words between the `begin_signature`/`end_signature` ELF symbols, in the
-suite's reference format) — what makes Quanta a drop-in `make check-arch` target.
+compose. Add `--gdb[=PORT]` (default 1234) to start a GDB remote stub and wait
+for a debugger to `target remote :PORT`; it drives execution itself, so it does
+not combine with `--trace`/`--pipeline`. Add `--signature=FILE` to dump the
+architectural-test signature region (the words between the
+`begin_signature`/`end_signature` ELF symbols, in the suite's reference format) —
+what makes Quanta a drop-in `make check-arch` target.
 
 Debugging the emulator: `make debug && gdb ./quanta`. Note the two-level
 structure — gdb debugs the emulator (x86), which internally "runs" a RISC-V
@@ -148,11 +155,20 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   out-of-range access becomes `HALT_MEM_FAULT`), surfaced through the public
   `QuantaStatus`/`QuantaHalt` enums. Built as `libquanta.a`; the CLI and
   `examples/embed.c` are clients of it.
+- `src/gdbstub.{h,c}` — a GDB remote-serial-protocol server over TCP (E9):
+  `quanta_gdb_serve(q, port)` listens on localhost, accepts one debugger, and
+  drives the machine through the public `quanta.h` API alone — registers, memory,
+  single-step, halt reason — answering the `g`/`G`/`m`/`M`/`p`/`P`/`c`/`s`/`vCont`/
+  `Z`/`z`/`qXfer` packets and serving an RV32 target description. Breakpoints are
+  tracked here and enforced in the continue loop, so guest memory is never
+  patched. Reached via `--gdb` from `main.c`, and embeddable. It is the project's
+  one piece of OS-specific code, so the POSIX-sockets feature macro is local to
+  the `.c`.
 - `src/main.c` — the CLI driver, a thin client over `quanta.h`: argument parsing,
-  the `--trace` narration, the `--pipeline`/`--cache` overlays, and the
-  `--signature` arch-test dump, all driving the machine through the public API
-  (no engine internals). Loads an ELF named on the command line, or runs the
-  built-in demo when none is given.
+  the `--trace` narration, the `--pipeline`/`--cache` overlays, the `--gdb` stub
+  hand-off, and the `--signature` arch-test dump, all driving the machine through
+  the public API (no engine internals). Loads an ELF named on the command line,
+  or runs the built-in demo when none is given.
 - `examples/embed.c` — minimal embedding example: ~30 lines that load and run a
   guest through `libquanta` (`make embed`).
 - `tests/hello.S` — sample RV32I assembly, mirrors the built-in demo.
@@ -206,6 +222,12 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   with and without a load-use hazard; `tests/check_pipeline.sh` runs both under
   `--pipeline` and asserts the reorder cut stalls and cycles without changing the
   result (`make check-pipeline`).
+- `tests/check_gdb.sh` + `tests/gdb_client.py` — exercise the GDB stub (`--gdb`)
+  end to end with a self-contained RSP client (no riscv `gdb` needed): it
+  attaches, reads/writes registers and memory, single-steps, sets a breakpoint
+  and continues to exit on `tests/hello.elf`, asserting the known outcomes
+  (`make check-gdb`). Skips cleanly without python3; also run under `make
+  sanitize` and `make coverage`.
 - `tests/coverage.sh` — collects gcov line coverage after an instrumented build
   (`make coverage`): prefers lcov (HTML under `build/coverage`) and falls back to
   plain gcov. Observability only, like the cache/pipeline overlays.
@@ -364,6 +386,19 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   `PREFIX`/`DESTDIR`-based; `libquanta.a` is archived with `ar D` so a rebuild is
   byte-identical (the objects embed no `__DATE__`/`__TIME__`) — don't reintroduce
   build timestamps.
+- The GDB stub (`--gdb`, E9) is built only on the public `quanta.h` API and
+  speaks the standard RSP, so a stock `gdb` attaches with `target remote :PORT`
+  (it binds localhost only). Breakpoints are stub-side: the continue loop stops
+  when the PC reaches a `Z0`/`Z1` address, so guest memory is never patched with
+  trap words. The packet buffer is `calloc`'d so a read past a matched prefix is a
+  defined 0 — which also keeps clang-analyzer/scan-build from flagging an
+  uninitialised read. It is the lone POSIX dependency: `gdbstub.c` defines
+  `_DEFAULT_SOURCE` itself (so `make analyze`'s clang-tidy, which compiles with a
+  bare `-std=c11`, still sees the socket decls) under a local NOLINT for the
+  reserved-identifier check. `--gdb` takes over execution, so it does not combine
+  with `--trace`/`--pipeline`; `make check-gdb` drives it with a pure-python RSP
+  client (`tests/gdb_client.py`, no riscv `gdb` needed) and it also runs under
+  `make sanitize`/`make coverage`.
 
 ## .claude/
 

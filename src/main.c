@@ -1,6 +1,7 @@
 #include "quanta.h"
 #include "disasm.h"
 #include "pipeline.h"
+#include "gdbstub.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -11,7 +12,7 @@
  *
  * Usage:
  *   quanta [--version] [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]]
- *          [--pipeline] [--signature=FILE] [program.elf]
+ *          [--pipeline] [--gdb[=PORT]] [--signature=FILE] [program.elf]
  *
  * With a path, Quanta loads that RV32I ELF executable and runs it from its
  * entry point. With no argument, it runs a tiny built-in demo program — a
@@ -152,6 +153,8 @@ int main(int argc, char **argv) {
     int quiet = 0;
     int cache_on = 0;
     int pipe_on = 0;
+    int gdb_on = 0;
+    int gdb_port = 1234;            /* the conventional gdbserver/qemu port */
     uint32_t csize = 1024, cways = 2, cblock = 32; /* default L1 geometry */
     const char *path = NULL;
     const char *sigfile = NULL; /* --signature=FILE: arch-test signature dump */
@@ -175,6 +178,16 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--pipeline") == 0) {
             pipe_on = 1;
+        } else if (strcmp(argv[i], "--gdb") == 0) {
+            gdb_on = 1;
+        } else if (strncmp(argv[i], "--gdb=", 6) == 0) {
+            gdb_on = 1;
+            if (sscanf(argv[i] + 6, "%d", &gdb_port) != 1 ||
+                gdb_port <= 0 || gdb_port > 65535) {
+                fprintf(stderr, "bad --gdb port '%s' (want 1..65535)\n",
+                        argv[i] + 6);
+                return 2;
+            }
         } else if (strncmp(argv[i], "--signature=", 12) == 0) {
             sigfile = argv[i] + 12;
             if (sigfile[0] == '\0') {
@@ -184,14 +197,14 @@ int main(int argc, char **argv) {
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
-                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] "
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--gdb[=PORT]] "
                     "[--signature=FILE] [program.elf]\n", argv[0]);
             return 2;
         } else if (path == NULL) {
             path = argv[i];
         } else {
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
-                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] "
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--gdb[=PORT]] "
                     "[--signature=FILE] [program.elf]\n", argv[0]);
             return 2;
         }
@@ -236,6 +249,31 @@ int main(int argc, char **argv) {
     if (cache_on && quanta_enable_cache(q, csize, cways, cblock) != QUANTA_OK) {
         quanta_destroy(q);
         return 2;
+    }
+
+    /* GDB remote debugging takes over execution: rather than running the guest
+     * to completion, hand control to a debugger over TCP, which drives the
+     * machine (read/write state, breakpoints, step, continue) through libquanta.
+     * This is a self-contained mode, so the trace and pipeline overlays — both
+     * tied to the run-to-completion loop — do not apply. */
+    if (gdb_on) {
+        if (!quiet)
+            printf("Starting GDB stub on port %d; waiting for a connection.\n",
+                   gdb_port);
+        int rc = quanta_gdb_serve(q, gdb_port);
+        QuantaHalt gdb_halt = quanta_halt_reason(q);
+        int gdb_status = 0;
+        if (rc != 0) {
+            gdb_status = 1;                       /* could not start the stub */
+        } else if (gdb_halt == QUANTA_HALT_EXIT) {
+            if (!quiet)
+                printf("Program exited with code %u.\n", quanta_exit_code(q));
+            gdb_status = (int)(quanta_exit_code(q) & 0xffu);
+        } else if (!quiet) {
+            printf("GDB session ended.\n");
+        }
+        quanta_destroy(q);
+        return gdb_status;
     }
 
     /* Optional pipeline timing model: another overlay (it reads the retired

@@ -39,8 +39,10 @@ sanitizer and fuzzing builds, differential testing against qemu, coverage and
 static-analysis gates, and versioned releases with a man page and `make install`)
 and a capability track: Zicsr/Zifencei CSR access (M8), the M/S/U privileged
 architecture with exception/trap handling (M9), RV32A atomics (M10), and Sv32
-virtual memory (M12). Next come platform devices and interrupts, on the road to
-booting an operating system.
+virtual memory (M12). A GDB remote stub (`quanta --gdb=PORT`, E9) lets a stock
+`gdb` attach over TCP to read and write registers and memory, set breakpoints,
+single-step, and continue. Next come platform devices and interrupts, on the
+road to booting an operating system.
 
 ## Tech stack
 
@@ -93,6 +95,25 @@ composes with `--cache` and `--trace`):
 ./quanta --pipeline path/to/program.elf
 ```
 
+Debug a guest with a real `gdb` — `--gdb` starts a remote stub on a TCP port
+(default 1234), bound to localhost, and waits for the debugger to attach:
+
+```sh
+./quanta --gdb path/to/program.elf          # listen on :1234
+./quanta --gdb=4321 path/to/program.elf     # listen on :4321
+```
+
+Then, from another terminal, drive it with stock `gdb` over the remote protocol:
+
+```sh
+riscv64-unknown-elf-gdb path/to/program.elf
+(gdb) target remote :1234
+(gdb) break _start
+(gdb) stepi
+(gdb) info registers
+(gdb) continue
+```
+
 Print the version:
 
 ```sh
@@ -110,6 +131,7 @@ make check-arch    # run the official riscv-arch-test conformance suite
 make check-disasm  # cross-check the disassembler against objdump
 make check-cache   # check the cache model on a locality workload
 make check-pipeline # check the pipeline model on a hazard workload
+make check-gdb     # drive the gdb remote stub with a self-contained client
 make check-diff    # differential-test against qemu-riscv32
 make coverage      # gcov/lcov line-coverage report
 make analyze       # cppcheck + clang-tidy static analysis
@@ -145,7 +167,8 @@ quanta/
 │   ├── memory.h / memory.c    # flat little-endian address space
 │   ├── elf.h / elf.c          # minimal ELF32 loader
 │   ├── syscall.h / syscall.c  # ECALL handling: write + exit syscalls
-│   └── main.c                 # driver: load an ELF (or demo), --trace/--cache/--signature
+│   ├── gdbstub.h / gdbstub.c  # GDB remote-protocol stub over TCP (--gdb)
+│   └── main.c                 # driver: load an ELF (or demo), --trace/--cache/--gdb/--signature
 ├── tests/
 │   ├── hello.S                # arithmetic demo (mirrors the built-in program)
 │   ├── hello_world.S          # syscall demo: prints via write, then exits
@@ -155,6 +178,7 @@ quanta/
 │   ├── check_disasm.sh        # disassembler vs objdump (run by `make check-disasm`)
 │   ├── check_cache.sh         # cache model checks (run by `make check-cache`)
 │   ├── check_pipeline.sh      # pipeline model checks (run by `make check-pipeline`)
+│   ├── check_gdb.sh / gdb_client.py  # GDB-stub RSP client checks (make check-gdb)
 │   ├── check_arch.sh          # official riscv-arch-test conformance (make check-arch)
 │   └── arch/                  # Quanta target for riscv-arch-test (model_test.h, link.ld)
 ├── docs/quanta.1            # man page (installed by `make install`)
@@ -174,9 +198,10 @@ loader, system calls, RV32I conformance, disassembler + trace mode, RV32M
 extension, cache model, and pipeline timing model. Part II then advances two
 tracks toward a production-grade, OS-booting emulator: an engineering track
 (`libquanta` split, CI, sanitizers, fuzzing, differential testing, coverage and
-static-analysis gates, versioned releases — E1–E8 done) and a capability track
-(Zicsr/Zifencei M8, the M/S/U privileged architecture M9, RV32A atomics M10, Sv32
-virtual memory M12, with platform devices and a device tree next). See
+static-analysis gates, versioned releases, and a GDB remote stub — E1–E9 done)
+and a capability track (Zicsr/Zifencei M8, the M/S/U privileged architecture M9,
+RV32A atomics M10, Sv32 virtual memory M12, with platform devices and a device
+tree next). See
 [ROADMAP.md](ROADMAP.md) for the full plan, acceptance criteria, and learning
 path.
 

@@ -438,14 +438,36 @@ rebuilds. The first release is tagged `v0.1.0` (M0–M12, E1–E8).
 - [x] **Commits:** `feat: add --version`,
   `chore: add changelog and release tagging`.
 
-### E9 — GDB remote stub
+### E9 — GDB remote stub (DONE)
 
-- [ ] **Build:** a gdbserver-protocol stub over TCP (read/write registers and
+Quanta now speaks the GDB remote serial protocol (RSP) over TCP, so a stock
+`gdb` debugs a guest the same way it would real hardware or qemu's `-s`.
+`src/gdbstub.{h,c}` adds `quanta_gdb_serve(q, port)`, built entirely on the
+public `quanta.h` surface (register/memory access, single-step, halt reason) —
+so it doubles as a worked example of driving the engine from outside, and as a
+headline embeddable feature. `quanta --gdb[=PORT]` (default 1234) binds
+localhost, accepts one debugger, and drives the machine on its behalf: the
+`g`/`G`/`p`/`P` register packets, `m`/`M` memory, `s`/`c` (and `vCont`)
+step/continue, `Z0`/`z0` breakpoints — tracked stub-side and enforced in the
+continue loop, so guest memory is never patched with trap words — a Ctrl-C
+interrupt, and a `qXfer` target description advertising the RV32 register file
+(x0..x31 + pc) so gdb needs no hand-set architecture. The session ends on
+detach/kill or guest exit, mapping the halt reason to the right stop reply
+(`W` for a clean exit, `S05`/`S0b`/`S04` for trap/fault/illegal). It is the one
+piece of OS-specific code in an otherwise ISO-C project, so the POSIX-sockets
+feature macro is isolated to `gdbstub.c`. `tests/check_gdb.sh` exercises it end
+to end with a self-contained RSP client (`tests/gdb_client.py`, no riscv `gdb`
+needed in this environment) — asserting register/memory access, a single step,
+and a breakpoint-then-continue-to-exit on `tests/hello.elf` — under `make
+check-gdb`, and the same client runs inside `make sanitize` (ASan/UBSan over the
+socket and packet-buffer code) and `make coverage`. A CI job runs it on push.
+
+- [x] **Build:** a gdbserver-protocol stub over TCP (read/write registers and
   memory, single-step, breakpoints, continue) on top of the `libquanta` hooks.
-- [ ] **Why:** debugging a booting kernel without a debugger is brutal — this is
+- [x] **Why:** debugging a booting kernel without a debugger is brutal — this is
   effectively required tooling for Stage 3, and a headline embeddable feature.
-- [ ] **Done when:** real `gdb` attaches to a running guest and single-steps it.
-- [ ] **Commits:** `feat: add gdb remote stub`, `docs: document gdb debugging`.
+- [x] **Done when:** real `gdb` attaches to a running guest and single-steps it.
+- [x] **Commits:** `feat: add gdb remote stub`, `docs: document gdb debugging`.
 
 ---
 

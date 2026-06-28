@@ -9,6 +9,7 @@ quanta \- from-scratch RISC-V (RV32) instruction-set emulator
 .RB [ \-\-quiet ]
 .RB [ \-\-cache [ =\fISIZE\fR:\fIWAYS\fR:\fIBLOCK\fR ]]
 .RB [ \-\-pipeline ]
+.RB [ \-\-gdb [ =\fIPORT\fR ]]
 .RB [ \-\-signature=\fIFILE\fR ]
 .RI [ program.elf ]
 .SH DESCRIPTION
@@ -61,6 +62,21 @@ control-hazard stalls under a forwarding, predict-not-taken model. Also an
 observability layer; it composes with
 .BR \-\-cache .
 .TP
+.BR \-\-gdb [ =\fIPORT\fR ]
+Start a GDB remote stub on TCP
+.I PORT
+(default
+.BR 1234 ),
+bound to localhost, and wait for a debugger to connect before running. A stock
+.BR gdb (1)
+then attaches with
+.RB \(lq "target remote :" \fIPORT\fR \(rq
+to read and write registers and memory, set breakpoints, single-step, and
+continue. This mode drives execution itself, so it does not combine with
+.B \-\-trace
+or
+.BR \-\-pipeline .
+.TP
 .BI \-\-signature= FILE
 Dump the architectural-test signature region (the words between the
 .B begin_signature
@@ -86,7 +102,8 @@ syscall with that status (its low 8 bits).
 .B 1
 An abnormal stop \(em ebreak with no debugger, an illegal instruction, an
 unknown syscall, an out-of-range memory access, the instruction-count safety
-limit, a failed program load, or a signature-dump error.
+limit, a failed program load, a signature-dump error, or a GDB stub that could
+not bind its port.
 .TP
 .B 2
 A command-line usage error (unknown option, malformed
@@ -104,6 +121,9 @@ Trace execution, matching \fBobjdump \-d\fR mnemonics:
 .TP
 Estimate cache and pipeline behaviour:
 .B quanta \-\-cache=2048:4:64 \-\-pipeline program.elf
+.TP
+Debug a guest from gdb over a remote connection:
+.B quanta \-\-gdb=1234 program.elf
 .SH FILES
 .TP
 .I program.elf
@@ -113,7 +133,8 @@ executable (built, for example, with
 .BR "\-nostdlib \-nostartfiles \-Ttext=0x80000000" ).
 .SH SEE ALSO
 .BR objdump (1),
-.BR qemu-riscv32 (1).
+.BR qemu-riscv32 (1),
+.BR gdb (1).
 The full design notes and roadmap ship with the source in
 .B CLAUDE.md
 and

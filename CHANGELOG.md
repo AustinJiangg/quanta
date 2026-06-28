@@ -7,6 +7,16 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ## [Unreleased]
 
+### Added
+
+- **GDB remote stub** — `quanta --gdb[=PORT]` (default port 1234) serves the GDB
+  remote serial protocol over TCP, so a stock `gdb` attaches to a guest to read
+  and write registers and memory, set breakpoints, single-step, and continue. It
+  is built entirely on the public engine API and exposed to embedders as
+  `quanta_gdb_serve()` in a new `gdbstub.h`. Verified end to end by `make
+  check-gdb` with a self-contained RSP client (no riscv `gdb` required), and run
+  under the sanitizer and coverage builds. (E9)
+
 ## [0.1.0] - 2026-06-28
 
 First tagged release: a correct, observable RV32 emulator with a reusable engine

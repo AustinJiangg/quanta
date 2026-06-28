@@ -13,6 +13,7 @@
 #   make check-disasm  cross-check the disassembler against objdump
 #   make check-cache   check the cache model on a locality workload
 #   make check-pipeline  check the pipeline model on a hazard workload
+#   make check-gdb    drive the gdb remote stub with a self-contained client
 #   make check-diff   differential-test against a reference sim (qemu-riscv32)
 #   make check-arch   run the official riscv-arch-test conformance suite
 #   make sanitize     build with ASan+UBSan and run the suite through it
@@ -52,7 +53,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -139,6 +140,12 @@ check-cache: $(BIN) tests/test_stack.elf
 check-pipeline: $(BIN) tests/hazard_slow.elf tests/hazard_fast.elf
 	@sh tests/check_pipeline.sh
 
+# Drive the GDB remote stub (--gdb) with a self-contained RSP client that
+# attaches, reads/writes registers and memory, single-steps, sets a breakpoint,
+# and continues — no riscv `gdb` needed. Skips cleanly without python3.
+check-gdb: $(BIN) tests/hello.elf
+	@sh tests/check_gdb.sh
+
 # Differential test: compare quanta against a reference simulator (qemu-riscv32
 # by default; override with REF=...) on the sample programs. Skips cleanly if
 # the reference simulator is not installed.
@@ -171,7 +178,7 @@ debug: clean $(BIN)
 sanitize:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
-		embed check check-disasm check-cache check-pipeline check-diff
+		embed check check-disasm check-cache check-pipeline check-gdb check-diff
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
 # the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`
@@ -202,7 +209,7 @@ COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
 
 coverage:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb
 	@sh tests/coverage.sh
 
 # Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),
@@ -220,12 +227,13 @@ install: $(BIN) $(LIB)
 		$(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/share/man/man1
 	install -m 755 $(BIN) $(DESTDIR)$(PREFIX)/bin/
 	install -m 644 $(LIB) $(DESTDIR)$(PREFIX)/lib/
-	install -m 644 src/quanta.h $(DESTDIR)$(PREFIX)/include/
+	install -m 644 src/quanta.h src/gdbstub.h $(DESTDIR)$(PREFIX)/include/
 	install -m 644 docs/quanta.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/$(BIN) $(DESTDIR)$(PREFIX)/lib/$(LIB) \
 		$(DESTDIR)$(PREFIX)/include/quanta.h \
+		$(DESTDIR)$(PREFIX)/include/gdbstub.h \
 		$(DESTDIR)$(PREFIX)/share/man/man1/quanta.1
 
 clean:
