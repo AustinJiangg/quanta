@@ -9,6 +9,13 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **Platform devices and interrupts** — a full-system device layer reached
+  through MMIO: a CLINT (`mtime`/`mtimecmp` timer and `msip` software-interrupt),
+  a PLIC (external-interrupt priority/enable/threshold and claim/complete), and a
+  16550 UART whose transmit register prints to the console. The memory layer
+  dispatches device-window accesses, and the CPU now delivers machine timer,
+  software, and external interrupts (priority order, `mstatus`/`mideleg` gating,
+  vectored `mtvec`). Pinned by `make check` and `make check-devices`. (M13)
 - **GDB remote stub** — `quanta --gdb[=PORT]` (default port 1234) serves the GDB
   remote serial protocol over TCP, so a stock `gdb` attaches to a guest to read
   and write registers and memory, set breakpoints, single-step, and continue. It

@@ -1,4 +1,5 @@
 #include "memory.h"
+#include "device.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,7 @@ int mem_init(Memory *mem, uint32_t base, uint32_t size) {
     mem->size       = size;
     mem->fault      = 0;
     mem->fault_addr = 0;
+    mem->plat       = NULL; /* no devices until a platform is attached */
     return 0;
 }
 
@@ -38,9 +40,11 @@ void mem_free(Memory *mem) {
     mem->size = 0;
 }
 
-/* Little-endian: byte 0 is least significant. A faulting read returns 0. */
+/* Little-endian: byte 0 is least significant. A faulting read returns 0. An
+ * address in a device window is dispatched to the platform, not RAM. */
 uint32_t mem_read32(Memory *mem, uint32_t addr) {
     uint32_t i;
+    if (mem->plat && plat_contains(addr)) return plat_read(mem->plat, addr, 4);
     if (!translate(mem, addr, 4, &i)) return 0;
     return (uint32_t)mem->data[i]
          | (uint32_t)mem->data[i + 1] << 8
@@ -50,19 +54,22 @@ uint32_t mem_read32(Memory *mem, uint32_t addr) {
 
 uint16_t mem_read16(Memory *mem, uint32_t addr) {
     uint32_t i;
+    if (mem->plat && plat_contains(addr)) return (uint16_t)plat_read(mem->plat, addr, 2);
     if (!translate(mem, addr, 2, &i)) return 0;
     return (uint16_t)(mem->data[i] | mem->data[i + 1] << 8);
 }
 
 uint8_t mem_read8(Memory *mem, uint32_t addr) {
     uint32_t i;
+    if (mem->plat && plat_contains(addr)) return (uint8_t)plat_read(mem->plat, addr, 1);
     if (!translate(mem, addr, 1, &i)) return 0;
     return mem->data[i];
 }
 
-/* A faulting store is dropped. */
+/* A faulting store is dropped; a store to a device window goes to the platform. */
 void mem_write32(Memory *mem, uint32_t addr, uint32_t value) {
     uint32_t i;
+    if (mem->plat && plat_contains(addr)) { plat_write(mem->plat, addr, 4, value); return; }
     if (!translate(mem, addr, 4, &i)) return;
     mem->data[i]     = (uint8_t)(value);
     mem->data[i + 1] = (uint8_t)(value >> 8);
@@ -72,6 +79,7 @@ void mem_write32(Memory *mem, uint32_t addr, uint32_t value) {
 
 void mem_write16(Memory *mem, uint32_t addr, uint16_t value) {
     uint32_t i;
+    if (mem->plat && plat_contains(addr)) { plat_write(mem->plat, addr, 2, value); return; }
     if (!translate(mem, addr, 2, &i)) return;
     mem->data[i]     = (uint8_t)(value);
     mem->data[i + 1] = (uint8_t)(value >> 8);
@@ -79,6 +87,7 @@ void mem_write16(Memory *mem, uint32_t addr, uint16_t value) {
 
 void mem_write8(Memory *mem, uint32_t addr, uint8_t value) {
     uint32_t i;
+    if (mem->plat && plat_contains(addr)) { plat_write(mem->plat, addr, 1, value); return; }
     if (!translate(mem, addr, 1, &i)) return;
     mem->data[i] = value;
 }

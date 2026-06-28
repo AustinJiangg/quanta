@@ -38,11 +38,12 @@ hazards. Part II then adds an engineering track (a `libquanta` engine split, CI,
 sanitizer and fuzzing builds, differential testing against qemu, coverage and
 static-analysis gates, and versioned releases with a man page and `make install`)
 and a capability track: Zicsr/Zifencei CSR access (M8), the M/S/U privileged
-architecture with exception/trap handling (M9), RV32A atomics (M10), and Sv32
-virtual memory (M12). A GDB remote stub (`quanta --gdb=PORT`, E9) lets a stock
-`gdb` attach over TCP to read and write registers and memory, set breakpoints,
-single-step, and continue. Next come platform devices and interrupts, on the
-road to booting an operating system.
+architecture with exception/trap handling (M9), RV32A atomics (M10), Sv32
+virtual memory (M12), and a full-system device platform with interrupt delivery —
+a CLINT timer/IPI, a PLIC, and a 16550 UART reached over MMIO (M13). A GDB remote
+stub (`quanta --gdb=PORT`, E9) lets a stock `gdb` attach over TCP to read and
+write registers and memory, set breakpoints, single-step, and continue. Next come
+a device tree and a bare-metal SBI, on the road to booting an operating system.
 
 ## Tech stack
 
@@ -132,6 +133,7 @@ make check-disasm  # cross-check the disassembler against objdump
 make check-cache   # check the cache model on a locality workload
 make check-pipeline # check the pipeline model on a hazard workload
 make check-gdb     # drive the gdb remote stub with a self-contained client
+make check-devices # check the MMIO devices and interrupt delivery (M13)
 make check-diff    # differential-test against qemu-riscv32
 make coverage      # gcov/lcov line-coverage report
 make analyze       # cppcheck + clang-tidy static analysis
@@ -164,7 +166,8 @@ quanta/
 │   ├── disasm.h / disasm.c    # RV32I disassembler (objdump-style output)
 │   ├── cache.h / cache.c      # optional set-associative cache model (--cache)
 │   ├── pipeline.h / pipeline.c # optional 5-stage timing model (--pipeline)
-│   ├── memory.h / memory.c    # flat little-endian address space
+│   ├── memory.h / memory.c    # flat little-endian address space + MMIO dispatch
+│   ├── device.h / device.c    # MMIO devices: CLINT, PLIC, 16550 UART (M13)
 │   ├── elf.h / elf.c          # minimal ELF32 loader
 │   ├── syscall.h / syscall.c  # ECALL handling: write + exit syscalls
 │   ├── gdbstub.h / gdbstub.c  # GDB remote-protocol stub over TCP (--gdb)
@@ -179,6 +182,7 @@ quanta/
 │   ├── check_cache.sh         # cache model checks (run by `make check-cache`)
 │   ├── check_pipeline.sh      # pipeline model checks (run by `make check-pipeline`)
 │   ├── check_gdb.sh / gdb_client.py  # GDB-stub RSP client checks (make check-gdb)
+│   ├── check_devices.sh       # MMIO device + interrupt checks (make check-devices)
 │   ├── check_arch.sh          # official riscv-arch-test conformance (make check-arch)
 │   └── arch/                  # Quanta target for riscv-arch-test (model_test.h, link.ld)
 ├── docs/quanta.1            # man page (installed by `make install`)
@@ -200,8 +204,8 @@ tracks toward a production-grade, OS-booting emulator: an engineering track
 (`libquanta` split, CI, sanitizers, fuzzing, differential testing, coverage and
 static-analysis gates, versioned releases, and a GDB remote stub — E1–E9 done)
 and a capability track (Zicsr/Zifencei M8, the M/S/U privileged architecture M9,
-RV32A atomics M10, Sv32 virtual memory M12, with platform devices and a device
-tree next). See
+RV32A atomics M10, Sv32 virtual memory M12, platform devices and interrupts M13,
+with a device tree and a bare-metal SBI next). See
 [ROADMAP.md](ROADMAP.md) for the full plan, acceptance criteria, and learning
 path.
 

@@ -5,19 +5,24 @@
 #include <stddef.h>
 
 /*
- * A flat, byte-addressable memory.
+ * A flat, byte-addressable memory with optional memory-mapped I/O.
  *
- * Real machines have a rich memory hierarchy (caches, TLBs, MMIO regions).
- * For the MVP we model the simplest possible thing: one contiguous array of
- * bytes starting at a fixed base address. RISC-V is little-endian, so
- * multi-byte loads and stores assemble/disassemble bytes low-first.
+ * The bulk of the address space is one contiguous array of bytes starting at a
+ * fixed base address (RISC-V is little-endian, so multi-byte loads and stores
+ * assemble/disassemble bytes low-first). When a platform is attached (M13), a
+ * few physical-address windows are carved out for device registers instead:
+ * accesses to those are dispatched to the device models rather than RAM. The
+ * dispatch lives here so the CPU's load/store paths stay oblivious to it.
  */
+struct Platform; /* device models (device.h); attached for MMIO, else NULL */
+
 typedef struct {
-    uint8_t *data;       /* backing storage */
-    uint32_t base;       /* address that maps to data[0] */
-    uint32_t size;       /* number of bytes */
-    int      fault;      /* set by an out-of-range access; cleared each step */
-    uint32_t fault_addr; /* the offending address when `fault` is set */
+    uint8_t *data;          /* backing storage */
+    uint32_t base;          /* address that maps to data[0] */
+    uint32_t size;          /* number of bytes */
+    int      fault;         /* set by an out-of-range access; cleared each step */
+    uint32_t fault_addr;    /* the offending address when `fault` is set */
+    struct Platform *plat;  /* MMIO device platform, or NULL for plain RAM */
 } Memory;
 
 /* Allocate `size` bytes of zeroed memory mapped at `base`.

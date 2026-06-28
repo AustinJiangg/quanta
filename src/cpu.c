@@ -3,6 +3,7 @@
 #include "syscall.h"
 #include "cache.h"
 #include "mmu.h"
+#include "device.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -25,6 +26,16 @@ enum {
                    MSTATUS_SUM | MSTATUS_MXR,
     S_INT_MASK = (1u << 1) | (1u << 5) | (1u << 9)
 };
+
+/* Interrupt numbers: the bit positions in mie/mip, and the low bits of mcause
+ * with its high bit set. Machine outranks supervisor, and within a level the
+ * delivery priority is external > software > timer. */
+enum {
+    IRQ_SSOFT  = 1,  IRQ_MSOFT  = 3,
+    IRQ_STIMER = 5,  IRQ_MTIMER = 7,
+    IRQ_SEXT   = 9,  IRQ_MEXT   = 11
+};
+#define CAUSE_INTERRUPT 0x80000000u
 
 /* Defined below with the trap machinery, declared here so the memory-access
  * instructions (which appear earlier) can raise page faults through it. */
@@ -328,15 +339,52 @@ static void legacy_trap(CPU *cpu, uint32_t cause) {
     }
 }
 
+/* Enter a trap handler: the common state-stacking shared by synchronous
+ * exceptions and interrupts. `to_s` picks the S- or M-mode CSR set; `cause`
+ * already carries its interrupt bit (31) when relevant. The hart saves epc, the
+ * cause and tval, stacks the interrupt-enable and previous-privilege bits into
+ * mstatus, raises its privilege, and vectors to the handler. Direct mode points
+ * every trap at the base; an interrupt under a vectored *tvec (low bit set) goes
+ * to base + 4*cause instead. cpu->trapped tells cpu_step the PC is now the
+ * handler entry, not the next sequential instruction. */
+static void enter_trap(CPU *cpu, uint32_t cause, uint32_t tval, int to_s) {
+    uint32_t s = cpu->csr[CSR_MSTATUS];
+    uint32_t tvec;
+    if (to_s) {
+        cpu->csr[CSR_SEPC]   = cpu->pc;
+        cpu->csr[CSR_SCAUSE] = cause;
+        cpu->csr[CSR_STVAL]  = tval;
+        s = (s & ~MSTATUS_SPIE) | ((s & MSTATUS_SIE) ? MSTATUS_SPIE : 0);
+        s &= ~MSTATUS_SIE;
+        s = (s & ~MSTATUS_SPP) | (cpu->priv ? MSTATUS_SPP : 0); /* prev priv */
+        cpu->priv = PRIV_S;
+        cpu->csr[CSR_MSTATUS] = s;
+        tvec = cpu->csr[CSR_STVEC];
+    } else {
+        cpu->csr[CSR_MEPC]   = cpu->pc;
+        cpu->csr[CSR_MCAUSE] = cause;
+        cpu->csr[CSR_MTVAL]  = tval;
+        s = (s & ~MSTATUS_MPIE) | ((s & MSTATUS_MIE) ? MSTATUS_MPIE : 0);
+        s &= ~MSTATUS_MIE;
+        s = (s & ~MSTATUS_MPP) | (cpu->priv << MSTATUS_MPP_SHIFT);
+        cpu->priv = PRIV_M;
+        cpu->csr[CSR_MSTATUS] = s;
+        tvec = cpu->csr[CSR_MTVEC];
+    }
+    uint32_t base = tvec & ~0x3u;
+    if ((cause & CAUSE_INTERRUPT) && (tvec & 0x1u)) /* vectored mode (interrupts) */
+        base += 4u * (cause & ~CAUSE_INTERRUPT);
+    cpu->pc = base;
+    cpu->trapped = 1;
+}
+
 /* Raise a synchronous exception with cause `cause` and trap value `tval`.
  *
  * The trap is delegated to S-mode when it arises in S/U mode and the matching
  * medeleg bit is set; otherwise it is taken in M-mode. A trap taken in M never
- * delegates. If the resolved trap vector is still 0, no guest handler exists
- * and we fall back to the built-in SEE. Otherwise we save the architectural
- * state the spec requires, stack the interrupt-enable and previous-privilege
- * bits, and vector to the handler. cpu->trapped tells cpu_step the PC is now
- * the handler entry, not the next sequential instruction. */
+ * delegates. If the resolved trap vector is still 0, no guest handler exists and
+ * we fall back to the built-in SEE; otherwise enter_trap stacks state and
+ * vectors into the handler. */
 static void raise_trap(CPU *cpu, uint32_t cause, uint32_t tval) {
     int to_s = (cpu->priv <= PRIV_S) &&
                ((cpu->csr[CSR_MEDELEG] >> cause) & 1u);
@@ -346,28 +394,52 @@ static void raise_trap(CPU *cpu, uint32_t cause, uint32_t tval) {
         legacy_trap(cpu, cause);
         return;
     }
+    enter_trap(cpu, cause, tval, to_s);
+}
 
-    uint32_t s = cpu->csr[CSR_MSTATUS];
-    if (to_s) {
-        cpu->csr[CSR_SEPC]   = cpu->pc;
-        cpu->csr[CSR_SCAUSE] = cause; /* interrupt bit (31) stays 0 */
-        cpu->csr[CSR_STVAL]  = tval;
-        s = (s & ~MSTATUS_SPIE) | ((s & MSTATUS_SIE) ? MSTATUS_SPIE : 0);
-        s &= ~MSTATUS_SIE;
-        s = (s & ~MSTATUS_SPP) | (cpu->priv ? MSTATUS_SPP : 0); /* prev priv */
-        cpu->priv = PRIV_S;
-    } else {
-        cpu->csr[CSR_MEPC]   = cpu->pc;
-        cpu->csr[CSR_MCAUSE] = cause;
-        cpu->csr[CSR_MTVAL]  = tval;
-        s = (s & ~MSTATUS_MPIE) | ((s & MSTATUS_MIE) ? MSTATUS_MPIE : 0);
-        s &= ~MSTATUS_MIE;
-        s = (s & ~MSTATUS_MPP) | (cpu->priv << MSTATUS_MPP_SHIFT);
-        cpu->priv = PRIV_M;
+/* Refresh the device-driven interrupt-pending bits and return mip. The CLINT and
+ * PLIC own MSIP/MTIP/MEIP — they are read-only reflections of device state, so
+ * each step we recompute them from the platform rather than trusting a stored
+ * value; the software-writable bits (e.g. SSIP) are left as-is. */
+static uint32_t effective_mip(CPU *cpu) {
+    uint32_t mip = cpu->csr[CSR_MIP];
+    if (cpu->mem->plat) {
+        mip &= ~(MIP_MSIP | MIP_MTIP | MIP_MEIP);
+        mip |= plat_mip_bits(cpu->mem->plat);
+        cpu->csr[CSR_MIP] = mip; /* so a CSR read of mip sees the live bits */
     }
-    cpu->csr[CSR_MSTATUS] = s;
-    cpu->pc = tvec & ~0x3u; /* direct mode; vectored is for interrupts (M13) */
-    cpu->trapped = 1;
+    return mip;
+}
+
+/* Deliver a pending interrupt if one is enabled and the privilege gate is open.
+ * Returns 1 (and vectors into the handler via enter_trap) when it took one.
+ *
+ * An interrupt fires when its mip and mie bits are both set and the destination
+ * privilege has interrupts globally enabled: M-targeted interrupts when the hart
+ * is below M, or in M with mstatus.MIE; S-targeted (delegated via mideleg) when
+ * below S, or in S with mstatus.SIE. Among those eligible, the spec's fixed
+ * priority order picks one. tval is 0 for interrupts. */
+static int take_interrupt(CPU *cpu) {
+    uint32_t pending = effective_mip(cpu) & cpu->csr[CSR_MIE];
+    if (!pending) return 0;
+
+    uint32_t ms      = cpu->csr[CSR_MSTATUS];
+    uint32_t mideleg = cpu->csr[CSR_MIDELEG];
+    int m_on = (cpu->priv < PRIV_M) || ((cpu->priv == PRIV_M) && (ms & MSTATUS_MIE));
+    int s_on = (cpu->priv < PRIV_S) || ((cpu->priv == PRIV_S) && (ms & MSTATUS_SIE));
+
+    static const uint32_t order[6] = { IRQ_MEXT, IRQ_MSOFT, IRQ_MTIMER,
+                                       IRQ_SEXT, IRQ_SSOFT, IRQ_STIMER };
+    for (int k = 0; k < 6; k++) {
+        uint32_t i = order[k];
+        if (!(pending & (1u << i))) continue;
+        int to_s = ((mideleg >> i) & 1u) != 0;
+        if (to_s ? s_on : m_on) {
+            enter_trap(cpu, CAUSE_INTERRUPT | i, 0, to_s);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* Execute a Zicsr instruction: an atomic read-modify-write of one CSR.
@@ -569,6 +641,14 @@ void cpu_step(CPU *cpu) {
      * that into a trap rather than letting the access abort the host. */
     cpu->mem->fault = 0;
     cpu->trapped = 0; /* set by raise_trap if this step vectors into a handler */
+
+    /* Advance the platform timer and take any pending interrupt before fetch,
+     * at this instruction boundary. A taken interrupt vectors into the handler
+     * and retires nothing, so we return without fetching. */
+    if (cpu->mem->plat) {
+        plat_tick(cpu->mem->plat);
+        if (take_interrupt(cpu)) return;
+    }
 
     /* FETCH: translate PC, then read the 32-bit instruction word there. */
     uint32_t pc_pa;

@@ -4,6 +4,7 @@
 #include "memory.h"
 #include "elf.h"
 #include "cache.h"
+#include "device.h"
 #include "decode.h"
 
 #include <stdlib.h>
@@ -26,11 +27,12 @@ const char *quanta_version(void) {
  * are wired up by the loaders.
  */
 struct Quanta {
-    CPU    cpu;
-    Memory mem;
-    Cache  cache;
-    int    cache_on;  /* a cache has been attached */
-    int    loaded;    /* memory is initialised and PC/sp are set */
+    CPU      cpu;
+    Memory   mem;
+    Cache    cache;
+    Platform plat;    /* MMIO devices: CLINT timer/IPI, PLIC, 16550 UART (M13) */
+    int      cache_on;  /* a cache has been attached */
+    int      loaded;    /* memory is initialised and PC/sp are set */
 };
 
 /* Map the internal halt reason to the public enum. */
@@ -76,6 +78,8 @@ void quanta_destroy(Quanta *q) {
 static void start_at(Quanta *q, uint32_t entry) {
     cpu_init(&q->cpu, &q->mem, entry);
     if (q->cache_on) q->cpu.cache = &q->cache;
+    plat_init(&q->plat);      /* reset the MMIO devices */
+    q->mem.plat = &q->plat;   /* attach them so MMIO is dispatched and timers tick */
     reg_write(&q->cpu, 2, (q->mem.base + q->mem.size) & ~(uint32_t)0xf);
     q->loaded = 1;
 }

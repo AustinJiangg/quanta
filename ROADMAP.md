@@ -605,16 +605,36 @@ its three-level walk are M18, after the RV64 transition.)
 - [x] **Commits:** `feat: add sv32 page-table walk`, `feat: add a tlb`,
   `feat: trap on page faults`, `docs: document virtual memory`.
 
-## M13 — Platform devices and interrupts
+## M13 — Platform devices and interrupts (DONE)
 
-- [ ] **Build:** MMIO dispatch in the memory layer plus a CLINT (`mtime`/
+The machine grows hardware beyond RAM, and the trap mechanism from M9 gains its
+asynchronous half. `memory.c` stops being purely a flat array: physical-address
+windows now dispatch to device models in `src/device.{h,c}`, on the de-facto qemu
+`virt` layout. Three devices land — a **CLINT** (the `mtime` timer with a
+per-hart `mtimecmp`, and the `msip` software-interrupt/IPI register), a **PLIC**
+(external-interrupt routing with per-source priority, an enable bitmap, a
+threshold, and the claim/complete handshake), and a **16550 UART** whose transmit
+register prints to the host console. The CPU pulls the resulting pending bits
+(`MTIP`/`MSIP`/`MEIP`) into `mip` each step and, at the instruction boundary
+before fetch, delivers the highest-priority enabled interrupt: `take_interrupt`
+honours the global `mstatus.MIE`/`SIE` gates and `mideleg`, and `enter_trap` (now
+shared with the synchronous `raise_trap`) supports vectored `*tvec`. `mtime`
+advances one tick per step, so timers are deterministic. The platform is attached
+to every loaded machine but inert until a guest programs it — no pre-M13 test
+enables an interrupt, so all keep running unchanged. `tests/test_irq.S` arms the
+timer, raises an IPI, and routes a UART interrupt through the PLIC (claim →
+deassert → complete), checking each fires exactly once, then prints through the
+UART; `make check` pins the interrupt assertions and `make check-devices` pins the
+console output. Being machine-mode + MMIO, it stays out of `make check-diff`.
+
+- [x] **Build:** MMIO dispatch in the memory layer plus a CLINT (`mtime`/
   `mtimecmp` timer, `msip` IPI), a PLIC (external-interrupt claim/complete), and
   a 16550 UART for console I/O.
-- [ ] **ISA:** none new — memory-mapped device models and interrupt delivery.
-- [ ] **Concept:** memory-mapped I/O; the interrupt path from device to trap;
+- [x] **ISA:** none new — memory-mapped device models and interrupt delivery.
+- [x] **Concept:** memory-mapped I/O; the interrupt path from device to trap;
   timer-driven preemption.
-- [ ] **Done when:** a timer interrupt fires on `mtimecmp` and the UART prints.
-- [ ] **Commits:** `feat: add mmio dispatch`, `feat: add clint timer and ipi`,
+- [x] **Done when:** a timer interrupt fires on `mtimecmp` and the UART prints.
+- [x] **Commits:** `feat: add mmio dispatch`, `feat: add clint timer and ipi`,
   `feat: add plic`, `feat: add a 16550 uart`.
 
 ## M14 — Device tree and boot protocol

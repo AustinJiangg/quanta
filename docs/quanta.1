@@ -18,7 +18,9 @@ is a single-hart RISC-V emulator: 32 registers, a program counter, and a flat
 little-endian memory driven by a fetch/decode/execute loop. It implements the
 RV32I base integer ISA plus the M (multiply/divide), A (atomics), and
 Zicsr/Zifencei extensions, the M/S/U privileged architecture with trap handling,
-and Sv32 virtual memory.
+and Sv32 virtual memory. It also models a small platform reached through
+memory-mapped I/O \(em a CLINT timer, a PLIC, and a 16550 UART \(em and delivers
+timer, software, and external interrupts.
 .PP
 Given
 .IR program.elf ,

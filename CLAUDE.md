@@ -21,12 +21,13 @@ flat little-endian memory. The core is a fetch/decode/execute loop.
 All roadmap milestones (M0–M7) are complete, and Part II is under way: the full
 RV32I base integer set, the RV32M multiply/divide extension, Zicsr/Zifencei (CSR
 access and `fence.i`, M8), the privileged architecture (M/S/U privilege levels
-with exception/trap handling, M9), RV32A atomics (M10), and Sv32 virtual memory
-(M12) are implemented and pinned by a hand-written conformance suite (`make
-check`) plus the official RISC-V architectural tests (`make check-arch`, run
-offline against the suite's own committed reference signatures), an optional
-cache model sits in front of memory, and a `--pipeline` timing model estimates
-cycles and CPI.
+with exception/trap handling, M9), RV32A atomics (M10), Sv32 virtual memory
+(M12), and a full-system device platform with interrupt delivery (a CLINT
+timer/IPI, a PLIC, and a 16550 UART reached through MMIO, M13) are implemented
+and pinned by a hand-written conformance suite (`make check`) plus the official
+RISC-V architectural tests (`make check-arch`, run offline against the suite's
+own committed reference signatures), an optional cache model sits in front of
+memory, and a `--pipeline` timing model estimates cycles and CPI.
 Quanta loads ELF32
 executables (`quanta program.elf`), services `write`/`exit` system calls through
 the ECALL path — the built-in SEE that runs until a guest installs its own trap
@@ -56,6 +57,7 @@ make check-disasm  # cross-check the disassembler against objdump (needs cross-t
 make check-cache   # check the cache model on a locality workload (needs cross-toolchain)
 make check-pipeline # check the pipeline model on a hazard workload (needs cross-toolchain)
 make check-gdb     # drive the gdb remote stub with a self-contained client (needs python3)
+make check-devices # check the MMIO devices and interrupt delivery (needs cross-toolchain)
 make check-diff    # differential-test against qemu-riscv32 (needs qemu-user-static)
 make check-arch    # official riscv-arch-test conformance (needs cross-toolchain + clone)
 make sanitize      # build with ASan+UBSan and run the suite (needs cross-toolchain)
@@ -100,6 +102,15 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
 ## Code layout
 
 - `src/memory.{h,c}` — flat address space; little-endian load/store helpers.
+  With a `Platform` attached (M13), physical-address windows are carved out for
+  MMIO: each `mem_read*`/`mem_write*` checks `plat_contains(addr)` first and
+  dispatches device accesses to `device.c`, otherwise hits the flat RAM array.
+- `src/device.{h,c}` — the MMIO device models (M13): a CLINT (`mtime`/`mtimecmp`
+  timer + `msip` IPI), a PLIC (priority/enable/threshold + claim/complete), and a
+  16550 UART (transmit prints to stdout). Self-contained register files on the
+  qemu `virt` address map, with no CPU/memory dependency — the memory layer
+  dispatches accesses here, and the CPU pulls `plat_mip_bits()` (MTIP/MSIP/MEIP)
+  each step. `plat_tick` advances `mtime` one tick per CPU step (deterministic).
 - `src/decode.h` — shared instruction decoding: field-extraction and
   immediate-decoding helpers, the opcode map, and ABI register names, all
   `static inline`. The executor and the disassembler decode through this, so
@@ -118,7 +129,12 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   (LR/SC and the AMO*s) are `exec_amo` under the dedicated AMO opcode, backed by
   a single-word LR reservation (`reserve_valid`/`reserve_addr`) that a matching
   store voids. Under M12, every fetch and data address is run through
-  `mmu_translate` before it reaches memory.
+  `mmu_translate` before it reaches memory. M13 adds interrupt delivery: at the
+  top of each step the hart ticks the platform timer and calls `take_interrupt`,
+  which pulls the device-driven `mip` bits (`effective_mip`), applies the
+  `mstatus`/`mideleg` gates, and vectors the highest-priority enabled interrupt
+  through `enter_trap` (the trap-entry path now shared with `raise_trap`, with
+  vectored-`*tvec` support).
 - `src/mmu.{h,c}` — Sv32 virtual memory (M12): the two-level page-table walker,
   a small software TLB (in the CPU struct), permission and A/D-bit handling, and
   the page-fault decision. `mmu_translate(cpu, va, acc, &pa)` returns 0 or a
@@ -195,6 +211,12 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   to one frame), hardware dirty-bit update, and a precise load page fault caught
   by an M-mode handler. Uses satp/supervisor CSRs, so `-march=rv32i_zicsr` and
   out of `make check-diff`.
+- `tests/test_irq.S` — the M13 device/interrupt suite: arms the CLINT timer,
+  raises a software IPI, and routes a UART interrupt through the PLIC (claim →
+  deassert → complete), asserting each machine interrupt fires exactly once with
+  the right `mcause`, then prints "uart ok" through the UART. Machine-mode CSRs +
+  MMIO, so `-march=rv32i_zicsr` and out of `make check-diff`; `make check` pins
+  the exit code and `make check-devices` pins the UART output.
 - `tests/check_disasm.sh` — runs each sample ELF under `--trace` and diffs the
   disassembly against `objdump` (`make check-disasm`).
 - `tests/check_cache.sh` — runs `test_stack` under two cache geometries and
@@ -228,6 +250,10 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   and continues to exit on `tests/hello.elf`, asserting the known outcomes
   (`make check-gdb`). Skips cleanly without python3; also run under `make
   sanitize` and `make coverage`.
+- `tests/check_devices.sh` — runs `test_irq` and asserts both halves of M13's
+  "done when": a clean exit (timer, IPI, and PLIC external interrupts all fired)
+  and the UART's "uart ok" reaching stdout (`make check-devices`). Also run under
+  `make sanitize` and `make coverage`.
 - `tests/coverage.sh` — collects gcov line coverage after an instrumented build
   (`make coverage`): prefers lcov (HTML under `build/coverage`) and falls back to
   plain gcov. Observability only, like the cache/pipeline overlays.
@@ -347,6 +373,24 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   flushes (`sfence.vma` drops the whole TLB). Like the other privileged tests,
   `test_vm` can't run under user-mode qemu, so it has no differential safety
   net — lean on `--trace` when changing the walker.
+- Platform devices and interrupts (M13) live in `device.c`; the MMIO *dispatch*
+  is in `memory.c`, gated on `mem->plat` (NULL = plain RAM, e.g. a Memory not
+  wired through `start_at`). The platform is attached to every loaded machine but
+  inert until programmed: no pre-M13 test enables an interrupt, so all are
+  unaffected. Key points: MMIO addresses are matched on the **physical** address
+  (after `mmu_translate`) — `test_vm`'s `0x10000000` is a deliberately-unmapped
+  *VA* that faults at translation, never reaching the UART there. `mtime` ticks
+  once per `cpu_step` (deterministic, not wall-clock), and `mtimecmp` resets to
+  all-ones so the timer is quiet until armed. `MTIP`/`MSIP`/`MEIP` are read-only
+  reflections of device state, recomputed into `mip` each step by `effective_mip`
+  (software-writable `mip` bits like `SSIP` are left alone). Interrupts are taken
+  at the instruction boundary **before** fetch, so `*epc` is the interrupted
+  instruction and the handler resumes it (do **not** advance `*epc` the way a
+  synchronous handler skips its trapping instruction). `enter_trap` is shared by
+  `raise_trap` (synchronous) and `take_interrupt`; vectored `*tvec` applies only
+  to interrupts. Addresses follow the qemu `virt` map (CLINT `0x02000000`, PLIC
+  `0x0c000000`, UART `0x10000000`). The UART transmit prints straight to stdout
+  (like the `write` syscall), so it composes with `--quiet`.
 - `--trace` writes to stderr, leaving the guest's own stdout (`write`) clean;
   "changed registers" are recovered by diffing a register snapshot taken around
   `cpu_step`, so the core isn't instrumented. The disassembler prints the common
