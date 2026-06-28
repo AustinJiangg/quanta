@@ -9,6 +9,15 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **Device tree and boot protocol** — the loader now hands an ELF guest a
+  flattened device tree the way RISC-V firmware does: a freshly generated DTB
+  (describing the RAM and the CLINT/PLIC/UART, built from scratch with no external
+  `dtc`) is placed at the top of guest memory, and the guest is entered with
+  `a0` = boot hart id and `a1` = the DTB's physical address. So a kernel can
+  discover its memory layout and devices instead of assuming fixed addresses. The
+  blob serialiser is `dtb_build` in a new `dtb.h`; `quanta_dtb_addr()` and the CLI
+  banner report where the tree landed. Pinned by `make check` with a `test_dtb`
+  program that parses the tree back out of `a1`. (M14)
 - **Platform devices and interrupts** — a full-system device layer reached
   through MMIO: a CLINT (`mtime`/`mtimecmp` timer and `msip` software-interrupt),
   a PLIC (external-interrupt priority/enable/threshold and claim/complete), and a

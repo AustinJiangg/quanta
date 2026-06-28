@@ -5,6 +5,7 @@
 #include "elf.h"
 #include "cache.h"
 #include "device.h"
+#include "dtb.h"
 #include "decode.h"
 
 #include <stdlib.h>
@@ -31,6 +32,7 @@ struct Quanta {
     Memory   mem;
     Cache    cache;
     Platform plat;    /* MMIO devices: CLINT timer/IPI, PLIC, 16550 UART (M13) */
+    uint32_t dtb_addr;  /* where the boot device tree was placed (0 if none, M14) */
     int      cache_on;  /* a cache has been attached */
     int      loaded;    /* memory is initialised and PC/sp are set */
 };
@@ -80,8 +82,41 @@ static void start_at(Quanta *q, uint32_t entry) {
     if (q->cache_on) q->cpu.cache = &q->cache;
     plat_init(&q->plat);      /* reset the MMIO devices */
     q->mem.plat = &q->plat;   /* attach them so MMIO is dispatched and timers tick */
+    q->dtb_addr = 0;          /* set only by the boot handoff below (ELF path) */
     reg_write(&q->cpu, 2, (q->mem.base + q->mem.size) & ~(uint32_t)0xf);
     q->loaded = 1;
+}
+
+/* The RISC-V boot handoff (M14): describe this machine in a flattened device
+ * tree, drop it at the top of guest memory, and enter the guest the way firmware
+ * does — a0 = boot hart id, a1 = the DTB's physical address — with sp moved just
+ * below the tree so the stack never grows into it. So a kernel can discover its
+ * RAM and devices instead of assuming a fixed layout. The tree is tiny (well
+ * under a page) and sits in the loader's stack headroom; if it somehow does not
+ * fit, we leave start_at's plain entry state untouched (a0/a1 = 0). */
+static void setup_boot(Quanta *q) {
+    DtbConfig cfg = {
+        .mem_base   = q->mem.base,   .mem_size  = q->mem.size,
+        .clint_base = CLINT_BASE,    .clint_size = CLINT_SIZE,
+        .plic_base  = PLIC_BASE,     .plic_size  = PLIC_SIZE,
+        .uart_base  = UART_BASE,     .uart_size  = UART_SIZE,
+        .uart_irq   = UART_IRQ,      .plic_ndev  = PLIC_NSOURCES - 1,
+        .boot_hart  = 0,             .timebase_freq = 10000000,
+        .isa        = "rv32ima_zicsr_zifencei",
+    };
+
+    uint8_t blob[DTB_MAX_SIZE];
+    size_t n = dtb_build(blob, sizeof blob, &cfg);
+    if (n == 0 || n + 16 > q->mem.size) return;   /* no room: keep entry defaults */
+
+    uint32_t addr = (q->mem.base + q->mem.size - (uint32_t)n) & ~(uint32_t)7;
+    if (addr < q->mem.base + 16) return;          /* paranoia: would underflow RAM */
+    if (mem_load(&q->mem, addr, blob, n) != 0) return;
+    q->dtb_addr = addr;
+
+    reg_write(&q->cpu, 2, (addr - 16) & ~(uint32_t)0xf); /* sp: 16-aligned, below the DTB */
+    reg_write(&q->cpu, 10, cfg.boot_hart);               /* a0 = hartid */
+    reg_write(&q->cpu, 11, addr);                        /* a1 = DTB pointer */
 }
 
 QuantaStatus quanta_load_elf(Quanta *q, const char *path) {
@@ -89,6 +124,7 @@ QuantaStatus quanta_load_elf(Quanta *q, const char *path) {
     uint32_t entry;
     if (elf_load(path, &q->mem, &entry) != 0) return QUANTA_ERR_LOAD;
     start_at(q, entry);
+    setup_boot(q);   /* hand the guest a device tree per the RISC-V boot contract */
     return QUANTA_OK;
 }
 
@@ -199,6 +235,7 @@ uint32_t quanta_exit_code(const Quanta *q)  { return q ? q->cpu.exit_code : 0; }
 uint32_t quanta_fault_addr(const Quanta *q) { return q ? q->mem.fault_addr : 0; }
 uint32_t quanta_mem_base(const Quanta *q)   { return q ? q->mem.base : 0; }
 uint32_t quanta_mem_size(const Quanta *q)   { return q ? q->mem.size : 0; }
+uint32_t quanta_dtb_addr(const Quanta *q)   { return q ? q->dtb_addr : 0; }
 
 const char *quanta_halt_str(QuantaHalt h) {
     switch (h) {

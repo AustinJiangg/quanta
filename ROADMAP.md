@@ -637,14 +637,36 @@ console output. Being machine-mode + MMIO, it stays out of `make check-diff`.
 - [x] **Commits:** `feat: add mmio dispatch`, `feat: add clint timer and ipi`,
   `feat: add plic`, `feat: add a 16550 uart`.
 
-## M14 — Device tree and boot protocol
+## M14 — Device tree and boot protocol (DONE)
 
-- [ ] **Build:** load (or generate) a flattened device tree and enter the guest
+The boot handoff: how a kernel learns what hardware it is running on. Instead of
+assuming fixed addresses, a RISC-V system enters its OS with the boot hart id in
+`a0` and the physical address of a *flattened device tree* (DTB) in `a1` — a
+self-describing blob, built by firmware (OpenSBI/qemu), that lists the RAM ranges
+and the memory-mapped devices and how their interrupts are wired. `src/dtb.{h,c}`
+adds a from-scratch FDT serialiser: `dtb_build` emits the standard binary form (a
+big-endian header, a memory-reservation block, a structure block of nested
+nodes/properties, and a deduplicated strings block) with no external `dtc`. It
+describes Quanta's own RAM (`/memory`) and the M13 platform (`/soc` with the
+CLINT, PLIC, and 16550 UART, plus the per-hart interrupt controller and phandle
+wiring). `quanta_load_elf` now generates this tree, drops it at the top of guest
+memory (in the loader's stack headroom, with `sp` moved just below it), and sets
+`a0`/`a1` per the convention; `quanta_dtb_addr` exposes its address and the CLI
+banner reports it. The raw-image/demo path is unchanged (no tree, `a0`/`a1` = 0),
+so the boot protocol is inert for hand-assembled embeds. `tests/test_dtb.S` plays
+bootloader: it walks the structure block token by token straight from `a1`,
+reads the `/memory` reg range back out and confirms it contains the program, and
+finds the UART device node — proving the guest can discover its layout from the
+DTB. Being a Quanta-supplied boot artifact user-mode qemu does not provide, it is
+kept out of `make check-diff`; `make check` pins it (and `make check-disasm`
+covers its disassembly).
+
+- [x] **Build:** load (or generate) a flattened device tree and enter the guest
   per the RISC-V boot convention (`a0`=hartid, `a1`=DTB pointer).
-- [ ] **ISA:** none new — the firmware/OS boot contract.
-- [ ] **Concept:** hardware discovery via device tree; the boot handoff.
-- [ ] **Done when:** the guest reads its memory layout and devices from the DTB.
-- [ ] **Commits:** `feat: pass a device tree at boot`,
+- [x] **ISA:** none new — the firmware/OS boot contract.
+- [x] **Concept:** hardware discovery via device tree; the boot handoff.
+- [x] **Done when:** the guest reads its memory layout and devices from the DTB.
+- [x] **Commits:** `feat: pass a device tree at boot`,
   `docs: document the boot protocol`.
 
 ### Stage 3 — Boot an OS (RV32 trophy) (M15–M16)

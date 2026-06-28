@@ -159,8 +159,10 @@ check-devices: $(BIN) tests/test_irq.elf
 #
 # The privileged tests are excluded: they touch machine-mode CSRs and trap
 # state (mscratch, mtvec, mret, delegation) that user-mode qemu rejects with
-# SIGILL because it provides its own supervisor. `make check` pins them instead.
-DIFF_ELF := $(filter-out tests/test_csr.elf tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf tests/test_irq.elf,$(TEST_ELF))
+# SIGILL because it provides its own supervisor. test_dtb is excluded too: it
+# parses the boot device tree Quanta hands over in a1, which user-mode qemu does
+# not supply. `make check` pins them all instead.
+DIFF_ELF := $(filter-out tests/test_csr.elf tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf tests/test_irq.elf tests/test_dtb.elf,$(TEST_ELF))
 
 check-diff: $(BIN) $(TEST_ELF)
 	@sh tests/check_diff.sh $(DIFF_ELF)

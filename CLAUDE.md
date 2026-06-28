@@ -22,8 +22,10 @@ All roadmap milestones (M0–M7) are complete, and Part II is under way: the ful
 RV32I base integer set, the RV32M multiply/divide extension, Zicsr/Zifencei (CSR
 access and `fence.i`, M8), the privileged architecture (M/S/U privilege levels
 with exception/trap handling, M9), RV32A atomics (M10), Sv32 virtual memory
-(M12), and a full-system device platform with interrupt delivery (a CLINT
-timer/IPI, a PLIC, and a 16550 UART reached through MMIO, M13) are implemented
+(M12), a full-system device platform with interrupt delivery (a CLINT
+timer/IPI, a PLIC, and a 16550 UART reached through MMIO, M13), and a flattened
+device tree handed to the guest at boot per the RISC-V `a0`=hartid/`a1`=DTB
+convention (M14) are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
@@ -111,6 +113,11 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   qemu `virt` address map, with no CPU/memory dependency — the memory layer
   dispatches accesses here, and the CPU pulls `plat_mip_bits()` (MTIP/MSIP/MEIP)
   each step. `plat_tick` advances `mtime` one tick per CPU step (deterministic).
+- `src/dtb.{h,c}` — the flattened device-tree (FDT) generator (M14): `dtb_build`
+  serialises a standard `.dtb` blob (big-endian header, memory-reservation block,
+  structure block, deduplicated strings) from a `DtbConfig` describing the RAM
+  and the M13 devices — no external `dtc`. A pure serialiser with no machine
+  state; the boot handoff that *uses* it lives in `quanta.c`'s `setup_boot`.
 - `src/decode.h` — shared instruction decoding: field-extraction and
   immediate-decoding helpers, the opcode map, and ABI register names, all
   `static inline`. The executor and the disassembler decode through this, so
@@ -169,7 +176,10 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   loading, `quanta_step`/`quanta_run`, and register/memory accessors. The engine
   core never calls `exit()` on its host — every stop is a `HaltReason` (an
   out-of-range access becomes `HALT_MEM_FAULT`), surfaced through the public
-  `QuantaStatus`/`QuantaHalt` enums. Built as `libquanta.a`; the CLI and
+  `QuantaStatus`/`QuantaHalt` enums. The M14 boot handoff lives here too:
+  `setup_boot` (run only on the ELF path) builds the device tree via `dtb.c`,
+  places it atop guest memory, and sets `a0`=hartid/`a1`=DTB/`sp`-below-DTB;
+  `quanta_dtb_addr` reports where it landed. Built as `libquanta.a`; the CLI and
   `examples/embed.c` are clients of it.
 - `src/gdbstub.{h,c}` — a GDB remote-serial-protocol server over TCP (E9):
   `quanta_gdb_serve(q, port)` listens on localhost, accepts one debugger, and
@@ -217,6 +227,13 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   the right `mcause`, then prints "uart ok" through the UART. Machine-mode CSRs +
   MMIO, so `-march=rv32i_zicsr` and out of `make check-diff`; `make check` pins
   the exit code and `make check-devices` pins the UART output.
+- `tests/test_dtb.S` — the M14 boot suite: plays bootloader, walking the
+  flattened device tree handed over in `a1` token by token (BEGIN_NODE / PROP /
+  END_NODE), reading big-endian fields by hand. It checks `a0`=hartid, the DTB
+  magic/version, recovers the `/memory` reg range and asserts it contains the
+  program, and finds a `uart@` device node. Plain `-march=rv32i`; relies on the
+  boot DTB user-mode qemu does not provide, so it is out of `make check-diff` and
+  pinned by `make check`.
 - `tests/check_disasm.sh` — runs each sample ELF under `--trace` and diffs the
   disassembly against `objdump` (`make check-disasm`).
 - `tests/check_cache.sh` — runs `test_stack` under two cache geometries and
@@ -226,9 +243,10 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   `quanta --quiet` and a reference simulator (qemu-riscv32 by default, override
   with `REF=`) and asserts they agree on stdout and exit code (`make
   check-diff`). Skips cleanly if the reference is absent. The privileged tests
-  (`test_csr`, `test_trap`, `test_priv`, `test_vm`) are excluded — their
-  machine-mode CSR, trap, and paging use trips user-mode qemu's own supervisor;
-  `make check` pins them instead.
+  (`test_csr`, `test_trap`, `test_priv`, `test_vm`, `test_irq`) are excluded —
+  their machine-mode CSR, trap, paging, and MMIO use trips user-mode qemu's own
+  supervisor; `test_dtb` is excluded too (it parses the boot device tree qemu
+  does not supply). `make check` pins them all instead.
 - `tests/arch/` + `tests/check_arch.sh` — the official architectural conformance
   (`make check-arch`, E6). `check_arch.sh` clones the pinned riscv-arch-test
   `old-framework-2.x` branch into `build/`, builds each test with the framework
@@ -391,6 +409,23 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   to interrupts. Addresses follow the qemu `virt` map (CLINT `0x02000000`, PLIC
   `0x0c000000`, UART `0x10000000`). The UART transmit prints straight to stdout
   (like the `write` syscall), so it composes with `--quiet`.
+- Device tree and boot protocol (M14): `dtb.c` *generates* the flattened tree
+  (no external `dtc`, no committed `.dtb`), and `quanta.c`'s `setup_boot` does the
+  handoff — **only on the ELF path**. The raw-image/demo/embed path (`quanta_load_image`)
+  is unchanged: no tree, `a0`/`a1` = 0. Key points: the tree is placed in the
+  top of the loader's 64 KiB stack headroom (so no `elf.c` resizing) and `sp` is
+  moved just below it; `a0` = hartid stays 0 (it already was), and the only
+  register change for existing ELF tests is `a1` = DTB pointer — harmless because
+  they set their own registers and never read `a1` uninitialised (verified across
+  `make check`, `make check-arch`, and `make check-diff`, where Quanta still
+  matches qemu despite qemu supplying no DTB). The `/memory` node reports the real
+  region base — typically `0x7ffff000`, the page the linker puts below `-Ttext`,
+  **not** `0x80000000` — so a reader should believe the tree, not assume the
+  entry address. The root uses `#address-cells`/`#size-cells` = 2, so each `reg`
+  address/size is a *pair* of cells with the high cell 0 on this 32-bit machine.
+  Multi-byte FDT fields are **big-endian** (the one big-endian corner in an
+  otherwise little-endian project). `quanta_dtb_addr` and the CLI banner report
+  where it landed.
 - `--trace` writes to stderr, leaving the guest's own stdout (`write`) clean;
   "changed registers" are recovered by diffing a register snapshot taken around
   `cpu_step`, so the core isn't instrumented. The disassembler prints the common

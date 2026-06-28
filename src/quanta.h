@@ -136,6 +136,10 @@ uint32_t   quanta_fault_addr(const Quanta *q);
 uint32_t quanta_mem_base(const Quanta *q);
 uint32_t quanta_mem_size(const Quanta *q);
 
+/* Physical address of the device tree handed to the guest at boot (in a1), or 0
+ * if none was placed (e.g. a raw image load). See dtb.h. */
+uint32_t quanta_dtb_addr(const Quanta *q);
+
 /* Human-readable name for a halt state. */
 const char *quanta_halt_str(QuantaHalt h);
 

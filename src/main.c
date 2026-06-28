@@ -239,7 +239,10 @@ int main(int argc, char **argv) {
         if (demo) {
             printf("No ELF given; running the built-in demo program.\n\n");
         } else {
-            printf("Loaded %s (entry = 0x%08x, sp = 0x%08x)\n\n", path, entry, sp);
+            /* The loader hands the guest a device tree per the RISC-V boot
+             * contract: a0 = hartid, a1 = dtb (reported here for visibility). */
+            printf("Loaded %s (entry = 0x%08x, sp = 0x%08x, dtb = 0x%08x)\n\n",
+                   path, entry, sp, quanta_dtb_addr(q));
         }
     }
 
