@@ -1,6 +1,7 @@
 #include "cpu.h"
 #include "decode.h"
 #include "syscall.h"
+#include "sbi.h"
 #include "cache.h"
 #include "mmu.h"
 #include "device.h"
@@ -317,8 +318,14 @@ static void csr_write(CPU *cpu, uint32_t addr, uint32_t val) {
  * traps by setting mtvec/stvec. */
 static void legacy_trap(CPU *cpu, uint32_t cause) {
     switch (cause) {
-        case CAUSE_ECALL_U: case CAUSE_ECALL_S: case CAUSE_ECALL_M:
-            syscall_dispatch(cpu); /* may set a0, or halt on exit */
+        case CAUSE_ECALL_S:
+            /* Supervisor mode talks to the firmware below it via the SBI; with
+             * no guest M-mode handler installed, Quanta itself is that firmware
+             * (M15). */
+            sbi_call(cpu);
+            return;
+        case CAUSE_ECALL_U: case CAUSE_ECALL_M:
+            syscall_dispatch(cpu); /* bare U/M programs use the newlib syscall SEE */
             return;
         case CAUSE_BREAKPOINT:
             cpu->halt_reason = HALT_EBREAK;

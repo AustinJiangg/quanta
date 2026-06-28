@@ -9,6 +9,14 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **SBI firmware interface** — Quanta now plays M-mode firmware for a guest that
+  drops to Supervisor mode: an S-mode `ecall` with no guest M-mode handler is
+  serviced as a Supervisor Binary Interface call. The implementation covers the
+  Base extension (version/probe), console putchar/getchar, the TIME `set_timer`,
+  HSM `hart_get_status`, and SRST `system_reset`/shutdown. M/U-mode `ecall`s
+  still reach the newlib syscall layer, so existing programs are unchanged.
+  Pinned by `make check` and a new `make check-sbi` with a bare-metal S-mode
+  `test_sbi` program that prints through the SBI console and shuts down. (M15)
 - **Device tree and boot protocol** — the loader now hands an ELF guest a
   flattened device tree the way RISC-V firmware does: a freshly generated DTB
   (describing the RAM and the CLINT/PLIC/UART, built from scratch with no external

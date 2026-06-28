@@ -54,7 +54,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-devices check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -105,8 +105,9 @@ tests/test_muldiv.elf: RVCFLAGS := $(subst rv32i,rv32im,$(RVCFLAGS))
 tests/test_csr.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr_zifencei,$(RVCFLAGS))
 
 # The M9/M12 privilege + paging tests use trap CSRs, mret/sret, satp and
-# sfence.vma, which need Zicsr; the M13 interrupt test uses the trap CSRs too.
-tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf tests/test_irq.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr,$(RVCFLAGS))
+# sfence.vma, which need Zicsr; the M13 interrupt test uses the trap CSRs too,
+# and the M15 SBI test drops to S-mode via mret.
+tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf tests/test_irq.elf tests/test_sbi.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr,$(RVCFLAGS))
 
 # tests/test_atomic.S uses the RV32A atomics, which the base assembler rejects.
 tests/test_atomic.elf: RVCFLAGS := $(subst rv32i,rv32ia,$(RVCFLAGS))
@@ -153,6 +154,11 @@ check-gdb: $(BIN) tests/hello.elf
 check-devices: $(BIN) tests/test_irq.elf
 	@sh tests/check_devices.sh
 
+# Exercise the M15 SBI: a bare-metal S-mode program must reach a clean exit
+# (system_reset shutdown) and its SBI console output must reach stdout.
+check-sbi: $(BIN) tests/test_sbi.elf
+	@sh tests/check_sbi.sh
+
 # Differential test: compare quanta against a reference simulator (qemu-riscv32
 # by default; override with REF=...) on the sample programs. Skips cleanly if
 # the reference simulator is not installed.
@@ -161,8 +167,9 @@ check-devices: $(BIN) tests/test_irq.elf
 # state (mscratch, mtvec, mret, delegation) that user-mode qemu rejects with
 # SIGILL because it provides its own supervisor. test_dtb is excluded too: it
 # parses the boot device tree Quanta hands over in a1, which user-mode qemu does
-# not supply. `make check` pins them all instead.
-DIFF_ELF := $(filter-out tests/test_csr.elf tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf tests/test_irq.elf tests/test_dtb.elf,$(TEST_ELF))
+# not supply; test_sbi runs in S-mode and calls Quanta's SBI, which user-mode
+# qemu does not provide either. `make check` pins them all instead.
+DIFF_ELF := $(filter-out tests/test_csr.elf tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf tests/test_irq.elf tests/test_dtb.elf tests/test_sbi.elf,$(TEST_ELF))
 
 check-diff: $(BIN) $(TEST_ELF)
 	@sh tests/check_diff.sh $(DIFF_ELF)
@@ -188,7 +195,7 @@ sanitize:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
-		check-devices check-diff
+		check-devices check-sbi check-diff
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
 # the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`
@@ -219,7 +226,7 @@ COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
 
 coverage:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-devices
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi
 	@sh tests/coverage.sh
 
 # Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),

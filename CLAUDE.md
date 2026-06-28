@@ -25,7 +25,8 @@ with exception/trap handling, M9), RV32A atomics (M10), Sv32 virtual memory
 (M12), a full-system device platform with interrupt delivery (a CLINT
 timer/IPI, a PLIC, and a 16550 UART reached through MMIO, M13), and a flattened
 device tree handed to the guest at boot per the RISC-V `a0`=hartid/`a1`=DTB
-convention (M14) are implemented
+convention (M14), and an SBI firmware interface that services an S-mode guest's
+`ecall`s (console, timer, system reset, M15) are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
@@ -60,6 +61,7 @@ make check-cache   # check the cache model on a locality workload (needs cross-t
 make check-pipeline # check the pipeline model on a hazard workload (needs cross-toolchain)
 make check-gdb     # drive the gdb remote stub with a self-contained client (needs python3)
 make check-devices # check the MMIO devices and interrupt delivery (needs cross-toolchain)
+make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-toolchain)
 make check-diff    # differential-test against qemu-riscv32 (needs qemu-user-static)
 make check-arch    # official riscv-arch-test conformance (needs cross-toolchain + clone)
 make sanitize      # build with ASan+UBSan and run the suite (needs cross-toolchain)
@@ -170,7 +172,15 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   locate `begin_signature`/`end_signature`, and surfaced as `quanta_elf_symbol`.
 - `src/syscall.{h,c}` — the system-call layer (the "kernel" side of ECALL):
   dispatches on the `a7` syscall number and implements `write` and `exit` per
-  the RISC-V Linux/newlib ABI.
+  the RISC-V Linux/newlib ABI. Reached by the SEE for `ecall`s from M/U mode; an
+  S-mode `ecall` goes to the SBI instead (see `sbi.c`).
+- `src/sbi.{h,c}` — the SBI firmware interface (M15): the "firmware" side of an
+  S-mode `ecall`. `sbi_call` dispatches on the extension id (`a7`) and function
+  id (`a6`) and implements the Base extension (probe/version), console
+  putchar/getchar, TIME `set_timer`, HSM `hart_get_status`, and SRST
+  `system_reset`/shutdown (which halts the machine). Self-contained — it only
+  reads/writes the hart's registers and, for `set_timer`, the CLINT; the SEE in
+  `cpu.c` routes S-mode `ecall`s here when no guest M-mode handler is installed.
 - `src/quanta.{h,c}` — the public `libquanta` engine API: an opaque `Quanta *`
   handle wrapping CPU + memory + the optional cache, with lifecycle, ELF/raw-image
   loading, `quanta_step`/`quanta_run`, and register/memory accessors. The engine
@@ -234,6 +244,13 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   program, and finds a `uart@` device node. Plain `-march=rv32i`; relies on the
   boot DTB user-mode qemu does not provide, so it is out of `make check-diff` and
   pinned by `make check`.
+- `tests/test_sbi.S` — the M15 SBI suite: a bare-metal program that `mret`s into
+  Supervisor mode and then reaches the machine only through the SBI — probing the
+  Base extension, arming `set_timer`, printing "sbi ok" through the SBI console,
+  and shutting down via SRST `system_reset` (a clean exit). An unexpected SBI
+  error falls to `ebreak` and a non-zero exit. Uses M-mode CSRs + `mret`, so
+  `-march=rv32i_zicsr` and out of `make check-diff`; `make check` pins the exit
+  code and `make check-sbi` pins the console output.
 - `tests/check_disasm.sh` — runs each sample ELF under `--trace` and diffs the
   disassembly against `objdump` (`make check-disasm`).
 - `tests/check_cache.sh` — runs `test_stack` under two cache geometries and
@@ -272,6 +289,10 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   "done when": a clean exit (timer, IPI, and PLIC external interrupts all fired)
   and the UART's "uart ok" reaching stdout (`make check-devices`). Also run under
   `make sanitize` and `make coverage`.
+- `tests/check_sbi.sh` — runs `test_sbi` and asserts both halves of M15's "done
+  when": a clean exit (the S-mode program made its SBI calls and shut down via
+  SRST) and the SBI console's "sbi ok" reaching stdout (`make check-sbi`). Also
+  run under `make sanitize` and `make coverage`.
 - `tests/coverage.sh` — collects gcov line coverage after an instrumented build
   (`make coverage`): prefers lcov (HTML under `build/coverage`) and falls back to
   plain gcov. Observability only, like the cache/pipeline overlays.
@@ -426,6 +447,22 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   Multi-byte FDT fields are **big-endian** (the one big-endian corner in an
   otherwise little-endian project). `quanta_dtb_addr` and the CLI banner report
   where it landed.
+- SBI and the SEE split (M15): the built-in SEE (`legacy_trap` in `cpu.c`, taken
+  when a trap finds no guest handler — `*tvec` still 0) now routes `ecall` by
+  **originating privilege**: an **S-mode** `ecall` (cause 9) goes to `sbi_call`
+  (`sbi.c`, Quanta acting as M-mode firmware), while **M/U-mode** `ecall`s
+  (causes 11/8) keep going to the newlib `syscall_dispatch` (`write`/`exit`). So
+  every pre-M15 program — all of which run in M-mode — is unchanged; only a guest
+  that deliberately drops to S-mode reaches the SBI. Consequence of the model:
+  the SBI is available **only while `mtvec` is 0**. On real hardware `mtvec`
+  points at the firmware (OpenSBI), which *is* the SBI; here Quanta is that
+  firmware precisely when the guest has installed no M-mode handler, so a guest
+  cannot have both its own M-mode trap handler and the SBI. SBI console output
+  goes straight to stdout (like the UART and the `write` syscall), so it composes
+  with `--quiet`. `set_timer` programs the CLINT comparator but full supervisor-
+  *timer* delivery (firmware relaying MTIP to the OS as STIP) is not modelled yet
+  — a guest that arms a near-future timer and enables MTIE in S-mode would vector
+  to the zero `mtvec`; keep timers parked far ahead until the OS-boot milestones.
 - `--trace` writes to stderr, leaving the guest's own stdout (`write`) clean;
   "changed registers" are recovered by diffing a register snapshot taken around
   `cpu_step`, so the core isn't instrumented. The disassembler prints the common

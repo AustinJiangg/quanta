@@ -671,16 +671,39 @@ covers its disassembly).
 
 ### Stage 3 — Boot an OS (RV32 trophy) (M15–M16)
 
-## M15 — Bare-metal S-mode + SBI
+## M15 — Bare-metal S-mode + SBI (DONE)
 
-- [ ] **Build:** an SBI implementation (timer, console putchar/getchar, hart
+The supervisor/firmware boundary: how an OS reaches the machine without owning
+M-mode. A supervisor-mode kernel does not program the lowest-level hardware
+itself; it calls down to the firmware (M-mode) through the **SBI** — a
+register-based RPC layered on `ecall` (extension id in `a7`, function id in `a6`,
+args in `a0`-`a5`, an `(error, value)` pair back in `a0`/`a1`). `src/sbi.{h,c}`
+implements that firmware side from scratch: the Base extension (spec version,
+implementation id, `probe_extension`), legacy console putchar/getchar, the TIME
+`set_timer`, HSM `hart_get_status`, and SRST `system_reset`/legacy shutdown
+(which stops the machine via `HALT_EXIT`). The hook is one line in the SEE: a
+trap with no guest M-mode handler (`mtvec` still 0 — `mtvec` belongs to the
+firmware, which here is Quanta) routes an **S-mode** `ecall` to `sbi_call`, while
+M/U-mode `ecall`s keep reaching the newlib syscall layer as before. So existing
+bare programs are untouched, and a guest that drops to S-mode gets a real
+firmware interface. `tests/test_sbi.S` is the bare-metal S-mode program: it
+`mret`s into Supervisor mode, probes the Base extension, arms `set_timer`, prints
+"sbi ok" through the SBI console, and shuts down via SRST — a clean exit pinned
+by `make check`, the console output by `make check-sbi`. Being S-mode + SBI
+(which user-mode qemu does not provide), it stays out of `make check-diff`.
+Running OpenSBI in emulated M-mode was the alternative; implementing a small SBI
+directly keeps the from-scratch ethos and needs no external firmware blob. (Full
+supervisor-*timer* delivery — the firmware relaying MTIP to the OS as STIP — is
+left for the OS-boot milestones.)
+
+- [x] **Build:** an SBI implementation (timer, console putchar/getchar, hart
   ops) so S-mode software has a firmware interface — or run OpenSBI in emulated
   M-mode.
-- [ ] **ISA:** none new — the SEE/SBI contract over ECALL.
-- [ ] **Concept:** the supervisor/firmware boundary; what an SEE provides.
-- [ ] **Done when:** a bare-metal S-mode program prints via the SBI console and
+- [x] **ISA:** none new — the SEE/SBI contract over ECALL.
+- [x] **Concept:** the supervisor/firmware boundary; what an SEE provides.
+- [x] **Done when:** a bare-metal S-mode program prints via the SBI console and
   exits.
-- [ ] **Commits:** `feat: add an sbi implementation`,
+- [x] **Commits:** `feat: add an sbi implementation`,
   `test: boot a bare-metal s-mode program`.
 
 ## M16 — Boot a small RV32 OS
