@@ -111,6 +111,7 @@ typedef struct {
     uint64_t instret;       /* retired-instruction count; backs the counter CSRs */
     uint32_t priv;          /* current privilege: PRIV_U / PRIV_S / PRIV_M */
     int      trapped;       /* set within a step when a trap redirected the PC */
+    int      sbi_timer_armed; /* SBI set_timer set a deadline the firmware watches */
     int      reserve_valid; /* RV32A: an LR.W set a reservation still held */
     uint32_t reserve_addr;  /* RV32A: physical word the reservation covers */
     TlbEntry tlb[TLB_ENTRIES]; /* M12: cached Sv32 translations */
@@ -132,6 +133,13 @@ void reg_write(CPU *cpu, uint32_t i, uint32_t value);
  * or to a branch/jump target). On a memory fault it records HALT_MEM_FAULT and
  * stops instead of advancing. */
 void cpu_step(CPU *cpu);
+
+/* Arm the supervisor timer on behalf of the SBI (M15 follow-up): set the CLINT
+ * comparator to `deadline`, clear any pending supervisor timer interrupt, and
+ * mark the deadline for the firmware to watch. When it is reached, the firmware
+ * raises the supervisor timer interrupt (STIP) so an S-mode OS can take a tick —
+ * the role real firmware plays relaying the machine timer to the supervisor. */
+void cpu_arm_supervisor_timer(CPU *cpu, uint64_t deadline);
 
 /* A short human-readable name for a halt reason, for diagnostics. */
 const char *halt_reason_str(HaltReason r);

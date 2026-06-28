@@ -1,7 +1,6 @@
 #include "sbi.h"
 
 #include "quanta.h"   /* QUANTA_VERSION_* for the implementation version */
-#include "device.h"   /* the CLINT, programmed by set_timer */
 
 #include <stdio.h>
 
@@ -61,12 +60,11 @@ static void sbi_halt(CPU *cpu) {
     cpu->halted      = 1;
 }
 
-/* Program the CLINT timer comparator (low/high words of a 64-bit value). Arming
- * it far ahead leaves the machine timer quiet; full supervisor-timer *delivery*
- * (the firmware relaying MTIP to the OS as STIP) is left for a later milestone. */
+/* Set the next timer deadline (low/high words of a 64-bit value). The firmware
+ * (cpu.c) watches it and, when mtime reaches it, delivers a supervisor timer
+ * interrupt (STIP) to the OS — and clears any previous one here. */
 static void sbi_set_timer(CPU *cpu, uint32_t lo, uint32_t hi) {
-    if (cpu->mem->plat)
-        cpu->mem->plat->clint.mtimecmp = ((uint64_t)hi << 32) | lo;
+    cpu_arm_supervisor_timer(cpu, ((uint64_t)hi << 32) | lo);
 }
 
 /* Is `eid` an extension this firmware implements? Backs base probe_extension. */

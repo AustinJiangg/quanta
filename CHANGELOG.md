@@ -9,6 +9,13 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **SBI supervisor-timer delivery** — `sbi_set_timer` now drives a real
+  supervisor timer interrupt: the firmware records the deadline and, when the
+  CLINT reaches it, raises the supervisor timer pending bit (STIP) for the OS to
+  take at `stvec` (once it has delegated via `mideleg` and enabled
+  `sie.STIE`/`sstatus.SIE`) — the machine-timer-to-supervisor relay real firmware
+  performs, without a literal M-mode trap round-trip. Inert unless a guest calls
+  SBI `set_timer`. Pinned by `make check` with a `test_stimer` tick loop. (M15)
 - **SBI firmware interface** — Quanta now plays M-mode firmware for a guest that
   drops to Supervisor mode: an S-mode `ecall` with no guest M-mode handler is
   serviced as a Supervisor Binary Interface call. The implementation covers the

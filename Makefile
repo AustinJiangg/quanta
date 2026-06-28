@@ -107,7 +107,7 @@ tests/test_csr.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr_zifencei,$(RVCFLAGS))
 # The M9/M12 privilege + paging tests use trap CSRs, mret/sret, satp and
 # sfence.vma, which need Zicsr; the M13 interrupt test uses the trap CSRs too,
 # and the M15 SBI test drops to S-mode via mret.
-tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf tests/test_irq.elf tests/test_sbi.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr,$(RVCFLAGS))
+tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf tests/test_irq.elf tests/test_sbi.elf tests/test_stimer.elf: RVCFLAGS := $(subst rv32i,rv32i_zicsr,$(RVCFLAGS))
 
 # tests/test_atomic.S uses the RV32A atomics, which the base assembler rejects.
 tests/test_atomic.elf: RVCFLAGS := $(subst rv32i,rv32ia,$(RVCFLAGS))
@@ -169,7 +169,7 @@ check-sbi: $(BIN) tests/test_sbi.elf
 # parses the boot device tree Quanta hands over in a1, which user-mode qemu does
 # not supply; test_sbi runs in S-mode and calls Quanta's SBI, which user-mode
 # qemu does not provide either. `make check` pins them all instead.
-DIFF_ELF := $(filter-out tests/test_csr.elf tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf tests/test_irq.elf tests/test_dtb.elf tests/test_sbi.elf,$(TEST_ELF))
+DIFF_ELF := $(filter-out tests/test_csr.elf tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf tests/test_irq.elf tests/test_dtb.elf tests/test_sbi.elf tests/test_stimer.elf,$(TEST_ELF))
 
 check-diff: $(BIN) $(TEST_ELF)
 	@sh tests/check_diff.sh $(DIFF_ELF)

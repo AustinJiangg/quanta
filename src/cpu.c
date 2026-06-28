@@ -53,6 +53,7 @@ void cpu_init(CPU *cpu, Memory *mem, uint32_t entry_pc) {
     cpu->instret     = 0;
     cpu->priv        = PRIV_M; /* the hart resets into Machine mode */
     cpu->trapped     = 0;
+    cpu->sbi_timer_armed = 0;
     cpu->reserve_valid = 0;
     cpu->reserve_addr  = 0;
     mmu_flush(cpu); /* invalidate the TLB */
@@ -449,6 +450,31 @@ static int take_interrupt(CPU *cpu) {
     return 0;
 }
 
+/* Arm the supervisor timer for the SBI (see cpu.h). Program the CLINT
+ * comparator, clear any pending supervisor timer interrupt (the OS is setting a
+ * fresh deadline), and flag it so firmware_timer_tick converts it to STIP once
+ * mtime reaches it. */
+void cpu_arm_supervisor_timer(CPU *cpu, uint64_t deadline) {
+    if (cpu->mem->plat) cpu->mem->plat->clint.mtimecmp = deadline;
+    cpu->csr[CSR_MIP] &= ~(1u << IRQ_STIMER);
+    cpu->sbi_timer_armed = 1;
+}
+
+/* The firmware's job each step: once an SBI-armed deadline is reached (the CLINT
+ * asserts MTIP), raise the supervisor timer pending bit (STIP) and disarm — a
+ * one-shot the OS re-arms with its next SBI set_timer. This is what M-mode
+ * firmware does relaying the machine timer to the supervisor, modelled without a
+ * literal trap round-trip: the machine timer is never delivered (an SBI guest
+ * leaves mie.MTIE clear), only its STIP shadow, which take_interrupt then routes
+ * to S-mode when the OS has delegated and enabled it. */
+static void firmware_timer_tick(CPU *cpu) {
+    if (!cpu->sbi_timer_armed) return;
+    if (plat_mip_bits(cpu->mem->plat) & MIP_MTIP) {
+        cpu->csr[CSR_MIP] |= (1u << IRQ_STIMER);
+        cpu->sbi_timer_armed = 0;
+    }
+}
+
 /* Execute a Zicsr instruction: an atomic read-modify-write of one CSR.
  *
  * Every form reads the old CSR value into rd and then updates the CSR; they
@@ -654,6 +680,7 @@ void cpu_step(CPU *cpu) {
      * and retires nothing, so we return without fetching. */
     if (cpu->mem->plat) {
         plat_tick(cpu->mem->plat);
+        firmware_timer_tick(cpu); /* convert a reached SBI deadline into STIP */
         if (take_interrupt(cpu)) return;
     }
 

@@ -692,9 +692,15 @@ firmware interface. `tests/test_sbi.S` is the bare-metal S-mode program: it
 by `make check`, the console output by `make check-sbi`. Being S-mode + SBI
 (which user-mode qemu does not provide), it stays out of `make check-diff`.
 Running OpenSBI in emulated M-mode was the alternative; implementing a small SBI
-directly keeps the from-scratch ethos and needs no external firmware blob. (Full
-supervisor-*timer* delivery — the firmware relaying MTIP to the OS as STIP — is
-left for the OS-boot milestones.)
+directly keeps the from-scratch ethos and needs no external firmware blob.
+
+Supervisor-*timer* delivery — the firmware relaying the machine timer to the OS
+as a supervisor timer interrupt (STIP) — landed next as an enabler for the
+OS-boot milestones: `cpu_arm_supervisor_timer` records the SBI deadline, and a
+per-step `firmware_timer_tick` raises STIP once the CLINT reaches it, which an
+S-mode OS takes at `stvec` when it has delegated (`mideleg`) and enabled it.
+`tests/test_stimer.S` drives a tick loop through it — three supervisor timer
+interrupts, each re-armed via SBI `set_timer`, then a clean SRST shutdown.
 
 - [x] **Build:** an SBI implementation (timer, console putchar/getchar, hart
   ops) so S-mode software has a firmware interface — or run OpenSBI in emulated

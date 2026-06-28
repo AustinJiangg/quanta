@@ -251,6 +251,12 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   error falls to `ebreak` and a non-zero exit. Uses M-mode CSRs + `mret`, so
   `-march=rv32i_zicsr` and out of `make check-diff`; `make check` pins the exit
   code and `make check-sbi` pins the console output.
+- `tests/test_stimer.S` — the SBI supervisor-timer suite (M15 follow-up): a boot
+  shim delegates the supervisor timer (`mideleg`), installs `stvec`, and drops to
+  S-mode; the S-mode loop arms SBI `set_timer` and takes three supervisor timer
+  interrupts (each handler re-arms), then shuts down via SRST. Proves the
+  firmware STIP relay end to end. `-march=rv32i_zicsr`, out of `make check-diff`,
+  pinned by `make check`.
 - `tests/check_disasm.sh` — runs each sample ELF under `--trace` and diffs the
   disassembly against `objdump` (`make check-disasm`).
 - `tests/check_cache.sh` — runs `test_stack` under two cache geometries and
@@ -459,10 +465,20 @@ the M9/M12 privilege and paging tests `-march=rv32i_zicsr`, and the RV32A test
   firmware precisely when the guest has installed no M-mode handler, so a guest
   cannot have both its own M-mode trap handler and the SBI. SBI console output
   goes straight to stdout (like the UART and the `write` syscall), so it composes
-  with `--quiet`. `set_timer` programs the CLINT comparator but full supervisor-
-  *timer* delivery (firmware relaying MTIP to the OS as STIP) is not modelled yet
-  — a guest that arms a near-future timer and enables MTIE in S-mode would vector
-  to the zero `mtvec`; keep timers parked far ahead until the OS-boot milestones.
+  with `--quiet`.
+- SBI supervisor-timer delivery: `set_timer` routes through
+  `cpu_arm_supervisor_timer` (cpu.c), which programs the CLINT comparator, clears
+  any pending supervisor timer (STIP), and arms `sbi_timer_armed`. Each step
+  `firmware_timer_tick` watches for the CLINT to assert MTIP and then raises STIP
+  (a one-shot, re-armed by the next `set_timer`) — the firmware relaying the
+  machine timer to the supervisor *without* a literal M-mode trap round-trip. The
+  machine timer itself is never delivered (an SBI guest leaves `mie.MTIE` clear,
+  so MTIP — perpetually asserted once mtime passes the comparator — is harmless);
+  only its STIP shadow reaches S-mode, and only when the guest delegates it
+  (`mideleg` bit 5) and enables `sie.STIE`/`sstatus.SIE`. The mechanism is inert
+  unless a guest calls SBI `set_timer` (so `test_irq`'s machine-timer path, which
+  arms the CLINT via MMIO and never touches the SBI, is unaffected). `test_stimer`
+  pins the whole shuttle.
 - `--trace` writes to stderr, leaving the guest's own stdout (`write`) clean;
   "changed registers" are recovered by diffing a register snapshot taken around
   `cpu_step`, so the core isn't instrumented. The disassembler prints the common
