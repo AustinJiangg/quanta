@@ -130,6 +130,7 @@ enum {
     CSR_SCOUNTEREN = 0x106,
     CSR_SSCRATCH   = 0x140, CSR_SEPC    = 0x141, CSR_SCAUSE  = 0x142,
     CSR_STVAL      = 0x143, CSR_SIP     = 0x144,
+    CSR_STIMECMP   = 0x14d, CSR_STIMECMPH = 0x15d, /* Sstc supervisor timer (M18) */
     CSR_SATP       = 0x180, /* address-translation root: Sv32 (M12) / Sv39 (M18) */
 
     /* Machine information (read-only). */
@@ -140,6 +141,7 @@ enum {
     CSR_MSTATUS    = 0x300, CSR_MISA    = 0x301, CSR_MEDELEG = 0x302,
     CSR_MIDELEG    = 0x303, CSR_MIE     = 0x304, CSR_MTVEC   = 0x305,
     CSR_MCOUNTEREN = 0x306, CSR_MSTATUSH = 0x310,
+    CSR_MENVCFG    = 0x30a, CSR_MENVCFGH = 0x31a, /* env config: Sstc STCE (M18) */
     CSR_MSCRATCH   = 0x340, CSR_MEPC    = 0x341, CSR_MCAUSE  = 0x342,
     CSR_MTVAL      = 0x343, CSR_MIP     = 0x344
 };

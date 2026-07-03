@@ -834,19 +834,38 @@ test_rv64_vm.S` is the Sv39 conformance test: it hand-builds a three-level table
 proves non-identity translation through the full walk (two VAs aliased to one
 frame), the hardware dirty bit, and a load page fault from a VA whose walk
 reaches the last level with no leaf — the RV64 analogue of the Sv32 `test_vm.S`,
-quanta-only (S-mode + satp, so out of the qemu differential). Still open: booting
-a mainstream OS (xv6-riscv, then Linux + OpenSBI) on top of it — the milestone's
-trophy, which also needs the DTB to advertise `mmu-type = "riscv,sv39"` and far
-longer run lengths.
+quanta-only (S-mode + satp, so out of the qemu differential).
+
+**OS-boot work — xv6-riscv scoped, first enablers landing.** The mainstream-OS
+target was scoped against upstream `mit-pdos/xv6-riscv`, and it fits Quanta well:
+xv6 builds with `-bios none`, so qemu enters it *in M-mode at 0x80000000* — exactly
+how Quanta enters every ELF — and it drops to S-mode itself in `start.c`, needing
+neither OpenSBI nor even Quanta's SBI. Its devices are the qemu `virt` CLINT/PLIC/
+UART Quanta already models, its 128 MiB fits `--memory`, and its PMP writes are
+inert against our unenforced-PMP model (they only grant S-mode full access, which
+we already allow). The gaps, in order: **(1) the Sstc supervisor-timer extension**
+— xv6's `start.c` sets `menvcfg.STCE` and arms `stimecmp` directly rather than
+using a firmware relay; **DONE** (`sstc_tick` in cpu.c, `tests/rv64/test_rv64_sstc.S`).
+**(2)** UART receive (stdin → RX interrupt) for an interactive shell, and a
+`--disk=fs.img` backend. **(3)** the crux — a **virtio-mmio (modern, v2) block
+device** with one split virtqueue, since xv6's root filesystem (and thus `/init`
+and the shell) lives on a virtio disk; the driver is deterministic-friendly
+(process the descriptor chain synchronously on `QUEUE_NOTIFY`, then assert PLIC
+IRQ 1 — safe because xv6 holds `vdisk_lock` with interrupts off until it sleeps).
+Then: build xv6 integer-only (`rv64imac`, no F/D), `CPUS=1`, and boot to the shell.
+Linux + OpenSBI (needing a fuller SBI, a `mmu-type = "riscv,sv39"` DTB, and far
+longer runs) follows xv6.
 
 - [x] **Build (paging):** the three-level Sv39 page-table scheme (a
   descriptor-parameterised generalisation of the Sv32 walk).
-- [ ] **Build (OS boot):** boot xv6-riscv and a standard Linux + OpenSBI.
-- [x] **ISA:** Sv39 address translation.
+- [ ] **Build (OS boot):** boot xv6-riscv, then Linux + OpenSBI. *In progress:*
+  Sstc timer done; virtio-blk + UART-RX + disk backend next.
+- [x] **ISA:** Sv39 address translation; Sstc (`stimecmp`/`menvcfg.STCE`).
 - [ ] **Concept:** deeper page-table hierarchies; a real distro's boot
   requirements.
 - [ ] **Done when:** xv6-riscv reaches its shell; Linux boots to userspace.
-- [x] **Commits:** `feat: add sv39 paging`. Still to come: `test: boot xv6-riscv`,
+- [x] **Commits:** `feat: add sv39 paging`, `feat: add sstc supervisor timer`.
+  Still to come: `feat: add virtio-mmio block device`, `test: boot xv6-riscv`,
   `test: boot linux`.
 
 ## M19 — SMP multi-hart (stretch)

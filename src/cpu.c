@@ -634,6 +634,28 @@ static void firmware_timer_tick(CPU *cpu) {
     }
 }
 
+/* menvcfg.STCE (bit 63): enables the Sstc extension's supervisor timer compare. */
+#define MENVCFG_STCE ((uint64_t)1 << 63)
+
+/* Sstc: when menvcfg.STCE is set, the supervisor timer interrupt (STIP) is a
+ * hardware-driven shadow of stimecmp — pending exactly while time >= stimecmp,
+ * with no SBI call or M-mode relay. So each step we recompute STIP directly from
+ * stimecmp, overriding software (under Sstc, STIP is read-only to S-mode). This
+ * is the path an OS booted without firmware uses (e.g. xv6 with -bios none):
+ * writing stimecmp arms the next tick, and it fires when the counter catches up.
+ *
+ * The counter compared is our `time` CSR, which reads back the retired-instruction
+ * count (see csr_read) — so `rdtime` and the deadline stay on one clock. STCE
+ * gates the whole thing, so an SBI guest (STCE clear) keeps the firmware_timer_tick
+ * path and its own software STIP untouched. */
+static void sstc_tick(CPU *cpu) {
+    if (!(cpu->csr[CSR_MENVCFG] & MENVCFG_STCE)) return;
+    if (cpu->instret >= cpu->csr[CSR_STIMECMP])
+        cpu->csr[CSR_MIP] |=  (1u << IRQ_STIMER);
+    else
+        cpu->csr[CSR_MIP] &= ~(1u << IRQ_STIMER);
+}
+
 /* Execute a Zicsr instruction: an atomic read-modify-write of one CSR.
  *
  * Every form reads the old CSR value into rd and then updates the CSR; they
@@ -659,13 +681,22 @@ static void exec_csr(CPU *cpu, uint32_t inst) {
     int reads  = ((f3 & 0x3) != 0x1) || (rd(inst) != 0);
     uint64_t old = 0;
 
-    /* The RV32-only high halves (counters + mstatush) do not exist on RV64. */
+    /* The RV32-only high halves (counters, mstatush, and the Sstc/env-config high
+     * words) do not exist on RV64. */
     int rv32_only_csr = (addr == CSR_CYCLEH || addr == CSR_TIMEH ||
-                         addr == CSR_INSTRETH || addr == CSR_MSTATUSH);
+                         addr == CSR_INSTRETH || addr == CSR_MSTATUSH ||
+                         addr == CSR_MENVCFGH || addr == CSR_STIMECMPH);
+
+    /* Sstc: stimecmp is accessible from S-mode only when menvcfg.STCE is set
+     * (M-mode always reaches it). Without that, S-mode access is illegal. */
+    int sstc_denied = (addr == CSR_STIMECMP || addr == CSR_STIMECMPH) &&
+                      cpu->priv == PRIV_S &&
+                      !(cpu->csr[CSR_MENVCFG] & MENVCFG_STCE);
 
     if (cpu->priv < ((addr >> 8) & 0x3) ||           /* insufficient privilege */
         (writes && ((addr >> 10) & 0x3) == 0x3) ||   /* write to a read-only CSR */
-        (cpu->xlen == 64 && rv32_only_csr)) {        /* RV32-only CSR on RV64 */
+        (cpu->xlen == 64 && rv32_only_csr) ||        /* RV32-only CSR on RV64 */
+        sstc_denied) {                               /* stimecmp without Sstc */
         raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst);
         return;
     }
@@ -872,6 +903,7 @@ void cpu_step(CPU *cpu) {
     if (cpu->mem->plat) {
         plat_tick(cpu->mem->plat);
         firmware_timer_tick(cpu); /* convert a reached SBI deadline into STIP */
+        sstc_tick(cpu);           /* or drive STIP directly from stimecmp (Sstc) */
         if (take_interrupt(cpu)) return;
     }
 

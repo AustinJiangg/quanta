@@ -3,10 +3,10 @@
 # exits 0 — meaning every one of its CHECKs passed. The user-mode programs are
 # additionally cross-checked against qemu-riscv64, the golden-model safety net for
 # the RV64 ISA (the RV64 analogue of `make check-diff`): quanta and qemu must
-# agree on stdout and exit code. The privileged programs (*_priv, *_vm) use
-# machine-mode CSRs, traps, and Sv39 paging that user-mode qemu rejects, so they
-# are quanta-only, exactly like the RV32 privileged tests are excluded from
-# check-diff.
+# agree on stdout and exit code. The privileged programs (*_priv, *_vm, *_sstc)
+# use machine-mode CSRs, traps, Sv39 paging, and the Sstc timer that user-mode
+# qemu rejects, so they are quanta-only, exactly like the RV32 privileged tests
+# are excluded from check-diff.
 #
 # Skips the qemu differential cleanly if qemu-riscv64 is not installed.
 
@@ -28,7 +28,7 @@ for elf in "$@"; do
     fi
 
     case "$elf" in
-    *_priv.elf|*_vm.elf)
+    *_priv.elf|*_vm.elf|*_sstc.elf)
         echo "OK    $elf (quanta exit 0; supervisor/paging, no qemu differential)"
         ;;
     *)

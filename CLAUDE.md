@@ -32,9 +32,11 @@ convention (M14), an SBI firmware interface that services an S-mode guest's
 kernel that boots to userspace on all of it (`tests/os/`, `make check-os`, M16),
 and the **RV64 transition** — a runtime-XLEN core that also runs RV64IMAC,
 selected per program from the ELF class (M17, `tests/rv64/`, `make check-rv64`,
-differential-tested against `qemu-riscv64`; RV32F/D stay deferred), and **Sv39
-virtual memory** on RV64 — the three-level page-table walk, sharing the walker
-with Sv32 (M18, `tests/rv64/test_rv64_vm.S`) — are implemented
+differential-tested against `qemu-riscv64`; RV32F/D stay deferred), and the start
+of **M18** — **Sv39 virtual memory** on RV64 (the three-level page-table walk,
+sharing the walker with Sv32, `tests/rv64/test_rv64_vm.S`) and the **Sstc**
+supervisor-timer extension (`stimecmp`/`menvcfg.STCE`, `tests/rv64/test_rv64_sstc.S`),
+both steps toward booting a mainstream OS — are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
@@ -415,11 +417,13 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
 - The RV64 conformance suite is `tests/rv64/` (own Makefile rule, built
   `-march=rv64imac_zicsr -mabi=lp64`, so the RV32 `tests/*.S` glob never touches
   it), run by `make check-rv64` — quanta exit-0 plus a `qemu-riscv64` differential
-  on the user-mode programs. The supervisor/paging programs — `*_priv` and
+  on the user-mode programs. The supervisor/paging programs — `*_priv`,
   `test_rv64_vm` (the M18 Sv39 test: a hand-built three-level table, aliasing,
   the hardware dirty bit, and a deep-miss load page fault, mirroring the RV32
-  `test_vm.S`) — are quanta-only (user-mode qemu rejects their M-mode CSRs and
-  satp), excluded from the differential like the RV32 privileged tests are from
+  `test_vm.S`), and `test_rv64_sstc` (the M18 Sstc timer test: three supervisor
+  timer interrupts driven by `stimecmp`, mirroring `test_stimer`) — are
+  quanta-only (user-mode qemu rejects their M-mode CSRs, satp, and Sstc),
+  excluded from the differential like the RV32 privileged tests are from
   `check-diff`. `test_rv64_priv.S` is built **without C** (`rv64ima_zicsr`)
   because its trap handler advances `mepc` by a fixed 4, so its `ebreak` must
   stay 4-byte (the same reason the RV32 `test_trap.S` avoids C); `test_rv64_vm.S`
@@ -609,6 +613,21 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   unless a guest calls SBI `set_timer` (so `test_irq`'s machine-timer path, which
   arms the CLINT via MMIO and never touches the SBI, is unaffected). `test_stimer`
   pins the whole shuttle.
+- Sstc supervisor-timer delivery (M18, xv6 enabler): the *other* way to reach
+  STIP, used by an OS that owns M-mode and wants no firmware round-trip (e.g. xv6
+  booted `-bios none`). When `menvcfg.STCE` (bit 63) is set, `sstc_tick` (cpu.c,
+  per step) makes STIP a hardware shadow of the `stimecmp` CSR (0x14D) — pending
+  exactly while `time >= stimecmp`, overriding software (under Sstc, STIP is
+  read-only to S-mode). Writing `stimecmp` arms the next tick; it fires when the
+  counter catches up. The clock compared is the `time` CSR (our retired-instruction
+  count), so `rdtime` and the deadline share one clock. `STCE` gates the whole
+  thing: clear (every pre-M18 guest, and any SBI guest) leaves `firmware_timer_tick`
+  and software STIP untouched, so the SBI path and Sstc never fight — a guest uses
+  one or the other. `stimecmp` is accessible from S-mode only when `STCE` is set
+  (else illegal); M-mode always reaches it. The RV32 high halves (`stimecmph`
+  0x15D, `menvcfgh` 0x31A) trap illegal on RV64 like the other `*h` CSRs.
+  `tests/rv64/test_rv64_sstc.S` pins it (three ticks, each handler re-arming
+  `stimecmp`), the Sstc analogue of `test_stimer`'s SBI shuttle.
 - Booting an OS (M16, `tests/os/`): the teaching kernel is *entered in M-mode*
   (Quanta's loader enters every ELF in M-mode), and its `boot.S` does the
   drop-to-S itself — the same pattern `test_sbi`/`test_stimer` use — rather than
