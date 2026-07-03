@@ -75,6 +75,7 @@ make check-pipeline # check the pipeline model on a hazard workload (needs cross
 make check-gdb     # drive the gdb remote stub with a self-contained client (needs python3)
 make check-devices # check the MMIO devices and interrupt delivery (needs cross-toolchain)
 make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-toolchain)
+make check-uart-rx # check UART receive (piped stdin) and the --disk backend (M18)
 make check-os      # boot the M16 teaching kernel to userspace (needs cross-toolchain)
 make check-rv64    # RV64IMAC conformance (tests/rv64/), diff vs qemu-riscv64 (M17)
 make check-diff    # differential-test against qemu-riscv32 (needs qemu-user-static)
@@ -101,10 +102,16 @@ not combine with `--trace`/`--pipeline`. Add `--memory=SIZE` (bytes, with an
 optional `K`/`M`/`G` suffix, e.g. `--memory=8M`) to grow the guest RAM region
 beyond its ELF image — spare RAM lands above the image for an OS-style guest to
 manage, and the boot DTB advertises the real size (`tests/os/` needs it). Add
+`--disk=FILE` to attach a raw block-device image (read wholly into memory, for a
+future virtio-mmio block device to serve — an OS's root filesystem). Add
 `--signature=FILE` to dump the
 architectural-test signature region (the words between the
 `begin_signature`/`end_signature` ELF symbols, in the suite's reference format) —
-what makes Quanta a drop-in `make check-arch` target.
+what makes Quanta a drop-in `make check-arch` target. While a guest runs, host
+stdin is pumped into the UART's receive path (checked by a zero-timeout `select`,
+so the shared stdin flags are never mutated), giving a full-system guest a
+keyboard; the terminal is left in its normal (cooked, echoing) mode for now —
+proper raw mode is deferred to the interactive-console work.
 
 Debugging the emulator: `make debug && gdb ./quanta`. Note the two-level
 structure — gdb debugs the emulator (x86), which internally "runs" a RISC-V
@@ -131,10 +138,14 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   dispatches device accesses to `device.c`, otherwise hits the flat RAM array.
 - `src/device.{h,c}` — the MMIO device models (M13): a CLINT (`mtime`/`mtimecmp`
   timer + `msip` IPI), a PLIC (priority/enable/threshold + claim/complete), and a
-  16550 UART (transmit prints to stdout). Self-contained register files on the
-  qemu `virt` address map, with no CPU/memory dependency — the memory layer
-  dispatches accesses here, and the CPU pulls `plat_mip_bits()` (MTIP/MSIP/MEIP)
-  each step. `plat_tick` advances `mtime` one tick per CPU step (deterministic).
+  16550 UART (transmit prints to stdout; receive via `plat_uart_rx`, which buffers
+  a host byte and — with RX interrupts enabled — raises the UART's PLIC source,
+  the input half of the console the CLI pumps stdin into, M18). Self-contained
+  register files on the qemu `virt` address map, with no CPU/memory dependency —
+  the memory layer dispatches accesses here, and the CPU pulls `plat_mip_bits()`
+  (MTIP/MSIP/MEIP) each step. `plat_tick` advances `mtime` one tick per CPU step
+  (deterministic). The `Platform` also holds a `Disk` — a raw block-device image
+  (`--disk`, owned by the engine) a future virtio-mmio device will DMA against.
 - `src/dtb.{h,c}` — the flattened device-tree (FDT) generator (M14): `dtb_build`
   serialises a standard `.dtb` blob (big-endian header, memory-reservation block,
   structure block, deduplicated strings) from a `DtbConfig` describing the RAM
@@ -233,14 +244,16 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   single-step, halt reason — answering the `g`/`G`/`m`/`M`/`p`/`P`/`c`/`s`/`vCont`/
   `Z`/`z`/`qXfer` packets and serving an RV32 target description. Breakpoints are
   tracked here and enforced in the continue loop, so guest memory is never
-  patched. Reached via `--gdb` from `main.c`, and embeddable. It is the project's
-  one piece of OS-specific code, so the POSIX-sockets feature macro is local to
-  the `.c`.
+  patched. Reached via `--gdb` from `main.c`, and embeddable. Its POSIX-sockets
+  feature macro is local to the `.c` — one of the project's two OS-specific
+  corners (the other is `main.c`'s console input).
 - `src/main.c` — the CLI driver, a thin client over `quanta.h`: argument parsing,
   the `--trace` narration, the `--pipeline`/`--cache` overlays, the `--gdb` stub
-  hand-off, and the `--signature` arch-test dump, all driving the machine through
-  the public API (no engine internals). Loads an ELF named on the command line,
-  or runs the built-in demo when none is given.
+  hand-off, the `--signature` arch-test dump, `--disk` attachment, and the console
+  input pump (host stdin → the UART, via a zero-timeout `select`) — all driving
+  the machine through the public API (no engine internals). Its own POSIX
+  feature macro is local to the file, mirroring `gdbstub.c`. Loads an ELF named
+  on the command line, or runs the built-in demo when none is given.
 - `examples/embed.c` — minimal embedding example: ~30 lines that load and run a
   guest through `libquanta` (`make embed`).
 - `tests/hello.S` — sample RV32I assembly, mirrors the built-in demo.
@@ -363,6 +376,12 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   when": a clean exit (the S-mode program made its SBI calls and shut down via
   SRST) and the SBI console's "sbi ok" reaching stdout (`make check-sbi`). Also
   run under `make sanitize` and `make coverage`.
+- `tests/uart_echo.S` + `tests/check_uart_rx.sh` — the M18 console-input test
+  (`make check-uart-rx`): pipes a known line into the `uart_echo` guest, which
+  echoes each byte back through the UART, asserting host stdin reaches the guest's
+  UART receive path; plus a `--disk` smoke (an image attaches; a missing file
+  errors). The guest needs host input to terminate, so it is out of `make check`
+  and the objdump/qemu suites. Also run under `make sanitize`/`make coverage`.
 - `tests/coverage.sh` — collects gcov line coverage after an instrumented build
   (`make coverage`): prefers lcov (HTML under `build/coverage`) and falls back to
   plain gcov. Observability only, like the cache/pipeline overlays.
@@ -628,6 +647,23 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   0x15D, `menvcfgh` 0x31A) trap illegal on RV64 like the other `*h` CSRs.
   `tests/rv64/test_rv64_sstc.S` pins it (three ticks, each handler re-arming
   `stimecmp`), the Sstc analogue of `test_stimer`'s SBI shuttle.
+- Console input + disk backend (M18, xv6 enablers): the 16550 UART already had
+  the receive path (`rx`/`rx_have`, LSR data-ready, the RX interrupt, RBR read);
+  what was missing was a *source*. `plat_uart_rx` buffers one host byte (the
+  interrupt then follows automatically via `uart_asserted`/`plic_lines`), exposed
+  as `quanta_uart_input`, and `main.c`'s `console_pump` feeds host stdin through
+  it every ~1024 steps during the run. Readiness is a zero-timeout `select` — the
+  code never sets `O_NONBLOCK` on stdin, because that flag is *shared with the
+  parent shell* and a crash would leave the shell broken; and it does not touch
+  termios (interactive input is cooked/echoed for now — raw mode is deferred to
+  the full interactive-console work). `--disk=FILE` reads a raw image wholly into
+  a malloc'd buffer held in `Platform.disk` (engine-owned, freed in
+  `quanta_destroy`), staged for the virtio-mmio block device; nothing consumes it
+  yet. `tests/uart_echo.S` (a plain-rv32i echo guest) is driven by
+  `check-uart-rx` with piped stdin — it is deliberately *not* named `test_*` and
+  is `filter-out`'d of `TEST_SRC`, because it needs host input to terminate and
+  would otherwise loop forever under `make check`/`check-disasm` and mismatch
+  user-mode qemu (no UART) under `check-diff`.
 - Booting an OS (M16, `tests/os/`): the teaching kernel is *entered in M-mode*
   (Quanta's loader enters every ELF in M-mode), and its `boot.S` does the
   drop-to-S itself — the same pattern `test_sbi`/`test_stimer` use — rather than
@@ -693,10 +729,11 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   when the PC reaches a `Z0`/`Z1` address, so guest memory is never patched with
   trap words. The packet buffer is `calloc`'d so a read past a matched prefix is a
   defined 0 — which also keeps clang-analyzer/scan-build from flagging an
-  uninitialised read. It is the lone POSIX dependency: `gdbstub.c` defines
+  uninitialised read. It is one of the two POSIX corners: `gdbstub.c` defines
   `_DEFAULT_SOURCE` itself (so `make analyze`'s clang-tidy, which compiles with a
   bare `-std=c11`, still sees the socket decls) under a local NOLINT for the
-  reserved-identifier check. `--gdb` takes over execution, so it does not combine
+  reserved-identifier check — the same pattern `main.c` uses for its `select`/
+  `read` console input. `--gdb` takes over execution, so it does not combine
   with `--trace`/`--pipeline`; `make check-gdb` drives it with a pure-python RSP
   client (`tests/gdb_client.py`, no riscv `gdb` needed) and it also runs under
   `make sanitize`/`make coverage`.

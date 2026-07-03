@@ -94,6 +94,24 @@ QuantaStatus quanta_load_image(Quanta *q, uint32_t base, uint32_t size,
 QuantaStatus quanta_elf_symbol(const char *path, const char *name,
                                uint32_t *addr);
 
+/* --- optional block device --- */
+
+/* Attach a raw disk image from `path` as the machine's block device, read wholly
+ * into memory (so reads and writes hit the buffer; writes do not persist back to
+ * the file). A future virtio-mmio block device DMAs against it — e.g. an OS
+ * mounting its root filesystem. Returns QUANTA_ERR_LOAD if the file cannot be
+ * read, QUANTA_ERR_NOMEM on allocation failure, QUANTA_ERR_INVAL on a NULL
+ * argument. Replaces any previously attached disk. */
+QuantaStatus quanta_attach_disk(Quanta *q, const char *path);
+
+/* --- console input --- */
+
+/* Deliver a byte to the UART receive path, as if typed on the serial console:
+ * the guest reads it from the UART and, with RX interrupts enabled, takes an
+ * external interrupt. Returns 1 if accepted, 0 if the receive buffer is still
+ * full (hold the byte and retry). The CLI pumps host stdin through here. */
+int quanta_uart_input(Quanta *q, uint8_t byte);
+
 /* --- optional cache model --- */
 
 /* Attach a set-associative LRU cache over data accesses (geometry as the

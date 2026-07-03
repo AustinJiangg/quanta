@@ -64,10 +64,20 @@ typedef struct {
     uint32_t claimed;                 /* source currently in service (0 = none) */
 } Plic;
 
+/* A raw block-device backing image (attached via --disk). Held here so a future
+ * virtio-mmio block device can DMA against it; loaded into RAM so reads and
+ * writes hit the buffer (writes do not persist to the file). data == NULL when
+ * no disk is attached. The bytes are owned by the engine, which frees them. */
+typedef struct {
+    uint8_t *data;
+    uint64_t size;
+} Disk;
+
 typedef struct Platform {
     Clint clint;
     Uart  uart;
     Plic  plic;
+    Disk  disk;
 } Platform;
 
 /* Reset all devices: zeroed register files, mtimecmp parked at all-ones so the
@@ -87,6 +97,13 @@ void     plat_write(Platform *p, uint64_t addr, uint32_t size, uint32_t value);
 
 /* Advance the timer by one tick (called once per CPU step). */
 void plat_tick(Platform *p);
+
+/* Deliver a received byte to the UART (as if it arrived on the serial line):
+ * buffer it for the guest to read from RBR and, if RX interrupts are enabled,
+ * raise the UART's interrupt through the PLIC. Returns 1 if accepted, or 0 when
+ * the one-byte receive buffer is still full (the caller should hold the byte and
+ * retry). This is the host-input side of the console — the CLI feeds stdin here. */
+int plat_uart_rx(Platform *p, uint8_t byte);
 
 /* The interrupt-pending bits the platform drives (MTIP/MSIP/MEIP), to be merged
  * into mip. The CPU pulls this each step rather than the devices pushing it. */

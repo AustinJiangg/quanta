@@ -91,6 +91,17 @@ static void uart_write(Uart *u, uint32_t off, uint8_t val) {
     }
 }
 
+/* Buffer a received byte for the guest. The interrupt follows automatically:
+ * uart_asserted() sees rx_have with IER's RX bit set, so plic_lines() raises the
+ * UART source and plat_mip_bits() reports MEIP on the next pull. A full buffer
+ * rejects the byte (0) so the caller can hold and retry rather than lose input. */
+int plat_uart_rx(Platform *p, uint8_t byte) {
+    if (p->uart.rx_have) return 0;
+    p->uart.rx = byte;
+    p->uart.rx_have = 1;
+    return 1;
+}
+
 /* ------------------------------------------------------------------------
  * PLIC.
  * ------------------------------------------------------------------------ */

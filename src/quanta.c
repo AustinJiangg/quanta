@@ -70,6 +70,7 @@ Quanta *quanta_create(void) {
 void quanta_destroy(Quanta *q) {
     if (!q) return;
     if (q->cache_on) cache_free(&q->cache);
+    free(q->plat.disk.data); /* the attached disk image, if any */
     mem_free(&q->mem);
     free(q);
 }
@@ -154,6 +155,33 @@ QuantaStatus quanta_load_image(Quanta *q, uint32_t base, uint32_t size,
     return QUANTA_OK;
 }
 
+QuantaStatus quanta_attach_disk(Quanta *q, const char *path) {
+    if (!q || !path) return QUANTA_ERR_INVAL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return QUANTA_ERR_LOAD;
+
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return QUANTA_ERR_LOAD; }
+    long n = ftell(f);
+    if (n < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return QUANTA_ERR_LOAD; }
+
+    uint8_t *data = NULL;
+    if (n > 0) {
+        data = malloc((size_t)n);
+        if (!data) { fclose(f); return QUANTA_ERR_NOMEM; }
+        if (fread(data, 1, (size_t)n, f) != (size_t)n) {
+            free(data);
+            fclose(f);
+            return QUANTA_ERR_LOAD;
+        }
+    }
+    fclose(f);
+
+    free(q->plat.disk.data); /* replace any previously attached disk */
+    q->plat.disk.data = data;
+    q->plat.disk.size = (uint64_t)n;
+    return QUANTA_OK;
+}
+
 QuantaStatus quanta_enable_cache(Quanta *q, uint32_t size_bytes,
                                  uint32_t assoc, uint32_t block_size) {
     if (!q || q->cache_on) return QUANTA_ERR_INVAL;
@@ -187,6 +215,11 @@ QuantaHalt quanta_run(Quanta *q, uint64_t max_steps, uint64_t *steps_out) {
     if (steps_out) *steps_out = steps;
     if (!q || !q->loaded) return QUANTA_RUN;
     return q->cpu.halted ? map_halt(q->cpu.halt_reason) : QUANTA_HALT_STEP_LIMIT;
+}
+
+int quanta_uart_input(Quanta *q, uint8_t byte) {
+    if (!q || !q->loaded) return 0;
+    return plat_uart_rx(&q->plat, byte);
 }
 
 /* The architectural value of an XLEN-wide quantity for API consumers. RV32

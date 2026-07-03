@@ -846,20 +846,25 @@ inert against our unenforced-PMP model (they only grant S-mode full access, whic
 we already allow). The gaps, in order: **(1) the Sstc supervisor-timer extension**
 — xv6's `start.c` sets `menvcfg.STCE` and arms `stimecmp` directly rather than
 using a firmware relay; **DONE** (`sstc_tick` in cpu.c, `tests/rv64/test_rv64_sstc.S`).
-**(2)** UART receive (stdin → RX interrupt) for an interactive shell, and a
-`--disk=fs.img` backend. **(3)** the crux — a **virtio-mmio (modern, v2) block
-device** with one split virtqueue, since xv6's root filesystem (and thus `/init`
-and the shell) lives on a virtio disk; the driver is deterministic-friendly
-(process the descriptor chain synchronously on `QUEUE_NOTIFY`, then assert PLIC
-IRQ 1 — safe because xv6 holds `vdisk_lock` with interrupts off until it sleeps).
-Then: build xv6 integer-only (`rv64imac`, no F/D), `CPUS=1`, and boot to the shell.
+**(2)** UART receive (host stdin → the guest's RX path) and a `--disk=fs.img`
+backend; **DONE** (`plat_uart_rx`/`quanta_uart_input` + `main.c`'s stdin pump, and
+`quanta_attach_disk` staging a raw image in `Platform.disk`; `make check-uart-rx`).
+**(3)** the crux — a **virtio-mmio (modern, v2) block device** with one split
+virtqueue, since xv6's root filesystem (and thus `/init` and the shell) lives on
+a virtio disk; the driver is deterministic-friendly (process the descriptor chain
+synchronously on `QUEUE_NOTIFY`, then assert PLIC IRQ 1 — safe because xv6 holds
+`vdisk_lock` with interrupts off until it sleeps). Then: build xv6 integer-only
+(`rv64imac`, no F/D), `CPUS=1`, boot to the shell — and there set the boot DTB's
+`mmu-type = "riscv,sv39"` (still `riscv,none` from the M17 Bare era) and add
+raw-mode terminal handling for a clean interactive console.
 Linux + OpenSBI (needing a fuller SBI, a `mmu-type = "riscv,sv39"` DTB, and far
 longer runs) follows xv6.
 
 - [x] **Build (paging):** the three-level Sv39 page-table scheme (a
   descriptor-parameterised generalisation of the Sv32 walk).
 - [ ] **Build (OS boot):** boot xv6-riscv, then Linux + OpenSBI. *In progress:*
-  Sstc timer done; virtio-blk + UART-RX + disk backend next.
+  Sstc timer, UART receive, and the `--disk` backend done; the virtio-mmio block
+  device is next, then xv6 integration.
 - [x] **ISA:** Sv39 address translation; Sstc (`stimecmp`/`menvcfg.STCE`).
 - [ ] **Concept:** deeper page-table hierarchies; a real distro's boot
   requirements.

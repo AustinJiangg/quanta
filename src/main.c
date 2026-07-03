@@ -1,3 +1,8 @@
+/* Expose the POSIX select()/read() API under -std=c11 for the console (pumping
+ * host stdin into the guest UART). Isolated here as gdbstub.c does for its
+ * sockets — the two are the driver's only OS-specific corners. */
+#define _DEFAULT_SOURCE 1 /* NOLINT(bugprone-reserved-identifier): feature-test macro */
+
 #include "quanta.h"
 #include "disasm.h"
 #include "pipeline.h"
@@ -8,13 +13,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <unistd.h>
+#include <sys/select.h>
+
 /*
  * Quanta driver — a thin client over libquanta.
  *
  * Usage:
  *   quanta [--version] [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]]
  *          [--pipeline] [--memory=SIZE] [--gdb[=PORT]] [--signature=FILE]
- *          [program.elf]
+ *          [--disk=FILE] [program.elf]
+ *
+ * A running guest can take console input: host stdin is pumped into the UART's
+ * receive path during the run, so a full-system guest has a keyboard. --disk
+ * attaches a raw block-device image for a (future) virtio-mmio device to serve.
  *
  * With a path, Quanta loads that RV32I ELF executable and runs it from its
  * entry point. With no argument, it runs a tiny built-in demo program — a
@@ -113,6 +125,36 @@ static void trace_step(Quanta *q) {
     fprintf(stderr, "\n");
 }
 
+/* --- console input ---------------------------------------------------------
+ * Pump host stdin into the guest UART's receive path so a full-system guest (a
+ * booting kernel) has a keyboard. Readiness is checked with a zero-timeout
+ * select() rather than by making stdin non-blocking: stdin's flags are shared
+ * with the parent shell, so mutating them is a footgun a crash would leave
+ * behind. The terminal is otherwise left untouched — on a real tty input is
+ * line-buffered and host-echoed (interactive typing works, if doubly echoed);
+ * proper raw mode is deferred to the full interactive-console work. A pipe or
+ * file is read as-is, which is what the piped-input test relies on. */
+static int stdin_has_byte(void) {
+    fd_set r;
+    FD_ZERO(&r);
+    FD_SET(STDIN_FILENO, &r);
+    struct timeval tv = { 0, 0 };
+    return select(STDIN_FILENO + 1, &r, NULL, NULL, &tv) > 0;
+}
+
+/* Move at most one byte from host stdin into the guest UART. A one-byte holding
+ * slot keeps a byte read from stdin from being dropped when the UART's receive
+ * buffer is momentarily full: read a fresh byte only when nothing is pending, and
+ * clear the pending byte once the UART accepts it. */
+static void console_pump(Quanta *q) {
+    static int pending = -1;
+    if (pending < 0 && stdin_has_byte()) {
+        unsigned char c;
+        if (read(STDIN_FILENO, &c, 1) == 1) pending = (int)c;
+    }
+    if (pending >= 0 && quanta_uart_input(q, (uint8_t)pending)) pending = -1;
+}
+
 /* Step until the program halts, or a safety limit is hit so a buggy program can
  * never spin forever. With trace set, narrate each instruction to stderr; with a
  * pipeline, feed it each retired instruction. Returns the instruction count. */
@@ -123,6 +165,10 @@ static uint64_t run_until_halt(Quanta *q, int trace, Pipeline *pipe) {
      * that never halts still stops in about a second instead of hanging. */
     const uint64_t max_steps = 100ull * 1000 * 1000;
     while (quanta_halt_reason(q) == QUANTA_RUN && steps < max_steps) {
+        /* Feed any waiting console input to the UART, occasionally — often enough
+         * to feel responsive, rarely enough that the select() is not a per-
+         * instruction tax. Harmless when no input is waiting. */
+        if ((steps & 0x3ff) == 0) console_pump(q);
         uint32_t pc   = quanta_pc(q);
         uint32_t inst = pipe ? quanta_read_u32(q, pc, NULL) : 0;
         if (trace) trace_step(q);
@@ -192,6 +238,7 @@ int main(int argc, char **argv) {
     uint32_t mem_req = 0;          /* --memory: minimum guest RAM (0 = image-sized) */
     const char *path = NULL;
     const char *sigfile = NULL; /* --signature=FILE: arch-test signature dump */
+    const char *diskpath = NULL; /* --disk=FILE: raw block-device backing image */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
             printf("quanta %s\n", quanta_version());
@@ -235,18 +282,26 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--signature needs a file (or '-' for stdout)\n");
                 return 2;
             }
+        } else if (strncmp(argv[i], "--disk=", 7) == 0) {
+            diskpath = argv[i] + 7;
+            if (diskpath[0] == '\0') {
+                fprintf(stderr, "--disk needs a file path\n");
+                return 2;
+            }
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] "
-                    "[--gdb[=PORT]] [--signature=FILE] [program.elf]\n", argv[0]);
+                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [program.elf]\n",
+                    argv[0]);
             return 2;
         } else if (path == NULL) {
             path = argv[i];
         } else {
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] "
-                    "[--gdb[=PORT]] [--signature=FILE] [program.elf]\n", argv[0]);
+                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [program.elf]\n",
+                    argv[0]);
             return 2;
         }
     }
@@ -271,6 +326,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Optionally attach a raw disk image, loaded after the program so the guest
+     * region already exists. A future virtio-mmio block device DMAs against it. */
+    if (diskpath && quanta_attach_disk(q, diskpath) != QUANTA_OK) {
+        fprintf(stderr, "failed to load disk image %s\n", diskpath);
+        quanta_destroy(q);
+        return 1;
+    }
+
     /* The loader set PC to the entry point and sp to the top of the region. */
     uint64_t entry = quanta_pc(q);
     uint64_t sp    = quanta_reg(q, 2);
@@ -283,9 +346,11 @@ int main(int argc, char **argv) {
         } else {
             /* The loader hands the guest a device tree per the RISC-V boot
              * contract: a0 = hartid, a1 = dtb (reported here for visibility). */
-            printf("Loaded %s (entry = 0x%0*llx, sp = 0x%0*llx, dtb = 0x%0*llx)\n\n",
+            printf("Loaded %s (entry = 0x%0*llx, sp = 0x%0*llx, dtb = 0x%0*llx)\n",
                    path, w, (unsigned long long)entry, w, (unsigned long long)sp,
                    w, (unsigned long long)quanta_dtb_addr(q));
+            if (diskpath) printf("Disk:  %s\n", diskpath);
+            printf("\n");
         }
     }
 

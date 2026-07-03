@@ -54,7 +54,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-uart-rx check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -86,7 +86,11 @@ examples/embed: examples/embed.c $(LIB)
 
 # Build the sample assembly programs with the cross-toolchain. Every tests/*.S
 # becomes a tests/*.elf via the pattern rule below.
-TEST_SRC := $(wildcard tests/*.S)
+# uart_echo is a console guest driven by check-uart-rx with piped stdin; it needs
+# host input to terminate, so keep it out of the general suites (make check runs
+# input-less; check-disasm executes under --trace; check-diff runs qemu, which
+# does not model the UART MMIO). It has its own target and the pattern rule builds it.
+TEST_SRC := $(filter-out tests/uart_echo.S,$(wildcard tests/*.S))
 TEST_ELF := $(TEST_SRC:.S=.elf)
 
 tests: $(TEST_ELF)
@@ -204,6 +208,13 @@ check-devices: $(BIN) tests/test_irq.elf
 check-sbi: $(BIN) tests/test_sbi.elf
 	@sh tests/check_sbi.sh
 
+# Exercise UART receive and the --disk backend (M18 xv6 enablers): pipe a line
+# into the guest and confirm it echoes back through the UART receive path, and
+# confirm a disk image attaches while a missing one errors. Needs host input, so
+# it lives outside the input-less `make check` and the objdump/qemu suites.
+check-uart-rx: $(BIN) tests/uart_echo.elf
+	@sh tests/check_uart_rx.sh
+
 # Boot the M16 teaching kernel and assert M16's "done when": it reached
 # userspace (the user process printed via the write syscall), the supervisor
 # timer preempted it, and it shut down cleanly (exit 0 via SBI system_reset).
@@ -254,7 +265,7 @@ sanitize:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
-		check-devices check-sbi check-os check-rv64 check-diff
+		check-devices check-sbi check-uart-rx check-os check-rv64 check-diff
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
 # the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`
@@ -285,7 +296,7 @@ COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
 
 coverage:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-os
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-uart-rx check-os
 	@sh tests/coverage.sh
 
 # Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),
