@@ -130,7 +130,7 @@ enum {
     CSR_SCOUNTEREN = 0x106,
     CSR_SSCRATCH   = 0x140, CSR_SEPC    = 0x141, CSR_SCAUSE  = 0x142,
     CSR_STVAL      = 0x143, CSR_SIP     = 0x144,
-    CSR_SATP       = 0x180, /* paging stays off until M12; stored, not walked */
+    CSR_SATP       = 0x180, /* address-translation root: Sv32 (M12) / Sv39 (M18) */
 
     /* Machine information (read-only). */
     CSR_MVENDORID = 0xf11, CSR_MARCHID = 0xf12, CSR_MIMPID = 0xf13,

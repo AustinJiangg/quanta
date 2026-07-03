@@ -32,8 +32,9 @@ convention (M14), an SBI firmware interface that services an S-mode guest's
 kernel that boots to userspace on all of it (`tests/os/`, `make check-os`, M16),
 and the **RV64 transition** — a runtime-XLEN core that also runs RV64IMAC,
 selected per program from the ELF class (M17, `tests/rv64/`, `make check-rv64`,
-differential-tested against `qemu-riscv64`; RV32F/D and RV64 Sv39 paging stay
-deferred) — are implemented
+differential-tested against `qemu-riscv64`; RV32F/D stay deferred), and **Sv39
+virtual memory** on RV64 — the three-level page-table walk, sharing the walker
+with Sv32 (M18, `tests/rv64/test_rv64_vm.S`) — are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
@@ -167,13 +168,17 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   `mstatus`/`mideleg` gates, and vectors the highest-priority enabled interrupt
   through `enter_trap` (the trap-entry path now shared with `raise_trap`, with
   vectored-`*tvec` support).
-- `src/mmu.{h,c}` — Sv32 virtual memory (M12): the two-level page-table walker,
-  a small software TLB (in the CPU struct), permission and A/D-bit handling, and
+- `src/mmu.{h,c}` — virtual memory: Sv32 (M12) and Sv39 (M18). One
+  descriptor-parameterised page-table walker serves both — a two-level walk with
+  4-byte PTEs for Sv32, a three-level walk with 8-byte PTEs for Sv39 — plus a
+  small software TLB (in the CPU struct), permission and A/D-bit handling, and
   the page-fault decision. `mmu_translate(cpu, va, acc, &pa)` returns 0 or a
   page-fault cause; `cpu.c` calls it in the fetch and load/store/AMO paths and
-  raises the cause as a trap. Translation is the identity in M-mode or Bare mode,
-  so it is inert until a guest writes `satp`. `mmu_flush` (called on `sfence.vma`
-  and satp writes) drops the TLB.
+  raises the cause as a trap. `satp.MODE` picks the scheme (and is WARL —
+  `mmu_satp_supported` drops a write selecting a mode we don't model, so a guest
+  probing Sv57/Sv48/Sv39 sees the unsupported ones not stick). Translation is the
+  identity in M-mode or Bare mode, so it is inert until a guest writes `satp`.
+  `mmu_flush` (called on `sfence.vma` and satp writes) drops the TLB.
 - `src/disasm.{h,c}` — RV32I disassembler: turns an instruction word back into
   objdump-style assembly (ABI names, common pseudo-instructions, absolute
   branch/jump targets). Mirrors `cpu_step`'s opcode switch over `decode.h`. A
@@ -394,9 +399,11 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   as 8 hex digits; RV64 hands back the full 64. `main.c` and `quanta_dump_regs`
   pick the field width from `quanta_xlen()`.
 - The MMU masks a VA to XLEN at its **single choke point** (`mmu_translate`
-  first recovers the real address from a sign-extended RV32 register). RV64 runs
-  **Bare** — Sv32 is an RV32 scheme, so the walk is gated on `xlen == 32`; RV64's
-  Sv39 walk is M18. `misa.MXL` is 1 (RV32) / 2 (RV64); the mcause/scause
+  first recovers the real address from a sign-extended RV32 register). One walk
+  loop serves both schemes, parameterised by a small descriptor (levels, PTE
+  width, VPN-field width, PPN mask): RV32 selects **Sv32** (2 levels, 4-byte
+  PTEs) and RV64 selects **Sv39** (3 levels, 8-byte PTEs), by `satp.MODE`
+  (M18). `misa.MXL` is 1 (RV32) / 2 (RV64); the mcause/scause
   **interrupt bit** is the top XLEN bit (bit 31 RV32, bit 63 RV64) via
   `cause_interrupt()`; the RV32-only high-half CSRs (`cycleh`/`timeh`/`instreth`/
   `mstatush`) trap illegal on RV64.
@@ -408,9 +415,15 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
 - The RV64 conformance suite is `tests/rv64/` (own Makefile rule, built
   `-march=rv64imac_zicsr -mabi=lp64`, so the RV32 `tests/*.S` glob never touches
   it), run by `make check-rv64` — quanta exit-0 plus a `qemu-riscv64` differential
-  on the user-mode programs. `test_rv64_priv.S` is built **without C**
-  (`rv64ima_zicsr`) because its trap handler advances `mepc` by a fixed 4, so its
-  `ebreak` must stay 4-byte (the same reason the RV32 `test_trap.S` avoids C).
+  on the user-mode programs. The supervisor/paging programs — `*_priv` and
+  `test_rv64_vm` (the M18 Sv39 test: a hand-built three-level table, aliasing,
+  the hardware dirty bit, and a deep-miss load page fault, mirroring the RV32
+  `test_vm.S`) — are quanta-only (user-mode qemu rejects their M-mode CSRs and
+  satp), excluded from the differential like the RV32 privileged tests are from
+  `check-diff`. `test_rv64_priv.S` is built **without C** (`rv64ima_zicsr`)
+  because its trap handler advances `mepc` by a fixed 4, so its `ebreak` must
+  stay 4-byte (the same reason the RV32 `test_trap.S` avoids C); `test_rv64_vm.S`
+  sets `mepc` directly, so it keeps C.
 - RV32I immediates are bit-scrambled across the instruction word and mostly
   sign-extended; the `imm_*` helpers in `decode.h` are the single source of
   truth, shared by the executor and the disassembler. Re-deriving them by hand
@@ -508,22 +521,33 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   test is user-mode (`-march=rv32ia`) and differential-tested against qemu — its
   SC-failure case overwrites the reserved word with a *different* value, so an
   address-based reservation (ours) and a value-based one (qemu-user) agree.
-- Sv32 paging (M12) lives in `mmu.c`, not `memory.c` — translation needs CPU
-  state (satp/priv/mstatus), while `memory.c` stays a dumb physical array. Key
-  points: translation is the identity in M-mode or Bare mode, so paging is inert
-  until a guest sets `satp` (every pre-M12 test is unaffected). Page tables are
-  read *physically* by the walker, so they need no mapping. A/D bits are set in
-  hardware (A on any access, D on a store); the TLB therefore serves only
-  fetches and loads — stores always walk so the dirty bit lands on the real PTE
-  — and is flushed by `sfence.vma` and any `satp` write. `mstatus.MPRV` lets an
-  M-mode load/store translate as MPP; SUM/MXR gate S-mode access to user pages.
-  A walk failure (missing PTE, bad permission, misaligned superpage) returns the
-  page-fault cause, which `cpu.c` raises as a trap with the faulting VA in
-  `*tval`. Not modelled: the access-fault-vs-page-fault distinction for a
-  page-table read that leaves RAM (treated as a page fault), and ASID-scoped
-  flushes (`sfence.vma` drops the whole TLB). Like the other privileged tests,
-  `test_vm` can't run under user-mode qemu, so it has no differential safety
-  net — lean on `--trace` when changing the walker.
+- Paging (Sv32, M12; Sv39, M18) lives in `mmu.c`, not `memory.c` — translation
+  needs CPU state (satp/priv/mstatus), while `memory.c` stays a dumb physical
+  array. **One walk loop serves both schemes**, parameterised by a descriptor
+  set from `satp.MODE`: Sv32 is 2 levels / 4-byte PTEs / 10-bit VPN fields /
+  22-bit PPN; Sv39 is 3 levels / 8-byte PTEs / 9-bit VPN fields / 44-bit PPN.
+  The superpage merge (low `level` VPN fields come from the VA, and the PTE's
+  matching PPN bits must be zero) is uniform, so it covers the Sv32 megapage and
+  the Sv39 mega/gigapage with the same three lines. Sv39 adds one check the walk
+  does up front: the VA must be **canonical** (bits [63:39] a sign-extension of
+  bit 38) or it faults. Key points otherwise shared: translation is the identity
+  in M-mode or Bare mode, so paging is inert until a guest sets `satp` (every
+  pre-paging test is unaffected). Page tables are read *physically* by the
+  walker, so they need no mapping. A/D bits are set in hardware (A on any access,
+  D on a store); the TLB therefore serves only fetches and loads — stores always
+  walk so the dirty bit lands on the real PTE — and is flushed by `sfence.vma`
+  and any `satp` write. `mstatus.MPRV` lets an M-mode load/store translate as
+  MPP; SUM/MXR gate S-mode access to user pages. A walk failure (missing PTE, bad
+  permission, misaligned superpage, non-canonical Sv39 VA) returns the page-fault
+  cause, which `cpu.c` raises as a trap with the faulting VA in `*tval`. Not
+  modelled: the access-fault-vs-page-fault distinction for a page-table read that
+  leaves RAM (treated as a page fault), ASID-scoped flushes (`sfence.vma` drops
+  the whole TLB), the Sv39 reserved/`Svpbmt`/`Svnapot` high PTE bits (ignored,
+  not faulted — no guest sets them since we don't advertise those extensions),
+  and RV64 Sv48/Sv57 (their `satp.MODE` is rejected as unsupported). Like the
+  other privileged tests, `test_vm` (Sv32) and `test_rv64_vm` (Sv39) can't run
+  under user-mode qemu, so they have no differential safety net — lean on
+  `--trace` when changing the walker.
 - Platform devices and interrupts (M13) live in `device.c`; the MMIO *dispatch*
   is in `memory.c`, gated on `mem->plat` (NULL = plain RAM, e.g. a Memory not
   wired through `start_at`). The platform is attached to every loaded machine but

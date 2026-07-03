@@ -447,6 +447,9 @@ static void csr_write(CPU *cpu, uint32_t addr, uint64_t val) {
                               | (val & S_INT_MASK);
             return;
         case CSR_SATP:
+            /* satp.MODE is WARL: drop a write selecting a paging scheme we do
+             * not model, so a guest probing modes sees it not take. */
+            if (!mmu_satp_supported(cpu, val)) return;
             cpu->csr[CSR_SATP] = val;
             mmu_flush(cpu); /* a new address space invalidates cached translations */
             return;

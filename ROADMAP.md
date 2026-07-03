@@ -811,15 +811,42 @@ Sv39 paging both wait, F/D until a guest needs it and Sv39 for M18.
 - [x] **Commits:** `refactor: parameterise xlen`, `feat: add rv64 base`,
   `test: rv64 conformance and differential`.
 
-## M18 — Sv39 + boot a mainstream OS
+## M18 — Sv39 + boot a mainstream OS (Sv39 DONE; OS boot in progress)
 
-- [ ] **Build:** the three-level Sv39 page-table scheme; then boot xv6-riscv and
-  a standard Linux + OpenSBI.
-- [ ] **ISA:** Sv39 address translation.
+Sv39 is in — the three-level page-table scheme RV64 needs, and the second half of
+the M17 "RV64 runs Bare" gap. Rather than a second walker, `mmu.c`'s existing
+Sv32 walk was *generalised*: the two schemes are the same walk at different
+sizes, so one loop now serves both, parameterised by a small descriptor (table
+depth, PTE width, VPN-field width, PPN mask) chosen from `satp.MODE`. Sv32 stays
+2 levels / 4-byte PTEs / 22-bit PPN; Sv39 is 3 levels / 8-byte PTEs / 44-bit PPN.
+The superpage merge is uniform across both (a leaf above the last level takes its
+low VPN fields from the VA, and the PTE's matching PPN bits must be zero), so it
+covers the Sv32 4 MiB megapage and the Sv39 2 MiB megapage / 1 GiB gigapage with
+the same three lines; the TLB, permission, A/D-writeback, and page-fault paths
+are shared unchanged. Sv39 adds one front-of-walk check the narrower scheme does
+not need: the VA must be canonical (bits [63:39] a sign-extension of bit 38) or
+it faults. `satp.MODE` is now enforced WARL — `csr_write` drops a write selecting
+an unsupported scheme (Sv48/Sv57) via `mmu_satp_supported`, so a guest probing
+for the widest mode (Linux tries Sv57, then Sv48, then Sv39) sees the ones we do
+not model not stick. The refactor kept every RV32 net bit-for-bit green (the Sv32
+`test_vm`, `check-arch`, `check-os`) — the safety checkpoint. `tests/rv64/
+test_rv64_vm.S` is the Sv39 conformance test: it hand-builds a three-level table,
+proves non-identity translation through the full walk (two VAs aliased to one
+frame), the hardware dirty bit, and a load page fault from a VA whose walk
+reaches the last level with no leaf — the RV64 analogue of the Sv32 `test_vm.S`,
+quanta-only (S-mode + satp, so out of the qemu differential). Still open: booting
+a mainstream OS (xv6-riscv, then Linux + OpenSBI) on top of it — the milestone's
+trophy, which also needs the DTB to advertise `mmu-type = "riscv,sv39"` and far
+longer run lengths.
+
+- [x] **Build (paging):** the three-level Sv39 page-table scheme (a
+  descriptor-parameterised generalisation of the Sv32 walk).
+- [ ] **Build (OS boot):** boot xv6-riscv and a standard Linux + OpenSBI.
+- [x] **ISA:** Sv39 address translation.
 - [ ] **Concept:** deeper page-table hierarchies; a real distro's boot
   requirements.
 - [ ] **Done when:** xv6-riscv reaches its shell; Linux boots to userspace.
-- [ ] **Commits:** `feat: add sv39 paging`, `test: boot xv6-riscv`,
+- [x] **Commits:** `feat: add sv39 paging`. Still to come: `test: boot xv6-riscv`,
   `test: boot linux`.
 
 ## M19 — SMP multi-hart (stretch)

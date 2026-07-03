@@ -2,25 +2,64 @@
 #include "decode.h"
 
 /*
- * Sv32 turns a 32-bit virtual address into a (up to 34-bit, but here 32-bit)
- * physical one through a two-level page table rooted at satp.PPN:
+ * Virtual memory: Sv32 on RV32 (M12) and Sv39 on RV64 (M18).
  *
- *   va = | VPN[1] : 10 | VPN[0] : 10 | offset : 12 |
+ * Once satp enables paging and the hart drops below Machine mode, every
+ * instruction fetch and data access goes through a multi-level page-table walk
+ * that turns a virtual address into a physical one. This is the layer that lets
+ * each program believe it owns the whole address space: the page tables map its
+ * virtual pages onto whatever physical frames the supervisor chose, and an
+ * access with no valid mapping — or the wrong permission — raises a precise
+ * page-fault exception instead of touching memory.
  *
- * The walk indexes the root table by VPN[1] and, unless that entry is already a
- * leaf (a 4 MiB "megapage"), the second-level table by VPN[0]. A leaf PTE
- * supplies the physical page number; its low byte carries valid/permission and
- * the accessed/dirty bits, which we maintain in hardware.
+ * The two schemes are the same walk at different sizes, so one loop serves both,
+ * parameterised by a small descriptor:
+ *
+ *   Sv32:  va = | VPN[1]:10 | VPN[0]:10 | offset:12 |   2 levels, 4-byte PTEs
+ *   Sv39:  va = | VPN[2]:9 | VPN[1]:9 | VPN[0]:9 | offset:12 |
+ *                                                    3 levels, 8-byte PTEs
+ *
+ * The walk indexes the root table by the top VPN field and descends until it
+ * reaches a leaf PTE; a leaf found above the last level is a superpage (a 4 MiB
+ * Sv32 megapage, or a 2 MiB Sv39 megapage / 1 GiB gigapage) whose low address
+ * bits come straight from the VA. A leaf PTE supplies the physical page number;
+ * its low byte carries valid/permission and the accessed/dirty bits, which we
+ * maintain in hardware.
+ *
+ * The walk is the slow path; a small TLB caches recent translations. Because a
+ * stale entry would hide page-table edits, the TLB is flushed by sfence.vma and
+ * by any write to satp.
  */
 
-/* satp (Sv32): MODE in bit 31, ASID in [30:22], root PPN in [21:0]. */
-#define SATP_SV32 0x80000000u
+/* Paging schemes, selected by satp.MODE. Bare is the identity map; the two walks
+ * are Sv32 (RV32) and Sv39 (RV64). An RV64 satp.MODE of 9/10 (Sv48/Sv57) is a
+ * scheme Quanta does not model. */
+enum { PT_BARE, PT_SV32, PT_SV39, PT_UNSUPPORTED };
 
-/* PTE permission/status bits. */
+/* satp.MODE: one bit (31) on RV32; four bits (63:60) on RV64, where 8 is Sv39. */
+#define SATP32_MODE      0x80000000u
+#define SATP64_MODE_SV39 8u
+
+/* PTE permission/status bits (identical low byte in Sv32 and Sv39). */
 enum {
     PTE_V = 1u << 0, PTE_R = 1u << 1, PTE_W = 1u << 2, PTE_X = 1u << 3,
     PTE_U = 1u << 4, PTE_G = 1u << 5, PTE_A = 1u << 6, PTE_D = 1u << 7
 };
+
+/* Which paging scheme satp currently selects. */
+static int satp_mode(const CPU *cpu, uint64_t satp) {
+    if (cpu->xlen == 32)
+        return ((uint32_t)satp & SATP32_MODE) ? PT_SV32 : PT_BARE;
+    switch ((satp >> 60) & 0xf) {
+        case 0:                return PT_BARE;
+        case SATP64_MODE_SV39: return PT_SV39;
+        default:               return PT_UNSUPPORTED; /* Sv48/Sv57 not modelled */
+    }
+}
+
+int mmu_satp_supported(const CPU *cpu, uint64_t val) {
+    return satp_mode(cpu, val) != PT_UNSUPPORTED;
+}
 
 /* Which page-fault cause an access of this kind raises. */
 static uint32_t pf_cause(AccessType acc) {
@@ -62,21 +101,39 @@ static int perm_ok(const CPU *cpu, uint32_t pte, AccessType acc, uint32_t priv) 
 }
 
 uint32_t mmu_translate(CPU *cpu, uint64_t va, AccessType acc, uint64_t *pa) {
-    uint32_t satp = cpu->csr[CSR_SATP];
+    uint64_t satp = cpu->csr[CSR_SATP];
     uint32_t priv = eff_priv(cpu, acc);
 
     if (cpu->xlen == 32) va &= 0xffffffffu; /* recover a sign-extended RV32 VA */
 
-    /* Machine mode, Bare mode, and (for now) all of RV64 access physical memory
-     * directly. Sv32 is an RV32 scheme; RV64's Sv39 walk is M18, so until then an
-     * RV64 satp resolves to Bare here. */
-    if (priv == PRIV_M || cpu->xlen != 32 || !(satp & SATP_SV32)) {
+    /* Machine mode and Bare mode access physical memory directly. (An
+     * unsupported RV64 MODE cannot reach satp — csr_write drops it — but map it
+     * to Bare defensively.) */
+    int scheme = satp_mode(cpu, satp);
+    if (priv == PRIV_M || scheme == PT_BARE || scheme == PT_UNSUPPORTED) {
         *pa = va;
         return 0;
     }
 
-    uint32_t asid = (satp >> 22) & 0x1ff;
-    uint64_t vpn  = va >> 12;
+    /* The one difference between the two walks: table depth, PTE width, VPN-field
+     * width, the PPN mask, and where the ASID sits in satp. */
+    int      levels, ptesize, vpnbits;
+    uint64_t ppnmask, asid;
+    if (scheme == PT_SV32) {
+        levels = 2; ptesize = 4; vpnbits = 10;
+        ppnmask = 0x3fffffu;            /* 22-bit PPN */
+        asid    = (satp >> 22) & 0x1ff;
+    } else { /* PT_SV39 */
+        levels = 3; ptesize = 8; vpnbits = 9;
+        ppnmask = 0xfffffffffffull;     /* 44-bit PPN */
+        asid    = (satp >> 44) & 0xffff;
+        /* Sv39 VAs must be sign-extended from bit 38; a non-canonical VA faults
+         * before the walk even starts. */
+        uint64_t sext = (uint64_t)(((int64_t)(va << 25)) >> 25);
+        if (sext != va) return pf_cause(acc);
+    }
+
+    uint64_t vpn = va >> 12;
 
     /* TLB serves fetches and loads; stores always walk so the dirty bit is set
      * on the real PTE before the write is allowed to land. */
@@ -91,41 +148,47 @@ uint32_t mmu_translate(CPU *cpu, uint64_t va, AccessType acc, uint64_t *pa) {
         }
     }
 
-    /* Two-level walk from the root table at satp.PPN. */
-    uint64_t a = (uint64_t)(satp & 0x3fffffu) << 12;
-    uint32_t pte = 0;
-    uint64_t pte_addr = 0;
+    /* Multi-level walk from the root table at satp.PPN. */
+    uint64_t a = (satp & ppnmask) << 12;
+    uint64_t pte = 0, pte_addr = 0;
+    uint32_t idxmask = (1u << vpnbits) - 1;
     int level;
-    for (level = 1; ; level--) {
-        uint32_t idx = (va >> (12 + level * 10)) & 0x3ff;
-        pte_addr = a + (uint64_t)idx * 4;
-        pte = mem_read32(cpu->mem, pte_addr);
+    for (level = levels - 1; ; level--) {
+        uint64_t idx = (va >> (12 + level * vpnbits)) & idxmask;
+        pte_addr = a + idx * (uint64_t)ptesize;
+        pte = (ptesize == 4) ? mem_read32(cpu->mem, pte_addr)
+                             : mem_read64(cpu->mem, pte_addr);
         if (cpu->mem->fault) { cpu->mem->fault = 0; return pf_cause(acc); }
         if (!(pte & PTE_V) || (!(pte & PTE_R) && (pte & PTE_W)))
             return pf_cause(acc);              /* invalid, or W without R */
         if (pte & (PTE_R | PTE_X)) break;      /* a leaf */
         if (level == 0) return pf_cause(acc);  /* no leaf at the last level */
-        a = (uint64_t)((pte >> 10) & 0x3fffffu) << 12; /* descend to next table */
+        a = ((pte >> 10) & ppnmask) << 12;     /* descend to the next table */
     }
 
     if (!perm_ok(cpu, pte, acc, priv)) return pf_cause(acc);
 
-    uint64_t ppn;
-    if (level == 1) {                           /* 4 MiB megapage */
-        if ((pte >> 10) & 0x3ff) return pf_cause(acc); /* misaligned superpage */
-        ppn = (((pte >> 20) & 0xfff) << 10) | ((va >> 12) & 0x3ff);
-    } else {
-        ppn = (pte >> 10) & 0x3fffffu;
+    /* Resolve the physical page number. For a superpage (a leaf above level 0)
+     * the low `level` VPN fields come from the VA, and the PTE's matching PPN
+     * bits must be zero — a misaligned superpage faults. */
+    uint64_t ppn = (pte >> 10) & ppnmask;
+    if (level > 0) {
+        uint64_t low = ((uint64_t)1 << (level * vpnbits)) - 1;
+        if (ppn & low) return pf_cause(acc);   /* misaligned superpage */
+        ppn = (ppn & ~low) | ((va >> 12) & low);
     }
 
     /* Maintain accessed/dirty in hardware: A on any access, D on a store. */
-    uint32_t newpte = pte | PTE_A | (acc == ACC_STORE ? PTE_D : 0);
-    if (newpte != pte) mem_write32(cpu->mem, pte_addr, newpte);
+    uint64_t newpte = pte | PTE_A | (acc == ACC_STORE ? PTE_D : 0);
+    if (newpte != pte) {
+        if (ptesize == 4) mem_write32(cpu->mem, pte_addr, (uint32_t)newpte);
+        else              mem_write64(cpu->mem, pte_addr, newpte);
+    }
 
     if (acc != ACC_STORE) { /* cache the fresh translation */
         TlbEntry *e = &cpu->tlb[cpu->tlb_next];
-        e->valid = 1; e->vpn = vpn; e->asid = asid; e->ppn = ppn;
-        e->pte_flags = newpte & 0xff;
+        e->valid = 1; e->vpn = vpn; e->asid = (uint32_t)asid; e->ppn = ppn;
+        e->pte_flags = (uint32_t)(newpte & 0xff);
         cpu->tlb_next = (cpu->tlb_next + 1) % TLB_ENTRIES;
     }
 
