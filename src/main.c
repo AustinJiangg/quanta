@@ -88,27 +88,28 @@ static int parse_size(const char *s, uint32_t *out) {
  * taken around the step through the public accessors, so the engine core stays
  * untouched. */
 static void trace_step(Quanta *q) {
-    uint32_t pc   = quanta_pc(q);
+    int      w    = (quanta_xlen(q) == 64) ? 16 : 8; /* hex digits per XLEN value */
+    uint64_t pc   = quanta_pc(q);
     uint32_t raw  = quanta_read_u32(q, pc, NULL);
-    /* The low two bits give the length: a 16-bit compressed instruction (RV32C)
+    /* The low two bits give the length: a 16-bit compressed instruction (RVC)
      * unless they are 0b11. Show only the bytes that belong to it. */
     uint32_t ilen = ((raw & 0x3u) == 0x3u) ? 4u : 2u;
     uint32_t inst = (ilen == 2) ? (raw & 0xffffu) : raw;
-    uint32_t before[32];
+    uint64_t before[32];
     for (int i = 0; i < 32; i++) before[i] = quanta_reg(q, i);
 
     char text[80];
-    disasm(pc, inst, text, sizeof text);
+    disasm(pc, inst, quanta_xlen(q), text, sizeof text);
 
     quanta_step(q);
 
-    if (ilen == 2) fprintf(stderr, "%08x:  %04x      %-24s", pc, inst, text);
-    else           fprintf(stderr, "%08x:  %08x  %-24s", pc, inst, text);
+    if (ilen == 2) fprintf(stderr, "%0*llx:  %04x      %-24s", w, (unsigned long long)pc, inst, text);
+    else           fprintf(stderr, "%0*llx:  %08x  %-24s", w, (unsigned long long)pc, inst, text);
     for (int i = 1; i < 32; i++) /* x0 is hardwired; it can never change */
         if (quanta_reg(q, i) != before[i])
-            fprintf(stderr, " %s=0x%08x", quanta_reg_name(i), quanta_reg(q, i));
+            fprintf(stderr, " %s=0x%0*llx", quanta_reg_name(i), w, (unsigned long long)quanta_reg(q, i));
     if (quanta_pc(q) != pc + ilen) /* taken branch, jump, or trap */
-        fprintf(stderr, " ->0x%08x", quanta_pc(q));
+        fprintf(stderr, " ->0x%0*llx", w, (unsigned long long)quanta_pc(q));
     fprintf(stderr, "\n");
 }
 
@@ -271,18 +272,20 @@ int main(int argc, char **argv) {
     }
 
     /* The loader set PC to the entry point and sp to the top of the region. */
-    uint32_t entry = quanta_pc(q);
-    uint32_t sp    = quanta_reg(q, 2);
+    uint64_t entry = quanta_pc(q);
+    uint64_t sp    = quanta_reg(q, 2);
+    int      w     = (quanta_xlen(q) == 64) ? 16 : 8; /* hex digits per XLEN value */
 
     if (!quiet) {
-        printf("Quanta — RV32I emulator\n");
+        printf("Quanta — RV%d emulator\n", quanta_xlen(q) ? quanta_xlen(q) : 32);
         if (demo) {
             printf("No ELF given; running the built-in demo program.\n\n");
         } else {
             /* The loader hands the guest a device tree per the RISC-V boot
              * contract: a0 = hartid, a1 = dtb (reported here for visibility). */
-            printf("Loaded %s (entry = 0x%08x, sp = 0x%08x, dtb = 0x%08x)\n\n",
-                   path, entry, sp, quanta_dtb_addr(q));
+            printf("Loaded %s (entry = 0x%0*llx, sp = 0x%0*llx, dtb = 0x%0*llx)\n\n",
+                   path, w, (unsigned long long)entry, w, (unsigned long long)sp,
+                   w, (unsigned long long)quanta_dtb_addr(q));
         }
     }
 
@@ -351,7 +354,7 @@ int main(int argc, char **argv) {
         } else if (halt != QUANTA_RUN) {
             printf("Halted: %s", quanta_halt_str(halt));
             if (halt == QUANTA_HALT_MEM_FAULT)
-                printf(" at 0x%08x", quanta_fault_addr(q));
+                printf(" at 0x%0*llx", w, (unsigned long long)quanta_fault_addr(q));
             printf(" after %llu instruction(s).\n\n", (unsigned long long)steps);
         } else {
             printf("Stopped at the %llu-instruction safety limit.\n\n",

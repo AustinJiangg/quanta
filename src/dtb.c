@@ -186,7 +186,7 @@ size_t dtb_build(uint8_t *buf, size_t cap, const DtbConfig *cfg) {
     prop_str(&f, "status", "okay");
     prop_str(&f, "compatible", "riscv");
     prop_str(&f, "riscv,isa", cfg->isa);
-    prop_str(&f, "mmu-type", "riscv,sv32");
+    prop_str(&f, "mmu-type", cfg->mmu_type);
     begin_node(&f, "interrupt-controller");
     prop_u32(&f, "#interrupt-cells", 1);
     prop_empty(&f, "interrupt-controller");

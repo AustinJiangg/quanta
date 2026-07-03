@@ -61,15 +61,22 @@ static int perm_ok(const CPU *cpu, uint32_t pte, AccessType acc, uint32_t priv) 
     return 0;
 }
 
-uint32_t mmu_translate(CPU *cpu, uint32_t va, AccessType acc, uint32_t *pa) {
+uint32_t mmu_translate(CPU *cpu, uint64_t va, AccessType acc, uint64_t *pa) {
     uint32_t satp = cpu->csr[CSR_SATP];
     uint32_t priv = eff_priv(cpu, acc);
 
-    /* Machine mode and Bare mode access physical memory directly. */
-    if (priv == PRIV_M || !(satp & SATP_SV32)) { *pa = va; return 0; }
+    if (cpu->xlen == 32) va &= 0xffffffffu; /* recover a sign-extended RV32 VA */
+
+    /* Machine mode, Bare mode, and (for now) all of RV64 access physical memory
+     * directly. Sv32 is an RV32 scheme; RV64's Sv39 walk is M18, so until then an
+     * RV64 satp resolves to Bare here. */
+    if (priv == PRIV_M || cpu->xlen != 32 || !(satp & SATP_SV32)) {
+        *pa = va;
+        return 0;
+    }
 
     uint32_t asid = (satp >> 22) & 0x1ff;
-    uint32_t vpn  = va >> 12;
+    uint64_t vpn  = va >> 12;
 
     /* TLB serves fetches and loads; stores always walk so the dirty bit is set
      * on the real PTE before the write is allowed to land. */
@@ -85,24 +92,25 @@ uint32_t mmu_translate(CPU *cpu, uint32_t va, AccessType acc, uint32_t *pa) {
     }
 
     /* Two-level walk from the root table at satp.PPN. */
-    uint32_t a = (satp & 0x3fffffu) << 12;
-    uint32_t pte = 0, pte_addr = 0;
+    uint64_t a = (uint64_t)(satp & 0x3fffffu) << 12;
+    uint32_t pte = 0;
+    uint64_t pte_addr = 0;
     int level;
     for (level = 1; ; level--) {
         uint32_t idx = (va >> (12 + level * 10)) & 0x3ff;
-        pte_addr = a + idx * 4;
+        pte_addr = a + (uint64_t)idx * 4;
         pte = mem_read32(cpu->mem, pte_addr);
         if (cpu->mem->fault) { cpu->mem->fault = 0; return pf_cause(acc); }
         if (!(pte & PTE_V) || (!(pte & PTE_R) && (pte & PTE_W)))
             return pf_cause(acc);              /* invalid, or W without R */
         if (pte & (PTE_R | PTE_X)) break;      /* a leaf */
         if (level == 0) return pf_cause(acc);  /* no leaf at the last level */
-        a = ((pte >> 10) & 0x3fffffu) << 12;   /* descend to the next table */
+        a = (uint64_t)((pte >> 10) & 0x3fffffu) << 12; /* descend to next table */
     }
 
     if (!perm_ok(cpu, pte, acc, priv)) return pf_cause(acc);
 
-    uint32_t ppn;
+    uint64_t ppn;
     if (level == 1) {                           /* 4 MiB megapage */
         if ((pte >> 10) & 0x3ff) return pf_cause(acc); /* misaligned superpage */
         ppn = (((pte >> 20) & 0xfff) << 10) | ((va >> 12) & 0x3ff);

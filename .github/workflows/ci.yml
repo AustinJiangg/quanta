@@ -79,6 +79,11 @@ jobs:
       - name: Differential vs qemu-riscv32
         run: make check-diff
 
+      # qemu-user-static also provides qemu-riscv64-static, so the RV64 suite's
+      # golden-model differential runs here too.
+      - name: RV64 conformance vs qemu-riscv64
+        run: make check-rv64
+
   conformance:
     runs-on: ubuntu-latest
     name: conformance (riscv-arch-test)

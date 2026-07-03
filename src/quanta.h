@@ -23,9 +23,9 @@ extern "C" {
 /* --- version (Semantic Versioning, https://semver.org) --- */
 
 #define QUANTA_VERSION_MAJOR 0
-#define QUANTA_VERSION_MINOR 1
+#define QUANTA_VERSION_MINOR 2
 #define QUANTA_VERSION_PATCH 0
-#define QUANTA_VERSION_STRING "0.1.0"
+#define QUANTA_VERSION_STRING "0.2.0"
 
 /* The library version as "MAJOR.MINOR.PATCH" (== QUANTA_VERSION_STRING), for
  * when only the linked runtime is at hand rather than the headers — e.g. the
@@ -118,34 +118,38 @@ QuantaHalt quanta_run(Quanta *q, uint64_t max_steps, uint64_t *steps_out);
 
 /* --- introspection --- */
 
-uint32_t quanta_reg(const Quanta *q, int i);        /* x0..x31; 0 for x0/oob */
-void     quanta_set_reg(Quanta *q, int i, uint32_t value);
-uint32_t quanta_pc(const Quanta *q);
-void     quanta_set_pc(Quanta *q, uint32_t pc);
+uint64_t quanta_reg(const Quanta *q, int i);        /* x0..x31; 0 for x0/oob */
+void     quanta_set_reg(Quanta *q, int i, uint64_t value);
+uint64_t quanta_pc(const Quanta *q);
+void     quanta_set_pc(Quanta *q, uint64_t pc);
+
+/* The register width of the loaded program: 32 (RV32) or 64 (RV64). 0 if none
+ * is loaded. Lets a caller format addresses/registers to the right width. */
+int      quanta_xlen(const Quanta *q);
 
 /* Read/write guest memory without disturbing CPU fault state. Returns
  * QUANTA_ERR_RANGE if [addr, addr+len) leaves the mapped region. */
-QuantaStatus quanta_mem_read(const Quanta *q, uint32_t addr,
+QuantaStatus quanta_mem_read(const Quanta *q, uint64_t addr,
                              void *dst, size_t len);
-QuantaStatus quanta_mem_write(Quanta *q, uint32_t addr,
+QuantaStatus quanta_mem_write(Quanta *q, uint64_t addr,
                               const void *src, size_t len);
 
 /* Read a little-endian 32-bit word (e.g. an instruction). Returns 0 when `addr`
  * is out of range; pass `ok` (non-NULL) to tell a real 0 from out-of-range. */
-uint32_t quanta_read_u32(const Quanta *q, uint32_t addr, int *ok);
+uint32_t quanta_read_u32(const Quanta *q, uint64_t addr, int *ok);
 
 /* Current halt reason, and when relevant the exit status / faulting address. */
 QuantaHalt quanta_halt_reason(const Quanta *q);
 uint32_t   quanta_exit_code(const Quanta *q);
-uint32_t   quanta_fault_addr(const Quanta *q);
+uint64_t   quanta_fault_addr(const Quanta *q);
 
 /* Bounds of the mapped guest region. */
-uint32_t quanta_mem_base(const Quanta *q);
-uint32_t quanta_mem_size(const Quanta *q);
+uint64_t quanta_mem_base(const Quanta *q);
+uint64_t quanta_mem_size(const Quanta *q);
 
 /* Physical address of the device tree handed to the guest at boot (in a1), or 0
  * if none was placed (e.g. a raw image load). See dtb.h. */
-uint32_t quanta_dtb_addr(const Quanta *q);
+uint64_t quanta_dtb_addr(const Quanta *q);
 
 /* Human-readable name for a halt state. */
 const char *quanta_halt_str(QuantaHalt h);

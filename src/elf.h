@@ -5,20 +5,22 @@
 #include "memory.h"
 
 /*
- * Minimal ELF32 loader for RV32I executables.
+ * Minimal ELF32/ELF64 loader for RISC-V executables.
  *
  * An ELF file is two things at once: a description of how to build a memory
  * image, and the bytes to build it from. The loader reads the ELF header to
  * find the program-header table, walks that table, and copies every PT_LOAD
  * segment from its file offset to its virtual address in guest memory. The
- * entry point recorded in the header becomes the initial PC.
+ * entry point recorded in the header becomes the initial PC, and the file class
+ * (ELFCLASS32 vs ELFCLASS64) selects the register width — RV32 or RV64.
  *
- * We parse only what a static, pre-linked RV32I executable needs: the ELF
- * header and the program headers. Sections, symbols, and relocations are
- * ignored — they matter to linkers, not to running an already-linked image.
+ * We parse only what a static, pre-linked executable needs: the ELF header and
+ * the program headers. Sections, symbols, and relocations are ignored — they
+ * matter to linkers, not to running an already-linked image.
  */
 
-/* Load the ELF32 executable at `path`, reporting its entry point in `*entry`.
+/* Load the ELF32/ELF64 executable at `path`, reporting its entry point in
+ * `*entry` and its register width (32 or 64) in `*xlen`.
  *
  * On success `*mem` is allocated and initialised to span the program's load
  * image — from the lowest PT_LOAD virtual address to the highest — plus stack
@@ -34,8 +36,9 @@
  * image-sized behaviour.
  *
  * Returns 0 on success, or -1 on any error (a diagnostic is printed to stderr).
- * On failure `*mem` is left unallocated and `*entry` is left unset. */
-int elf_load(const char *path, Memory *mem, uint32_t *entry, uint32_t min_size);
+ * On failure `*mem` is left unallocated and `*entry`/`*xlen` are left unset. */
+int elf_load(const char *path, Memory *mem, uint64_t *entry, int *xlen,
+             uint32_t min_size);
 
 /* Look up a symbol by name in the ELF at `path`, writing its address (st_value)
  * to `*out`. Returns 0 if found, -1 otherwise (parse error, a stripped object

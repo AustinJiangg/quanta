@@ -54,7 +54,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-os check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -136,6 +136,27 @@ $(KOS_ELF): $(KOS_SRC) tests/os/kernel.ld
 	$(RVCC) $(KOS_CFLAGS) -T tests/os/kernel.ld -o $@ $(KOS_SRC)
 	@echo "Built $@ — boot with: ./quanta --memory=8M $@"
 
+# RV64 conformance (M17): the same hand-written style as the RV32 suite but at
+# XLEN=64 — the *W ops, LD/SD, 6-bit shifts, RV64M/RV64A, RV64C, and a privileged
+# trap test. They live in tests/rv64/ so the RV32 tests/*.S glob and its ilp32
+# pattern rule never build them. One -march (rv64imac_zicsr, lp64) is a superset
+# that assembles all of them; check-rv64 differential-tests the user-mode ones
+# against qemu-riscv64.
+RV64_SRC := $(wildcard tests/rv64/*.S)
+RV64_ELF := $(RV64_SRC:.S=.elf)
+RV64FLAGS := -march=rv64imac_zicsr -mabi=lp64 -nostdlib -nostartfiles \
+             -Ttext=0x80000000 -Itests
+
+tests/rv64/%.elf: tests/rv64/%.S
+	$(RVCC) $(RV64FLAGS) -o $@ $<
+	@echo "Built $@ — run with: ./quanta $@"
+
+# The privileged trap test's handler advances mepc by a fixed 4 bytes, so its
+# ebreak must stay 4-byte: build it without the compressed extension, which would
+# otherwise assemble ebreak as a 2-byte c.ebreak and over-advance the return
+# (the same reason the RV32 test_trap.S is built -march=rv32i_zicsr, no C).
+tests/rv64/test_rv64_priv.elf: RV64FLAGS := $(subst rv64imac_zicsr,rv64ima_zicsr,$(RV64FLAGS))
+
 # Run the RV32I conformance suite (tests/test_*.S) through the emulator. Each
 # test exits 0 on success or the number of its first failed check, which quanta
 # propagates as its own exit status; we use that to print PASS/FAIL per file.
@@ -190,6 +211,13 @@ check-sbi: $(BIN) tests/test_sbi.elf
 check-os: $(BIN) $(KOS_ELF)
 	@sh tests/check_os.sh
 
+# Run the RV64 conformance suite (tests/rv64/): each program exits 0 on success,
+# and the user-mode ones are cross-checked against qemu-riscv64 — M17's "done
+# when", RV64IMAC running and agreeing with a golden model. Skips the differential
+# cleanly if qemu-riscv64 is absent.
+check-rv64: $(BIN) $(RV64_ELF)
+	@sh tests/check_rv64.sh $(RV64_ELF)
+
 # Differential test: compare quanta against a reference simulator (qemu-riscv32
 # by default; override with REF=...) on the sample programs. Skips cleanly if
 # the reference simulator is not installed.
@@ -226,7 +254,7 @@ sanitize:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
-		check-devices check-sbi check-os check-diff
+		check-devices check-sbi check-os check-rv64 check-diff
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
 # the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`
@@ -286,6 +314,6 @@ uninstall:
 
 clean:
 	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/*.elf tests/os/*.elf \
-		$(FUZZ_TARGETS) fuzz/*.replay \
+		tests/rv64/*.elf $(FUZZ_TARGETS) fuzz/*.replay \
 		src/*.gcno src/*.gcda examples/*.gcno examples/*.gcda
 	rm -rf build/arch-work build/coverage

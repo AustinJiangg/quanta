@@ -775,15 +775,40 @@ privileged tests.
 
 ### Stage 4 — Mainstream OS (triggers RV64) (M17–M19)
 
-## M17 — RV64GC transition
+## M17 — RV64 transition (RV64IMAC) (DONE)
 
-- [ ] **Build:** parameterise XLEN (a width-agnostic register/ALU/decode path),
-  taking the core to RV64. The Spike differential harness (E5) is the safety net
-  for the whole refactor.
-- [ ] **ISA:** RV64I/M/A/C (and F/D from M11) — the GC base.
-- [ ] **Concept:** XLEN parameterisation; why the world standardised on RV64GC.
-- [ ] **Done when:** the RV64 conformance and differential suites pass.
-- [ ] **Commits:** `refactor: parameterise xlen`, `feat: add rv64 base`,
+The width parameterisation: the core stops being RV32-only and runs RV64 too,
+selected per program from the ELF class. Rather than two builds, XLEN is a
+*runtime* property (`cpu->xlen`): every register, the PC, the CSRs, and every
+address are stored as 64 bits, and a single `sext_xlen` helper (applied at
+`reg_write` and the PC update) keeps the Spike-style invariant that in RV32 mode
+a register holds the sign-extension of its 32-bit value. So one `./quanta` runs
+either width, and the executor stays mostly width-agnostic — add/compare/logic
+are automatic once results re-sign-extend; only the shifts, the `*W` ops, and the
+loads carry an explicit width branch. The MMU masks a VA to XLEN at its single
+choke point (recovering the real address from a sign-extended RV32 register), and
+RV64 runs Bare (Sv32 is an RV32 scheme; RV64's Sv39 walk is M18). The pieces:
+the widened datapath (RV32 stays bit-identical, the green checkpoint proving it),
+RV64 integer + `*W` + RV64M/RV64A (gated illegal in RV32), RV64C by the same
+expand-to-32-bit path (C.ADDIW/C.LD/C.SD/C.LDSP/C.SDSP/C.SUBW/C.ADDW, 6-bit
+shifts), the XLEN-wide CSRs and the interrupt-cause bit that moves to bit 63,
+the ELF64 loader, and the width-aware disassembler, GDB stub (riscv:rv64,
+64-bit register packets), and boot device tree. `tests/rv64/` is the hand-written
+RV64 conformance suite — the `*W` ops, LD/SD, 6-bit shifts, RV64M/RV64A, RV64C,
+and a privileged trap test (a 64-bit CSR round-trip that would truncate on RV32);
+the user-mode ones are differential-tested against **qemu-riscv64** (`make
+check-rv64`), the golden-model net the roadmap called for. RV32F/D stay deferred
+(as in M11), so this is RV64IMAC, not the full GC — the "G" (F/D) and the RV64
+Sv39 paging both wait, F/D until a guest needs it and Sv39 for M18.
+
+- [x] **Build:** parameterise XLEN (a width-agnostic register/ALU/decode path),
+  taking the core to RV64. The qemu-riscv64 differential harness (E5) is the
+  safety net for the whole refactor. *(Runtime XLEN, single binary.)*
+- [x] **ISA:** RV64I/M/A/C — the IMAC base. *(F/D deferred with M11.)*
+- [x] **Concept:** XLEN parameterisation; why the world standardised on RV64.
+- [x] **Done when:** the RV64 conformance and differential suites pass
+  (`make check-rv64`; RV32 stays green).
+- [x] **Commits:** `refactor: parameterise xlen`, `feat: add rv64 base`,
   `test: rv64 conformance and differential`.
 
 ## M18 — Sv39 + boot a mainstream OS

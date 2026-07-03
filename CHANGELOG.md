@@ -9,6 +9,22 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **RV64 transition (RV64IMAC)** — the core is now width-parameterised and runs
+  RV64 as well as RV32, selected per program from the ELF class rather than by a
+  separate build. XLEN is a runtime property (`cpu->xlen`): all state is stored in
+  64-bit fields, and a Spike-style `sext_xlen` invariant (RV32 registers hold the
+  sign-extension of their 32-bit value) keeps the executor mostly width-agnostic —
+  only the shifts, the `*W` word ops, and the loads carry an explicit width
+  branch. Adds RV64I (the `*W` ops, LD/SD/LWU, 6-bit shifts), RV64M and RV64A
+  (`.D` doublewords), and RV64C (C.ADDIW/C.LD/C.SD/C.LDSP/C.SDSP/C.SUBW/C.ADDW,
+  6-bit shifts) via the same expand-to-32-bit path; the CSRs become XLEN-wide and
+  the mcause interrupt bit moves to bit 63; the ELF64 loader, disassembler, GDB
+  stub (`riscv:rv64`, 64-bit register packets), and boot device tree are all
+  width-aware. Every RV64-only encoding traps illegal in RV32, so the RV32 suite
+  is bit-for-bit unchanged. RV64 runs Bare (Sv39 paging is deferred), and RV32F/D
+  stay deferred, so this is RV64IMAC not the full GC. New `tests/rv64/`
+  conformance suite and `make check-rv64`, differential-tested against
+  `qemu-riscv64`. (M17)
 - **Boot a small RV32 OS** — a from-scratch teaching kernel (`tests/os/`) that
   boots on Quanta and runs a userspace process, the integration of everything
   M8–M15 built. An M-mode boot stub delegates user traps to Supervisor mode and

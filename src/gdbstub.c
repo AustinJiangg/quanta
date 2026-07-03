@@ -42,50 +42,10 @@
 #define SIG_TRAP  5   /* SIGTRAP — step done / breakpoint            */
 #define SIG_SEGV 11   /* SIGSEGV — access outside mapped memory      */
 
-/* RV32 target description (x0..x31 then pc, regnums 0..32). Single-quoted XML
- * attributes keep the C string free of escapes; gdb accepts either quote. The
- * register order here matches the g/G packet layout below. */
-static const char TARGET_XML[] =
-    "<?xml version='1.0'?>\n"
-    "<!DOCTYPE target SYSTEM 'gdb-target.dtd'>\n"
-    "<target version='1.0'>\n"
-    "  <architecture>riscv:rv32</architecture>\n"
-    "  <feature name='org.gnu.gdb.riscv.cpu'>\n"
-    "    <reg name='zero' bitsize='32' type='int' regnum='0'/>\n"
-    "    <reg name='ra'   bitsize='32' type='code_ptr'/>\n"
-    "    <reg name='sp'   bitsize='32' type='data_ptr'/>\n"
-    "    <reg name='gp'   bitsize='32' type='data_ptr'/>\n"
-    "    <reg name='tp'   bitsize='32' type='data_ptr'/>\n"
-    "    <reg name='t0'   bitsize='32' type='int'/>\n"
-    "    <reg name='t1'   bitsize='32' type='int'/>\n"
-    "    <reg name='t2'   bitsize='32' type='int'/>\n"
-    "    <reg name='fp'   bitsize='32' type='data_ptr'/>\n"
-    "    <reg name='s1'   bitsize='32' type='int'/>\n"
-    "    <reg name='a0'   bitsize='32' type='int'/>\n"
-    "    <reg name='a1'   bitsize='32' type='int'/>\n"
-    "    <reg name='a2'   bitsize='32' type='int'/>\n"
-    "    <reg name='a3'   bitsize='32' type='int'/>\n"
-    "    <reg name='a4'   bitsize='32' type='int'/>\n"
-    "    <reg name='a5'   bitsize='32' type='int'/>\n"
-    "    <reg name='a6'   bitsize='32' type='int'/>\n"
-    "    <reg name='a7'   bitsize='32' type='int'/>\n"
-    "    <reg name='s2'   bitsize='32' type='int'/>\n"
-    "    <reg name='s3'   bitsize='32' type='int'/>\n"
-    "    <reg name='s4'   bitsize='32' type='int'/>\n"
-    "    <reg name='s5'   bitsize='32' type='int'/>\n"
-    "    <reg name='s6'   bitsize='32' type='int'/>\n"
-    "    <reg name='s7'   bitsize='32' type='int'/>\n"
-    "    <reg name='s8'   bitsize='32' type='int'/>\n"
-    "    <reg name='s9'   bitsize='32' type='int'/>\n"
-    "    <reg name='s10'  bitsize='32' type='int'/>\n"
-    "    <reg name='s11'  bitsize='32' type='int'/>\n"
-    "    <reg name='t3'   bitsize='32' type='int'/>\n"
-    "    <reg name='t4'   bitsize='32' type='int'/>\n"
-    "    <reg name='t5'   bitsize='32' type='int'/>\n"
-    "    <reg name='t6'   bitsize='32' type='int'/>\n"
-    "    <reg name='pc'   bitsize='32' type='code_ptr'/>\n"
-    "  </feature>\n"
-    "</target>\n";
+/* The target description (x0..x31 then pc, regnums 0..32) is built per
+ * connection by build_target_xml() below, so each register's bitsize tracks the
+ * loaded program's width (RV32 vs RV64). The register order matches the g/G
+ * packet layout. */
 
 typedef struct {
     int      fd;                  /* the connected debugger socket */
@@ -93,7 +53,7 @@ typedef struct {
     int      feat_swbreak;        /* gdb negotiated the swbreak stop reason */
     int      dead;               /* connection lost — end the session */
     int      want_quit;          /* debugger detached/killed — end the session */
-    uint32_t bp[GDB_MAX_BP];     /* software-breakpoint addresses */
+    uint64_t bp[GDB_MAX_BP];     /* software-breakpoint addresses */
     int      bp_used[GDB_MAX_BP];
 } GdbStub;
 
@@ -114,25 +74,30 @@ static char nibble_hex(unsigned v) {
     return digits[v & 0xfu];
 }
 
-/* Encode a 32-bit value as 8 hex chars, low byte first (the RSP register/memory
- * byte order). Writes exactly 8 chars to out. */
-static void u32_to_hex_le(uint32_t v, char *out) {
-    for (size_t b = 0; b < 4; b++) {
+/* Bytes per XLEN-wide register in the RSP packets: 4 for RV32, 8 for RV64. */
+static int reg_bytes(const GdbStub *s) {
+    return quanta_xlen(s->q) == 64 ? 8 : 4;
+}
+
+/* Encode the low `nbytes` of `v` as 2*nbytes hex chars, low byte first (the RSP
+ * register/memory byte order). Writes exactly 2*nbytes chars to out. */
+static void val_to_hex_le(uint64_t v, int nbytes, char *out) {
+    for (size_t b = 0; b < (size_t)nbytes; b++) {
         unsigned byte = (v >> (8u * b)) & 0xffu;
         out[2 * b]     = nibble_hex(byte >> 4);
         out[2 * b + 1] = nibble_hex(byte);
     }
 }
 
-/* Decode 8 hex chars (low byte first) into a 32-bit value. Returns -1 on a
+/* Decode 2*nbytes hex chars (low byte first) into *out. Returns -1 on a
  * non-hex digit. */
-static int hex_to_u32_le(const char *s, uint32_t *out) {
-    uint32_t v = 0;
-    for (size_t b = 0; b < 4; b++) {
+static int hex_to_val_le(const char *s, int nbytes, uint64_t *out) {
+    uint64_t v = 0;
+    for (size_t b = 0; b < (size_t)nbytes; b++) {
         int hi = hex_nibble((unsigned char)s[2 * b]);
         int lo = hex_nibble((unsigned char)s[2 * b + 1]);
         if (hi < 0 || lo < 0) return -1;
-        v |= (uint32_t)(((unsigned)hi << 4) | (unsigned)lo) << (8u * b);
+        v |= (uint64_t)(((unsigned)hi << 4) | (unsigned)lo) << (8u * b);
     }
     *out = v;
     return 0;
@@ -244,13 +209,13 @@ static int interrupt_pending(GdbStub *s) {
 
 /* --- breakpoints (stub-managed, address compared in the continue loop) --- */
 
-static int bp_match(const GdbStub *s, uint32_t addr) {
+static int bp_match(const GdbStub *s, uint64_t addr) {
     for (int i = 0; i < GDB_MAX_BP; i++)
         if (s->bp_used[i] && s->bp[i] == addr) return 1;
     return 0;
 }
 
-static int bp_add(GdbStub *s, uint32_t addr) {
+static int bp_add(GdbStub *s, uint64_t addr) {
     if (bp_match(s, addr)) return 1;  /* already set is a success */
     for (int i = 0; i < GDB_MAX_BP; i++) {
         if (!s->bp_used[i]) {
@@ -262,7 +227,7 @@ static int bp_add(GdbStub *s, uint32_t addr) {
     return 0;  /* table full */
 }
 
-static void bp_remove(GdbStub *s, uint32_t addr) {
+static void bp_remove(GdbStub *s, uint64_t addr) {
     for (int i = 0; i < GDB_MAX_BP; i++)
         if (s->bp_used[i] && s->bp[i] == addr) s->bp_used[i] = 0;
 }
@@ -334,45 +299,49 @@ static int continue_and_reply(GdbStub *s) {
 /* --- packet handlers --- */
 
 static int handle_read_regs(GdbStub *s) {
-    char out[33 * 8 + 1];
+    int nb = reg_bytes(s), nc = nb * 2;
+    char out[33 * 16 + 1];
     for (int i = 0; i < 32; i++)
-        u32_to_hex_le(quanta_reg(s->q, i), out + (size_t)i * 8);
-    u32_to_hex_le(quanta_pc(s->q), out + (size_t)32 * 8);
-    out[(size_t)33 * 8] = '\0';
+        val_to_hex_le(quanta_reg(s->q, i), nb, out + (size_t)i * nc);
+    val_to_hex_le(quanta_pc(s->q), nb, out + (size_t)32 * nc);
+    out[(size_t)33 * nc] = '\0';
     return send_packet(s, out);
 }
 
 static int handle_write_regs(GdbStub *s, const char *args) {
-    if (strlen(args) < (size_t)33 * 8) return send_packet(s, "E22");
+    int nb = reg_bytes(s), nc = nb * 2;
+    if (strlen(args) < (size_t)33 * nc) return send_packet(s, "E22");
     for (int i = 0; i < 32; i++) {
-        uint32_t v;
-        if (hex_to_u32_le(args + (size_t)i * 8, &v) != 0)
+        uint64_t v;
+        if (hex_to_val_le(args + (size_t)i * nc, nb, &v) != 0)
             return send_packet(s, "E22");
         quanta_set_reg(s->q, i, v);
     }
-    uint32_t pc;
-    if (hex_to_u32_le(args + (size_t)32 * 8, &pc) != 0)
+    uint64_t pc;
+    if (hex_to_val_le(args + (size_t)32 * nc, nb, &pc) != 0)
         return send_packet(s, "E22");
     quanta_set_pc(s->q, pc);
     return send_packet(s, "OK");
 }
 
 static int handle_read_reg(GdbStub *s, const char *args) {
+    int nb = reg_bytes(s);
     unsigned long n = strtoul(args, NULL, 16);
-    char out[9];
-    if (n < 32)        u32_to_hex_le(quanta_reg(s->q, (int)n), out);
-    else if (n == 32)  u32_to_hex_le(quanta_pc(s->q), out);
+    char out[17];
+    if (n < 32)        val_to_hex_le(quanta_reg(s->q, (int)n), nb, out);
+    else if (n == 32)  val_to_hex_le(quanta_pc(s->q), nb, out);
     else               return send_packet(s, "E01");
-    out[8] = '\0';
+    out[(size_t)nb * 2] = '\0';
     return send_packet(s, out);
 }
 
 static int handle_write_reg(GdbStub *s, const char *args) {
+    int nb = reg_bytes(s);
     char *p;
     unsigned long n = strtoul(args, &p, 16);
     if (*p != '=') return send_packet(s, "E22");
-    uint32_t v;
-    if (hex_to_u32_le(p + 1, &v) != 0) return send_packet(s, "E22");
+    uint64_t v;
+    if (hex_to_val_le(p + 1, nb, &v) != 0) return send_packet(s, "E22");
     if (n < 32)        quanta_set_reg(s->q, (int)n, v);
     else if (n == 32)  quanta_set_pc(s->q, v);
     else               return send_packet(s, "E01");
@@ -381,14 +350,14 @@ static int handle_write_reg(GdbStub *s, const char *args) {
 
 static int handle_read_mem(GdbStub *s, const char *args) {
     char *p;
-    unsigned long addr = strtoul(args, &p, 16);
+    unsigned long long addr = strtoull(args, &p, 16);
     if (*p != ',') return send_packet(s, "E22");
     unsigned long len = strtoul(p + 1, &p, 16);
     if (len == 0) return send_packet(s, "");
     if (len > GDB_MAX_PAYLOAD) len = GDB_MAX_PAYLOAD;
 
     unsigned char tmp[GDB_MAX_PAYLOAD];
-    if (quanta_mem_read(s->q, (uint32_t)addr, tmp, len) != QUANTA_OK)
+    if (quanta_mem_read(s->q, addr, tmp, len) != QUANTA_OK)
         return send_packet(s, "E0e");
 
     char out[GDB_BUFSZ];
@@ -402,7 +371,7 @@ static int handle_read_mem(GdbStub *s, const char *args) {
 
 static int handle_write_mem(GdbStub *s, const char *args) {
     char *p;
-    unsigned long addr = strtoul(args, &p, 16);
+    unsigned long long addr = strtoull(args, &p, 16);
     if (*p != ',') return send_packet(s, "E22");
     unsigned long len = strtoul(p + 1, &p, 16);
     if (*p != ':') return send_packet(s, "E22");
@@ -416,7 +385,7 @@ static int handle_write_mem(GdbStub *s, const char *args) {
         if (hi < 0 || lo < 0) return send_packet(s, "E22");
         tmp[i] = (unsigned char)((hi << 4) | lo);
     }
-    if (len && quanta_mem_write(s->q, (uint32_t)addr, tmp, len) != QUANTA_OK)
+    if (len && quanta_mem_write(s->q, addr, tmp, len) != QUANTA_OK)
         return send_packet(s, "E0e");
     return send_packet(s, "OK");
 }
@@ -428,12 +397,43 @@ static int handle_bp(GdbStub *s, const char *args, int set) {
     char *p;
     unsigned long type = strtoul(args, &p, 16);
     if (*p != ',') return send_packet(s, "E22");
-    unsigned long addr = strtoul(p + 1, &p, 16);
+    unsigned long long addr = strtoull(p + 1, &p, 16);
     if (type > 1) return send_packet(s, "");
     if (set)
-        return send_packet(s, bp_add(s, (uint32_t)addr) ? "OK" : "E22");
-    bp_remove(s, (uint32_t)addr);
+        return send_packet(s, bp_add(s, addr) ? "OK" : "E22");
+    bp_remove(s, addr);
     return send_packet(s, "OK");
+}
+
+/* Build the target description for the connected machine's width into `buf`,
+ * returning its length. Each register is 32-bit on RV32, 64-bit on RV64; the
+ * order (x0..x31 then pc) matches the g/G packets. */
+static size_t build_target_xml(const GdbStub *s, char *buf, size_t n) {
+    static const char *const names[33] = {
+        "zero","ra","sp","gp","tp","t0","t1","t2","fp","s1",
+        "a0","a1","a2","a3","a4","a5","a6","a7","s2","s3",
+        "s4","s5","s6","s7","s8","s9","s10","s11","t3","t4","t5","t6","pc"
+    };
+    static const char *const types[33] = {
+        "int","code_ptr","data_ptr","data_ptr","data_ptr","int","int","int","data_ptr","int",
+        "int","int","int","int","int","int","int","int","int","int",
+        "int","int","int","int","int","int","int","int","int","int","int","int","code_ptr"
+    };
+    int bits = (quanta_xlen(s->q) == 64) ? 64 : 32;
+    size_t len = 0;
+    len += (size_t)snprintf(buf + len, n - len,
+        "<?xml version='1.0'?>\n"
+        "<!DOCTYPE target SYSTEM 'gdb-target.dtd'>\n"
+        "<target version='1.0'>\n"
+        "  <architecture>riscv:rv%d</architecture>\n"
+        "  <feature name='org.gnu.gdb.riscv.cpu'>\n", bits);
+    for (int i = 0; i < 33 && len < n; i++)
+        len += (size_t)snprintf(buf + len, n - len,
+            "    <reg name='%s' bitsize='%d' type='%s'%s/>\n",
+            names[i], bits, types[i], i == 0 ? " regnum='0'" : "");
+    if (len < n)
+        len += (size_t)snprintf(buf + len, n - len, "  </feature>\n</target>\n");
+    return len < n ? len : n; /* clamp; the description fits well under n */
 }
 
 /* qXfer:features:read:<annex>:<off>,<len> — serve the target description. */
@@ -450,7 +450,8 @@ static int handle_qxfer(GdbStub *s, const char *args) {
     if (*p != ',') return send_packet(s, "E00");
     unsigned long length = strtoul(p + 1, &p, 16);
 
-    size_t total = strlen(TARGET_XML);
+    char xml[4096];
+    size_t total = build_target_xml(s, xml, sizeof xml);
     if (off >= total) return send_packet(s, "l");
     size_t avail = total - (size_t)off;
     size_t chunk = ((size_t)length < avail) ? (size_t)length : avail;
@@ -458,7 +459,7 @@ static int handle_qxfer(GdbStub *s, const char *args) {
 
     char out[GDB_BUFSZ];
     out[0] = ((size_t)off + chunk >= total) ? 'l' : 'm';
-    memcpy(out + 1, TARGET_XML + off, chunk);
+    memcpy(out + 1, xml + off, chunk);
     out[1 + chunk] = '\0';
     return send_packet(s, out);
 }

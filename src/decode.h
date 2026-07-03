@@ -102,8 +102,10 @@ enum {
     OP_STORE  = 0x23, /* SB/SH/SW                 */
     OP_FENCE  = 0x0f, /* FENCE / FENCE.I          */
     OP_IMM    = 0x13, /* ADDI/SLTI/.../SRAI       */
+    OP_IMM_32 = 0x1b, /* RV64: ADDIW/SLLIW/...    */
     OP_REG    = 0x33, /* ADD/SUB/.../AND          */
-    OP_AMO    = 0x2f, /* RV32A: LR/SC and AMO*    */
+    OP_REG_32 = 0x3b, /* RV64: ADDW/SUBW + W ops  */
+    OP_AMO    = 0x2f, /* RV-A: LR/SC and AMO*     */
     OP_SYSTEM = 0x73  /* ECALL/EBREAK/CSR         */
 };
 

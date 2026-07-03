@@ -53,10 +53,10 @@ static QuantaHalt map_halt(HaltReason r) {
 
 /* Bounds check shared by the peek/poke helpers, written to avoid 32-bit wrap.
  * Returns the host offset for `addr` (valid only when it returns QUANTA_OK). */
-static QuantaStatus in_range(const Memory *mem, uint32_t addr, size_t len,
-                            uint32_t *off) {
+static QuantaStatus in_range(const Memory *mem, uint64_t addr, size_t len,
+                            uint64_t *off) {
     if (addr < mem->base || len > mem->size ||
-        addr - mem->base > mem->size - (uint32_t)len) {
+        addr - mem->base > mem->size - (uint64_t)len) {
         return QUANTA_ERR_RANGE;
     }
     *off = addr - mem->base;
@@ -77,13 +77,13 @@ void quanta_destroy(Quanta *q) {
 /* Shared tail of the loaders: attach the CPU to memory at `entry`, re-attach the
  * cache if one is enabled, and set sp to the top of the region (16-byte aligned
  * per the RISC-V ABI) so the program can call functions and spill locals. */
-static void start_at(Quanta *q, uint32_t entry) {
-    cpu_init(&q->cpu, &q->mem, entry);
+static void start_at(Quanta *q, uint64_t entry, int xlen) {
+    cpu_init(&q->cpu, &q->mem, entry, xlen); /* xlen from the ELF class (raw: 32) */
     if (q->cache_on) q->cpu.cache = &q->cache;
     plat_init(&q->plat);      /* reset the MMIO devices */
     q->mem.plat = &q->plat;   /* attach them so MMIO is dispatched and timers tick */
     q->dtb_addr = 0;          /* set only by the boot handoff below (ELF path) */
-    reg_write(&q->cpu, 2, (q->mem.base + q->mem.size) & ~(uint32_t)0xf);
+    reg_write(&q->cpu, 2, (q->mem.base + q->mem.size) & ~(uint64_t)0xf);
     q->loaded = 1;
 }
 
@@ -95,14 +95,17 @@ static void start_at(Quanta *q, uint32_t entry) {
  * under a page) and sits in the loader's stack headroom; if it somehow does not
  * fit, we leave start_at's plain entry state untouched (a0/a1 = 0). */
 static void setup_boot(Quanta *q) {
+    int rv64 = (q->cpu.xlen == 64);
     DtbConfig cfg = {
-        .mem_base   = q->mem.base,   .mem_size  = q->mem.size,
+        .mem_base   = (uint32_t)q->mem.base, .mem_size = (uint32_t)q->mem.size,
         .clint_base = CLINT_BASE,    .clint_size = CLINT_SIZE,
         .plic_base  = PLIC_BASE,     .plic_size  = PLIC_SIZE,
         .uart_base  = UART_BASE,     .uart_size  = UART_SIZE,
         .uart_irq   = UART_IRQ,      .plic_ndev  = PLIC_NSOURCES - 1,
         .boot_hart  = 0,             .timebase_freq = 10000000,
-        .isa        = "rv32ima_zicsr_zifencei",
+        /* RV64 runs Bare until Sv39 (M18), so it advertises no MMU. */
+        .isa      = rv64 ? "rv64imac_zicsr" : "rv32ima_zicsr_zifencei",
+        .mmu_type = rv64 ? "riscv,none"     : "riscv,sv32",
     };
 
     uint8_t blob[DTB_MAX_SIZE];
@@ -121,9 +124,10 @@ static void setup_boot(Quanta *q) {
 
 QuantaStatus quanta_load_elf_ex(Quanta *q, const char *path, uint32_t min_mem) {
     if (!q || !path) return QUANTA_ERR_INVAL;
-    uint32_t entry;
-    if (elf_load(path, &q->mem, &entry, min_mem) != 0) return QUANTA_ERR_LOAD;
-    start_at(q, entry);
+    uint64_t entry;
+    int xlen;
+    if (elf_load(path, &q->mem, &entry, &xlen, min_mem) != 0) return QUANTA_ERR_LOAD;
+    start_at(q, entry, xlen);
     setup_boot(q);   /* hand the guest a device tree per the RISC-V boot contract */
     return QUANTA_OK;
 }
@@ -146,7 +150,7 @@ QuantaStatus quanta_load_image(Quanta *q, uint32_t base, uint32_t size,
         mem_free(&q->mem);
         return QUANTA_ERR_RANGE;
     }
-    start_at(q, entry);
+    start_at(q, entry, 32); /* hand-assembled raw images are RV32 */
     return QUANTA_OK;
 }
 
@@ -185,21 +189,30 @@ QuantaHalt quanta_run(Quanta *q, uint64_t max_steps, uint64_t *steps_out) {
     return q->cpu.halted ? map_halt(q->cpu.halt_reason) : QUANTA_HALT_STEP_LIMIT;
 }
 
-uint32_t quanta_reg(const Quanta *q, int i) {
-    if (!q || i < 0 || i > 31) return 0;
-    return reg_read(&q->cpu, (uint32_t)i);
+/* The architectural value of an XLEN-wide quantity for API consumers. RV32
+ * registers and PC are stored sign-extended into 64 bits internally, so mask to
+ * 32 bits to hand back the real 32-bit value (zero-extended); RV64 is unchanged.
+ * This also keeps a returned PC a valid address for quanta_read_u32/mem access. */
+static uint64_t xlen_val(const Quanta *q, uint64_t v) {
+    return q->cpu.xlen == 64 ? v : (v & 0xffffffffu);
 }
 
-void quanta_set_reg(Quanta *q, int i, uint32_t value) {
+uint64_t quanta_reg(const Quanta *q, int i) {
+    if (!q || i < 0 || i > 31) return 0;
+    return xlen_val(q, reg_read(&q->cpu, (uint32_t)i));
+}
+
+void quanta_set_reg(Quanta *q, int i, uint64_t value) {
     if (q && i >= 0 && i <= 31) reg_write(&q->cpu, (uint32_t)i, value);
 }
 
-uint32_t quanta_pc(const Quanta *q) { return q ? q->cpu.pc : 0; }
-void     quanta_set_pc(Quanta *q, uint32_t pc) { if (q) q->cpu.pc = pc; }
+uint64_t quanta_pc(const Quanta *q) { return q ? xlen_val(q, q->cpu.pc) : 0; }
+void     quanta_set_pc(Quanta *q, uint64_t pc) { if (q) q->cpu.pc = pc; }
+int      quanta_xlen(const Quanta *q) { return (q && q->loaded) ? q->cpu.xlen : 0; }
 
-QuantaStatus quanta_mem_read(const Quanta *q, uint32_t addr,
+QuantaStatus quanta_mem_read(const Quanta *q, uint64_t addr,
                              void *dst, size_t len) {
-    uint32_t off;
+    uint64_t off;
     QuantaStatus rc;
     if (!q || (len && !dst)) return QUANTA_ERR_INVAL;
     rc = in_range(&q->mem, addr, len, &off);
@@ -208,9 +221,9 @@ QuantaStatus quanta_mem_read(const Quanta *q, uint32_t addr,
     return QUANTA_OK;
 }
 
-QuantaStatus quanta_mem_write(Quanta *q, uint32_t addr,
+QuantaStatus quanta_mem_write(Quanta *q, uint64_t addr,
                               const void *src, size_t len) {
-    uint32_t off;
+    uint64_t off;
     QuantaStatus rc;
     if (!q || (len && !src)) return QUANTA_ERR_INVAL;
     rc = in_range(&q->mem, addr, len, &off);
@@ -219,7 +232,7 @@ QuantaStatus quanta_mem_write(Quanta *q, uint32_t addr,
     return QUANTA_OK;
 }
 
-uint32_t quanta_read_u32(const Quanta *q, uint32_t addr, int *ok) {
+uint32_t quanta_read_u32(const Quanta *q, uint64_t addr, int *ok) {
     uint8_t b[4];
     if (quanta_mem_read(q, addr, b, sizeof b) != QUANTA_OK) {
         if (ok) *ok = 0;
@@ -236,10 +249,10 @@ QuantaHalt quanta_halt_reason(const Quanta *q) {
 }
 
 uint32_t quanta_exit_code(const Quanta *q)  { return q ? q->cpu.exit_code : 0; }
-uint32_t quanta_fault_addr(const Quanta *q) { return q ? q->mem.fault_addr : 0; }
-uint32_t quanta_mem_base(const Quanta *q)   { return q ? q->mem.base : 0; }
-uint32_t quanta_mem_size(const Quanta *q)   { return q ? q->mem.size : 0; }
-uint32_t quanta_dtb_addr(const Quanta *q)   { return q ? q->dtb_addr : 0; }
+uint64_t quanta_fault_addr(const Quanta *q) { return q ? xlen_val(q, q->mem.fault_addr) : 0; }
+uint64_t quanta_mem_base(const Quanta *q)   { return q ? q->mem.base : 0; }
+uint64_t quanta_mem_size(const Quanta *q)   { return q ? q->mem.size : 0; }
+uint64_t quanta_dtb_addr(const Quanta *q)   { return q ? q->dtb_addr : 0; }
 
 const char *quanta_halt_str(QuantaHalt h) {
     switch (h) {
@@ -261,10 +274,11 @@ const char *quanta_reg_name(int i) {
 
 void quanta_dump_regs(const Quanta *q, FILE *out) {
     if (!q || !out) return;
-    fprintf(out, "pc = 0x%08x\n", quanta_pc(q));
+    int w = (quanta_xlen(q) == 64) ? 16 : 8; /* hex digits per XLEN-wide value */
+    fprintf(out, "pc = 0x%0*llx\n", w, (unsigned long long)quanta_pc(q));
     for (int i = 0; i < 32; i++) {
-        fprintf(out, "x%-2d %-4s = 0x%08x", i, reg_abi_name((uint32_t)i),
-                quanta_reg(q, i));
+        fprintf(out, "x%-2d %-4s = 0x%0*llx", i, reg_abi_name((uint32_t)i),
+                w, (unsigned long long)quanta_reg(q, i));
         fputs((i % 2) ? "\n" : "    ", out);
     }
 }

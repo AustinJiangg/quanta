@@ -14,8 +14,9 @@
 
 ## What this is
 
-Quanta is a from-scratch RISC-V (RV32I) instruction-set emulator in C, built to
-learn computer architecture. It models a single hart: 32 registers, a PC, and a
+Quanta is a from-scratch RISC-V (RV32 and RV64) instruction-set emulator in C,
+built to learn computer architecture. It models a single hart: 32 XLEN-wide
+registers (32 or 64 bits, chosen per program from the ELF class), a PC, and a
 flat little-endian memory. The core is a fetch/decode/execute loop.
 
 All roadmap milestones (M0–M7) are complete, and Part II is under way: the full
@@ -28,13 +29,16 @@ timer/IPI, a PLIC, and a 16550 UART reached through MMIO, M13), and a flattened
 device tree handed to the guest at boot per the RISC-V `a0`=hartid/`a1`=DTB
 convention (M14), an SBI firmware interface that services an S-mode guest's
 `ecall`s (console, timer, system reset, M15), and a small from-scratch teaching
-kernel that boots to userspace on all of it (`tests/os/`, `make check-os`, M16)
-are implemented
+kernel that boots to userspace on all of it (`tests/os/`, `make check-os`, M16),
+and the **RV64 transition** — a runtime-XLEN core that also runs RV64IMAC,
+selected per program from the ELF class (M17, `tests/rv64/`, `make check-rv64`,
+differential-tested against `qemu-riscv64`; RV32F/D and RV64 Sv39 paging stay
+deferred) — are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
 memory, and a `--pipeline` timing model estimates cycles and CPI.
-Quanta loads ELF32
+Quanta loads static little-endian ELF32/ELF64
 executables (`quanta program.elf`), services `write`/`exit` system calls through
 the ECALL path — the built-in SEE that runs until a guest installs its own trap
 handler — and returns the guest's exit status as its own. A hardcoded
@@ -69,6 +73,7 @@ make check-gdb     # drive the gdb remote stub with a self-contained client (nee
 make check-devices # check the MMIO devices and interrupt delivery (needs cross-toolchain)
 make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-toolchain)
 make check-os      # boot the M16 teaching kernel to userspace (needs cross-toolchain)
+make check-rv64    # RV64IMAC conformance (tests/rv64/), diff vs qemu-riscv64 (M17)
 make check-diff    # differential-test against qemu-riscv32 (needs qemu-user-static)
 make check-arch    # official riscv-arch-test conformance (needs cross-toolchain + clone)
 make sanitize      # build with ASan+UBSan and run the suite (needs cross-toolchain)
@@ -370,7 +375,42 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
 
 ## Gotchas
 
-- Register `x0` is hardwired to zero — enforced in `reg_write`. Don't bypass it.
+- RV32 vs RV64 (M17) is a **runtime** property, not two builds: `cpu->xlen` is 32
+  or 64, set from the ELF class by the loader (raw-image/demo default to 32). All
+  state — registers, PC, CSRs, addresses — is stored in 64-bit fields. The
+  invariant is the **Spike sign-extension convention**: in RV32 a register holds
+  the sign-extension of its 32-bit value (upper half = copy of bit 31), enforced
+  by `sext_xlen()` applied in `reg_write` and at the PC retire in `cpu_step`. So
+  the executor is mostly width-agnostic — add/sub/compare/logic give the right
+  XLEN result once `reg_write` re-sign-extends — and only the **right shifts**
+  (they pull the high bits down: use `(uint32_t)a` / `(int32_t)a` in RV32),
+  the **shift amount** (5 bits RV32, 6 bits RV64), and the width-defining ops
+  need an `xlen` branch. `imm_*` immediates sign-extend to 64 for both widths, so
+  PC/address arithmetic uses `(uint64_t)imm_*` and masks like `& ~(uint64_t)1`.
+- Because registers/PC are sign-extended internally, the **public API returns the
+  architectural value masked to XLEN** (`xlen_val()` in `quanta.c`): RV32
+  `quanta_reg`/`quanta_pc` hand back the low 32 bits (zero-extended), so a
+  returned PC is a valid address for `quanta_read_u32`/memory access and displays
+  as 8 hex digits; RV64 hands back the full 64. `main.c` and `quanta_dump_regs`
+  pick the field width from `quanta_xlen()`.
+- The MMU masks a VA to XLEN at its **single choke point** (`mmu_translate`
+  first recovers the real address from a sign-extended RV32 register). RV64 runs
+  **Bare** — Sv32 is an RV32 scheme, so the walk is gated on `xlen == 32`; RV64's
+  Sv39 walk is M18. `misa.MXL` is 1 (RV32) / 2 (RV64); the mcause/scause
+  **interrupt bit** is the top XLEN bit (bit 31 RV32, bit 63 RV64) via
+  `cause_interrupt()`; the RV32-only high-half CSRs (`cycleh`/`timeh`/`instreth`/
+  `mstatush`) trap illegal on RV64.
+- The RV64-only instructions (OP-32/OP-IMM-32 `*W`, LD/SD/LWU, the `.D` atomics,
+  and the RV64C forms via `rvc_expand(c, rv64)`) are **gated to raise illegal in
+  RV32**, so every RV32 test is unaffected — the widening kept `make check`,
+  `check-arch`, `check-diff`, and `check-os` bit-for-bit green (the refactor's
+  safety checkpoint). RV32F/D remain deferred (M11), so M17 is RV64IMAC.
+- The RV64 conformance suite is `tests/rv64/` (own Makefile rule, built
+  `-march=rv64imac_zicsr -mabi=lp64`, so the RV32 `tests/*.S` glob never touches
+  it), run by `make check-rv64` — quanta exit-0 plus a `qemu-riscv64` differential
+  on the user-mode programs. `test_rv64_priv.S` is built **without C**
+  (`rv64ima_zicsr`) because its trap handler advances `mepc` by a fixed 4, so its
+  `ebreak` must stay 4-byte (the same reason the RV32 `test_trap.S` avoids C).
 - RV32I immediates are bit-scrambled across the instruction word and mostly
   sign-extended; the `imm_*` helpers in `decode.h` are the single source of
   truth, shared by the executor and the disassembler. Re-deriving them by hand

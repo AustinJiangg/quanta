@@ -39,9 +39,13 @@ enum {
     ELF_SHSIZE  = 40,  /* size of one ELF32 section header         */
     ELF_SYMSIZE = 16,  /* size of one ELF32 symbol-table entry     */
 
+    ELF64_EHSIZE = 64, /* size of the ELF64 header                 */
+    ELF64_PHSIZE = 56, /* size of one ELF64 program header         */
+
     EI_CLASS    = 4,   /* e_ident index: file class                */
     EI_DATA     = 5,   /* e_ident index: data encoding             */
     ELFCLASS32  = 1,   /* 32-bit objects                           */
+    ELFCLASS64  = 2,   /* 64-bit objects                           */
     ELFDATA2LSB = 1,   /* little-endian                            */
 
     ET_EXEC     = 2,   /* executable file                          */
@@ -61,6 +65,10 @@ static uint32_t rd_u32(const uint8_t *p) {
 
 static uint16_t rd_u16(const uint8_t *p) {
     return (uint16_t)(p[0] | p[1] << 8);
+}
+
+static uint64_t rd_u64(const uint8_t *p) {
+    return (uint64_t)rd_u32(p) | (uint64_t)rd_u32(p + 4) << 32;
 }
 
 /* Slurp the whole file at `path` into a freshly malloc'd buffer. On success
@@ -109,19 +117,26 @@ static uint8_t *read_file(const char *path, size_t *len) {
     return buf;
 }
 
-/* Verify the ELF header describes the kind of image we can run: a 32-bit,
- * little-endian, RISC-V executable. Returns 0 if so, -1 otherwise. */
-static int check_header(const uint8_t *buf, size_t len) {
+/* Verify the ELF header describes the kind of image we can run: a little-endian
+ * RISC-V executable, either 32- or 64-bit. Reports the class in `*is64` (1 for
+ * ELFCLASS64). Returns 0 if runnable, -1 otherwise. The e_ident/e_type/e_machine
+ * fields checked here sit at the same offsets in both classes. */
+static int check_header(const uint8_t *buf, size_t len, int *is64) {
     if (len < ELF_EHSIZE) {
-        fprintf(stderr, "elf: file too small to be ELF32\n");
+        fprintf(stderr, "elf: file too small to be an ELF object\n");
         return -1;
     }
     if (buf[0] != 0x7f || buf[1] != 'E' || buf[2] != 'L' || buf[3] != 'F') {
         fprintf(stderr, "elf: bad magic (not an ELF file)\n");
         return -1;
     }
-    if (buf[EI_CLASS] != ELFCLASS32) {
-        fprintf(stderr, "elf: not a 32-bit object (need ELFCLASS32)\n");
+    if (buf[EI_CLASS] != ELFCLASS32 && buf[EI_CLASS] != ELFCLASS64) {
+        fprintf(stderr, "elf: unknown class (need ELFCLASS32 or ELFCLASS64)\n");
+        return -1;
+    }
+    *is64 = (buf[EI_CLASS] == ELFCLASS64);
+    if (*is64 && len < ELF64_EHSIZE) {
+        fprintf(stderr, "elf: file too small to be ELF64\n");
         return -1;
     }
     if (buf[EI_DATA] != ELFDATA2LSB) {
@@ -149,23 +164,50 @@ static int check_header(const uint8_t *buf, size_t len) {
  * the region, so the stack can grow downward into it. */
 #define GUEST_STACK_SIZE (64ULL * 1024)
 
-int elf_load(const char *path, Memory *mem, uint32_t *entry, uint32_t min_size) {
+/* Read a PT_LOAD program header's (offset, vaddr, filesz, memsz) for the file's
+ * class. ELF64 widens each field to 8 bytes and inserts p_flags right after
+ * p_type, so the later fields sit at different offsets than ELF32. */
+static void read_phdr(const uint8_t *p, int is64, uint64_t *offset,
+                      uint64_t *vaddr, uint64_t *filesz, uint64_t *memsz) {
+    if (is64) {
+        *offset = rd_u64(p + 8);  *vaddr = rd_u64(p + 16);
+        *filesz = rd_u64(p + 32); *memsz = rd_u64(p + 40);
+    } else {
+        *offset = rd_u32(p + 4);  *vaddr = rd_u32(p + 8);
+        *filesz = rd_u32(p + 16); *memsz = rd_u32(p + 20);
+    }
+}
+
+int elf_load(const char *path, Memory *mem, uint64_t *entry, int *xlen,
+             uint32_t min_size) {
     size_t len;
     uint8_t *buf = read_file(path, &len);
     if (!buf) {
         return -1;
     }
 
-    int rc = -1;
-    if (check_header(buf, len) != 0) {
+    int rc = -1, is64 = 0;
+    if (check_header(buf, len, &is64) != 0) {
         goto out;
     }
 
-    uint32_t phoff     = rd_u32(buf + 28);
-    uint16_t phentsize = rd_u16(buf + 42);
-    uint16_t phnum     = rd_u16(buf + 44);
+    /* The program-header table location/shape lives at class-dependent offsets:
+     * ELF64 widens e_phoff to 8 bytes and moves e_phentsize/e_phnum. */
+    uint64_t phoff;
+    uint16_t phentsize, phnum, phsize_min;
+    if (is64) {
+        phoff      = rd_u64(buf + 32);
+        phentsize  = rd_u16(buf + 54);
+        phnum      = rd_u16(buf + 56);
+        phsize_min = ELF64_PHSIZE;
+    } else {
+        phoff      = rd_u32(buf + 28);
+        phentsize  = rd_u16(buf + 42);
+        phnum      = rd_u16(buf + 44);
+        phsize_min = ELF_PHSIZE;
+    }
 
-    if (phentsize < ELF_PHSIZE) {
+    if (phentsize < phsize_min) {
         fprintf(stderr, "elf: unexpected program-header size %u\n", phentsize);
         goto out;
     }
@@ -179,7 +221,7 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry, uint32_t min_size) 
     int loaded = 0;
     for (uint16_t i = 0; i < phnum; i++) {
         size_t ph = (size_t)phoff + (size_t)i * phentsize;
-        if (ph + ELF_PHSIZE > len) {
+        if (ph + phsize_min > len) {
             fprintf(stderr, "elf: program-header table runs past end of file\n");
             goto out;
         }
@@ -189,12 +231,10 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry, uint32_t min_size) 
             continue; /* not a loadable segment; skip it */
         }
 
-        uint32_t p_offset = rd_u32(p + 4);
-        uint32_t p_vaddr  = rd_u32(p + 8);
-        uint32_t p_filesz = rd_u32(p + 16);
-        uint32_t p_memsz  = rd_u32(p + 20);
+        uint64_t p_offset, p_vaddr, p_filesz, p_memsz;
+        read_phdr(p, is64, &p_offset, &p_vaddr, &p_filesz, &p_memsz);
 
-        if ((size_t)p_offset + p_filesz > len) {
+        if (p_offset > len || p_filesz > (uint64_t)len - p_offset) {
             fprintf(stderr, "elf: segment file range out of bounds\n");
             goto out;
         }
@@ -206,8 +246,8 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry, uint32_t min_size) 
         if (p_vaddr < lo) {
             lo = p_vaddr;
         }
-        if ((uint64_t)p_vaddr + p_memsz > hi) {
-            hi = (uint64_t)p_vaddr + p_memsz;
+        if (p_vaddr + p_memsz > hi) {
+            hi = p_vaddr + p_memsz;
         }
         loaded++;
     }
@@ -217,7 +257,7 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry, uint32_t min_size) 
         goto out;
     }
     if (hi > 0x100000000ULL) {
-        fprintf(stderr, "elf: image extends beyond the 32-bit address space\n");
+        fprintf(stderr, "elf: image extends beyond the supported 4 GiB region\n");
         goto out;
     }
 
@@ -240,7 +280,7 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry, uint32_t min_size) 
         fprintf(stderr, "elf: image plus stack does not fit guest memory\n");
         goto out;
     }
-    if (mem_init(mem, (uint32_t)lo, (uint32_t)span) != 0) {
+    if (mem_init(mem, lo, span) != 0) {
         fprintf(stderr, "elf: cannot allocate %llu bytes of guest memory\n",
                 (unsigned long long)span);
         goto out;
@@ -255,9 +295,9 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry, uint32_t min_size) 
         if (rd_u32(p + 0) != PT_LOAD) {
             continue;
         }
-        uint32_t p_offset = rd_u32(p + 4);
-        uint32_t p_vaddr  = rd_u32(p + 8);
-        uint32_t p_filesz = rd_u32(p + 16);
+        uint64_t p_offset, p_vaddr, p_filesz, p_memsz;
+        read_phdr(p, is64, &p_offset, &p_vaddr, &p_filesz, &p_memsz);
+        (void)p_memsz; /* the BSS tail is already zero from mem_init's calloc */
         if (p_filesz > 0 &&
             mem_load(mem, p_vaddr, buf + p_offset, p_filesz) != 0) {
             fprintf(stderr, "elf: segment does not fit guest memory\n");
@@ -266,16 +306,17 @@ int elf_load(const char *path, Memory *mem, uint32_t *entry, uint32_t min_size) 
         }
     }
 
-    uint32_t e_entry = rd_u32(buf + 24);
-    if (e_entry < mem->base ||
-        (uint64_t)e_entry >= (uint64_t)mem->base + mem->size) {
+    uint64_t e_entry = is64 ? rd_u64(buf + 24) : rd_u32(buf + 24);
+    if (e_entry < mem->base || e_entry >= mem->base + mem->size) {
         fprintf(stderr, "elf: entry 0x%08x outside the loaded image "
-                        "[0x%08x,+0x%x)\n", e_entry, mem->base, mem->size);
+                        "[0x%08x,+0x%x)\n", (uint32_t)e_entry,
+                (uint32_t)mem->base, (uint32_t)mem->size);
         mem_free(mem);
         goto out;
     }
 
     *entry = e_entry;
+    *xlen  = is64 ? 64 : 32;
     rc = 0;
 
 out:
@@ -312,9 +353,12 @@ int elf_symbol(const char *path, const char *name, uint32_t *out) {
         return -1;
     }
 
-    int rc = -1;
-    if (check_header(buf, len) != 0) {
+    int rc = -1, is64 = 0;
+    if (check_header(buf, len, &is64) != 0) {
         goto out;
+    }
+    if (is64) {
+        goto out; /* ELF64 symbol tables: handled when RV64 arch-tests land */
     }
 
     uint32_t shoff     = rd_u32(buf + 32);

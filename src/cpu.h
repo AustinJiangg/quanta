@@ -5,10 +5,13 @@
 #include "memory.h"
 
 /*
- * RV32I CPU state.
+ * RV32/RV64 CPU state.
  *
- * The architectural state of an RV32I hart is small: 32 general-purpose
- * 32-bit registers plus a program counter. With the Zicsr extension a sparse
+ * The architectural state of a hart is small: 32 general-purpose XLEN-wide
+ * registers (32 or 64 bits, selected at load time by cpu->xlen) plus a program
+ * counter. Everything is stored in 64-bit fields; in RV32 mode a register holds
+ * the sign-extension of its 32-bit value (the Spike convention), so the upper
+ * half is always a copy of bit 31. With the Zicsr extension a sparse
  * file of control/status registers joins them — configuration and counters
  * read and written only by the CSR instructions, never by load/store. The
  * privileged architecture (M9) adds a current privilege level: the hart runs
@@ -78,9 +81,9 @@ typedef enum { ACC_FETCH, ACC_LOAD, ACC_STORE } AccessType;
 #define TLB_ENTRIES 16
 typedef struct {
     int      valid;
-    uint32_t vpn;       /* va >> 12 */
+    uint64_t vpn;       /* va >> 12 */
     uint32_t asid;
-    uint32_t ppn;       /* pa >> 12 */
+    uint64_t ppn;       /* pa >> 12 */
     uint32_t pte_flags; /* leaf PTE low byte: D A G U X W R V */
 } TlbEntry;
 
@@ -101,8 +104,9 @@ typedef enum {
 } HaltReason;
 
 typedef struct {
-    uint32_t regs[32];      /* x0..x31; x0 is always zero */
-    uint32_t pc;            /* program counter */
+    uint64_t regs[32];      /* x0..x31; x0 is always zero (sext_xlen in RV32) */
+    uint64_t pc;            /* program counter */
+    int      xlen;          /* register width in bits: 32 (RV32) or 64 (RV64) */
     Memory  *mem;           /* attached memory (not owned by the CPU) */
     struct Cache *cache;    /* optional cache model; NULL if off (not owned) */
     int      halted;        /* set when execution should stop */
@@ -112,22 +116,25 @@ typedef struct {
     uint32_t priv;          /* current privilege: PRIV_U / PRIV_S / PRIV_M */
     int      trapped;       /* set within a step when a trap redirected the PC */
     int      sbi_timer_armed; /* SBI set_timer set a deadline the firmware watches */
-    int      reserve_valid; /* RV32A: an LR.W set a reservation still held */
-    uint32_t reserve_addr;  /* RV32A: physical word the reservation covers */
+    int      reserve_valid; /* RV-A: an LR set a reservation still held */
+    uint64_t reserve_addr;  /* RV-A: physical word the reservation covers */
     TlbEntry tlb[TLB_ENTRIES]; /* M12: cached Sv32 translations */
     uint32_t tlb_next;      /* round-robin TLB replacement index */
-    uint32_t csr[4096];     /* CSR file: Zicsr counters + the M9 trap registers */
+    uint64_t csr[4096];     /* CSR file: Zicsr counters + the M9 trap registers */
 } CPU;
 
-/* Initialise a CPU: zero all registers, set PC to the given entry point,
- * and attach memory. */
-void cpu_init(CPU *cpu, Memory *mem, uint32_t entry_pc);
+/* Initialise a CPU: zero all registers, set PC to the given entry point, select
+ * RV32 (callers move to RV64 by setting cpu->xlen after loading an ELF64), and
+ * attach memory. */
+void cpu_init(CPU *cpu, Memory *mem, uint64_t entry_pc, int xlen);
 
-/* Read register `i`. Returns 0 for x0. */
-uint32_t reg_read(const CPU *cpu, uint32_t i);
+/* Read register `i`. Returns 0 for x0. In RV32 the value is sign-extended to 64
+ * bits; truncate to uint32_t for the architectural 32-bit value. */
+uint64_t reg_read(const CPU *cpu, uint32_t i);
 
-/* Write `value` to register `i`. Writes to x0 are ignored. */
-void reg_write(CPU *cpu, uint32_t i, uint32_t value);
+/* Write `value` to register `i`. Writes to x0 are ignored. The value is
+ * sign-extended to XLEN (a no-op in RV64), keeping the sext invariant. */
+void reg_write(CPU *cpu, uint32_t i, uint64_t value);
 
 /* Fetch, decode, and execute a single instruction at PC. Advances PC (by 4,
  * or to a branch/jump target). On a memory fault it records HALT_MEM_FAULT and

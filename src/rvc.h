@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 /*
- * RV32C — the compressed-instruction extension (M11).
+ * RV32C / RV64C — the compressed-instruction extension (M11, RV64 in M17).
  *
  * RISC-V keeps code dense with a set of 16-bit instructions, each a shorthand
  * for a common 32-bit one (small immediates, the popular registers, the
@@ -26,9 +26,11 @@
  * — or, in the disassembler, prints the raw halfword. */
 #define RVC_ILLEGAL 0u
 
-/* Expand a 16-bit compressed instruction `c` to the equivalent 32-bit RV32I/M
+/* Expand a 16-bit compressed instruction `c` to the equivalent 32-bit
  * instruction word, or RVC_ILLEGAL for a reserved/unsupported encoding (which
- * includes the RV32C floating-point forms, since F/D are not implemented). */
-uint32_t rvc_expand(uint16_t c);
+ * includes the floating-point forms, since F/D are not implemented). `rv64`
+ * selects the RV64C reading of the width-dependent slots: C.ADDIW (not C.JAL),
+ * C.LD/C.SD/C.LDSP/C.SDSP, the C.SUBW/C.ADDW register ops, and a 6-bit shift. */
+uint32_t rvc_expand(uint16_t c, int rv64);
 
 #endif /* QUANTA_RVC_H */

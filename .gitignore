@@ -23,6 +23,7 @@ oom-*
 tests/*.elf
 tests/*.bin
 tests/os/*.elf
+tests/rv64/*.elf
 
 # Architectural-test suite: cached clone + compiled work (make check-arch)
 /build/

@@ -64,7 +64,7 @@ void syscall_dispatch(CPU *cpu) {
             /* An unimplemented syscall is a bug in the program-vs-emulator
              * contract, not something to paper over: report it and stop. */
             fprintf(stderr, "unknown syscall %u (a7) at pc=0x%08x\n",
-                    num, cpu->pc);
+                    num, (uint32_t)cpu->pc);
             cpu->halt_reason = HALT_UNKNOWN_SYSCALL;
             cpu->halted = 1;
             break;

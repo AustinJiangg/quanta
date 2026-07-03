@@ -12,7 +12,7 @@
 
 /* True when `addr` lies in [base, base+size). Written to stay correct for
  * addresses below base (the unsigned difference wraps high, failing the test). */
-static int in_window(uint32_t addr, uint32_t base, uint32_t size) {
+static int in_window(uint64_t addr, uint32_t base, uint32_t size) {
     return (addr - base) < size;
 }
 
@@ -21,7 +21,7 @@ void plat_init(Platform *p) {
     p->clint.mtimecmp = (uint64_t)-1; /* parked: no timer interrupt until armed */
 }
 
-int plat_contains(uint32_t addr) {
+int plat_contains(uint64_t addr) {
     return in_window(addr, CLINT_BASE, CLINT_SIZE) ||
            in_window(addr, PLIC_BASE,  PLIC_SIZE)  ||
            in_window(addr, UART_BASE,  UART_SIZE);
@@ -188,7 +188,7 @@ static void clint_write(Clint *c, uint32_t off, uint32_t val) {
  * MMIO dispatch and interrupt pull.
  * ------------------------------------------------------------------------ */
 
-uint32_t plat_read(Platform *p, uint32_t addr, uint32_t size) {
+uint32_t plat_read(Platform *p, uint64_t addr, uint32_t size) {
     if (in_window(addr, UART_BASE, UART_SIZE)) /* byte registers */
         return uart_read(&p->uart, addr - UART_BASE);
 
@@ -207,7 +207,7 @@ uint32_t plat_read(Platform *p, uint32_t addr, uint32_t size) {
     return word;
 }
 
-void plat_write(Platform *p, uint32_t addr, uint32_t size, uint32_t value) {
+void plat_write(Platform *p, uint64_t addr, uint32_t size, uint32_t value) {
     (void)size; /* CLINT/PLIC take word writes; the UART is byte-addressed */
     if (in_window(addr, UART_BASE, UART_SIZE))
         uart_write(&p->uart, addr - UART_BASE, (uint8_t)value);

@@ -26,7 +26,7 @@
  * the mapping is missing or the permission check fails — the caller raises that
  * as a trap with `va` as the trap value. In Machine mode, or when satp selects
  * Bare mode, translation is the identity and this always succeeds. */
-uint32_t mmu_translate(CPU *cpu, uint32_t va, AccessType acc, uint32_t *pa);
+uint32_t mmu_translate(CPU *cpu, uint64_t va, AccessType acc, uint64_t *pa);
 
 /* Invalidate every cached translation. Called on sfence.vma and satp writes. */
 void mmu_flush(CPU *cpu);

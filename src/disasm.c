@@ -124,12 +124,12 @@ static void disasm_csr(uint32_t inst, uint32_t f3, char *buf, size_t buflen) {
     }
 }
 
-void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
+void disasm(uint64_t pc, uint32_t inst, int xlen, char *buf, size_t buflen) {
     /* A compressed (16-bit) instruction is the low halfword when its low two
      * bits are not 0b11. Expand it to the 32-bit instruction it abbreviates and
      * disassemble that — objdump prints the same expanded mnemonic. */
     if ((inst & 0x3u) != 0x3u) {
-        uint32_t x = rvc_expand((uint16_t)inst);
+        uint32_t x = rvc_expand((uint16_t)inst, xlen == 64);
         if (x == RVC_ILLEGAL) {
             snprintf(buf, buflen, ".short 0x%04x", inst & 0xffffu);
             return;
@@ -211,8 +211,9 @@ void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
     case OP_LOAD: {
         int32_t imm = imm_i(inst);
         const char *m = (f3 == 0x0) ? "lb"  : (f3 == 0x1) ? "lh"  :
-                        (f3 == 0x2) ? "lw"  : (f3 == 0x4) ? "lbu" :
-                        (f3 == 0x5) ? "lhu" : NULL;
+                        (f3 == 0x2) ? "lw"  : (f3 == 0x3) ? "ld"  :
+                        (f3 == 0x4) ? "lbu" : (f3 == 0x5) ? "lhu" :
+                        (f3 == 0x6) ? "lwu" : NULL;
         if (m) snprintf(buf, buflen, "%s %s,%d(%s)", m, d, imm, s1);
         else   snprintf(buf, buflen, ".word 0x%08x", inst);
         return;
@@ -221,28 +222,30 @@ void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
     case OP_STORE: {
         int32_t imm = imm_s(inst);
         const char *m = (f3 == 0x0) ? "sb" : (f3 == 0x1) ? "sh" :
-                        (f3 == 0x2) ? "sw" : NULL;
+                        (f3 == 0x2) ? "sw" : (f3 == 0x3) ? "sd" : NULL;
         if (m) snprintf(buf, buflen, "%s %s,%d(%s)", m, s2, imm, s1);
         else   snprintf(buf, buflen, ".word 0x%08x", inst);
         return;
     }
 
     case OP_AMO: {
-        /* RV32A: funct5 picks the op, the aq/rl bits become a mnemonic suffix.
-         * LR.W takes no rs2 ("lr.w rd,(rs1)"); SC/AMO* are "op rd,rs2,(rs1)". */
+        /* RV-A: funct5 picks the op, funct3 the width (2=.w, 3=.d), the aq/rl
+         * bits a mnemonic suffix. LR takes no rs2 ("lr.w rd,(rs1)"); SC/AMO* are
+         * "op rd,rs2,(rs1)". */
         uint32_t f5 = inst >> 27;
         const char *aqrl = (inst & (3u << 25)) == (3u << 25) ? ".aqrl"
                          : (inst & (1u << 26)) ? ".aq"
                          : (inst & (1u << 25)) ? ".rl" : "";
-        if (f3 != 0x2) { snprintf(buf, buflen, ".word 0x%08x", inst); return; }
-        if (f5 == 0x02) { snprintf(buf, buflen, "lr.w%s %s,(%s)", aqrl, d, s1); return; }
+        const char *wd = (f3 == 0x2) ? "w" : (f3 == 0x3) ? "d" : NULL;
+        if (!wd) { snprintf(buf, buflen, ".word 0x%08x", inst); return; }
+        if (f5 == 0x02) { snprintf(buf, buflen, "lr.%s%s %s,(%s)", wd, aqrl, d, s1); return; }
         const char *m =
-            (f5 == 0x03) ? "sc.w"     : (f5 == 0x01) ? "amoswap.w" :
-            (f5 == 0x00) ? "amoadd.w" : (f5 == 0x04) ? "amoxor.w"  :
-            (f5 == 0x0c) ? "amoand.w" : (f5 == 0x08) ? "amoor.w"   :
-            (f5 == 0x10) ? "amomin.w" : (f5 == 0x14) ? "amomax.w"  :
-            (f5 == 0x18) ? "amominu.w": (f5 == 0x1c) ? "amomaxu.w" : NULL;
-        if (m) snprintf(buf, buflen, "%s%s %s,%s,(%s)", m, aqrl, d, s2, s1);
+            (f5 == 0x03) ? "sc"     : (f5 == 0x01) ? "amoswap" :
+            (f5 == 0x00) ? "amoadd" : (f5 == 0x04) ? "amoxor"  :
+            (f5 == 0x0c) ? "amoand" : (f5 == 0x08) ? "amoor"   :
+            (f5 == 0x10) ? "amomin" : (f5 == 0x14) ? "amomax"  :
+            (f5 == 0x18) ? "amominu": (f5 == 0x1c) ? "amomaxu" : NULL;
+        if (m) snprintf(buf, buflen, "%s.%s%s %s,%s,(%s)", m, wd, aqrl, d, s2, s1);
         else   snprintf(buf, buflen, ".word 0x%08x", inst);
         return;
     }
@@ -254,7 +257,7 @@ void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
 
     case OP_IMM: {
         int32_t imm = imm_i(inst);
-        uint32_t shamt = (inst >> 20) & 0x1f;
+        uint32_t shamt = (inst >> 20) & (xlen == 64 ? 0x3f : 0x1f);
         switch (f3) {
         case 0x0: /* ADDI */
             if (rd(inst) == 0 && rs1(inst) == 0 && imm == 0)
@@ -279,8 +282,25 @@ void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
         case 0x7: snprintf(buf, buflen, "andi %s,%s,%d", d, s1, imm); return;
         case 0x1: snprintf(buf, buflen, "slli %s,%s,0x%x", d, s1, shamt); return;
         case 0x5:
-            if (f7 == 0x20) snprintf(buf, buflen, "srai %s,%s,0x%x", d, s1, shamt);
-            else            snprintf(buf, buflen, "srli %s,%s,0x%x", d, s1, shamt);
+            if ((inst >> 30) & 1) snprintf(buf, buflen, "srai %s,%s,0x%x", d, s1, shamt);
+            else                  snprintf(buf, buflen, "srli %s,%s,0x%x", d, s1, shamt);
+            return;
+        default: snprintf(buf, buflen, ".word 0x%08x", inst); return;
+        }
+    }
+
+    case OP_IMM_32: { /* RV64 *W immediate ops */
+        int32_t imm = imm_i(inst);
+        uint32_t shamt = (inst >> 20) & 0x1f;
+        switch (f3) {
+        case 0x0:
+            if (imm == 0) snprintf(buf, buflen, "sext.w %s,%s", d, s1); /* addiw rd,rs,0 */
+            else          snprintf(buf, buflen, "addiw %s,%s,%d", d, s1, imm);
+            return;
+        case 0x1: snprintf(buf, buflen, "slliw %s,%s,0x%x", d, s1, shamt); return;
+        case 0x5:
+            if ((inst >> 30) & 1) snprintf(buf, buflen, "sraiw %s,%s,0x%x", d, s1, shamt);
+            else                  snprintf(buf, buflen, "srliw %s,%s,0x%x", d, s1, shamt);
             return;
         default: snprintf(buf, buflen, ".word 0x%08x", inst); return;
         }
@@ -319,6 +339,31 @@ void disasm(uint32_t pc, uint32_t inst, char *buf, size_t buflen) {
         case 0x6: snprintf(buf, buflen, "or %s,%s,%s", d, s1, s2); return;
         case 0x7: snprintf(buf, buflen, "and %s,%s,%s", d, s1, s2); return;
         default:  snprintf(buf, buflen, ".word 0x%08x", inst); return;
+        }
+    }
+
+    case OP_REG_32: { /* RV64 *W register ops */
+        if (f7 == 0x01) { /* RV64M *W: mulw/divw/divuw/remw/remuw */
+            static const char *mw[8] = {
+                "mulw", NULL, NULL, NULL, "divw", "divuw", "remw", "remuw"
+            };
+            if (mw[f3]) snprintf(buf, buflen, "%s %s,%s,%s", mw[f3], d, s1, s2);
+            else        snprintf(buf, buflen, ".word 0x%08x", inst);
+            return;
+        }
+        switch (f3) {
+        case 0x0:
+            if (f7 == 0x20) {
+                if (rs1(inst) == 0) snprintf(buf, buflen, "negw %s,%s", d, s2);
+                else                snprintf(buf, buflen, "subw %s,%s,%s", d, s1, s2);
+            } else                  snprintf(buf, buflen, "addw %s,%s,%s", d, s1, s2);
+            return;
+        case 0x1: snprintf(buf, buflen, "sllw %s,%s,%s", d, s1, s2); return;
+        case 0x5:
+            if (f7 == 0x20) snprintf(buf, buflen, "sraw %s,%s,%s", d, s1, s2);
+            else            snprintf(buf, buflen, "srlw %s,%s,%s", d, s1, s2);
+            return;
+        default: snprintf(buf, buflen, ".word 0x%08x", inst); return;
         }
     }
 

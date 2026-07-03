@@ -37,13 +37,28 @@ enum {
     IRQ_STIMER = 5,  IRQ_MTIMER = 7,
     IRQ_SEXT   = 9,  IRQ_MEXT   = 11
 };
-#define CAUSE_INTERRUPT 0x80000000u
 
 /* Defined below with the trap machinery, declared here so the memory-access
  * instructions (which appear earlier) can raise page faults through it. */
-static void raise_trap(CPU *cpu, uint32_t cause, uint32_t tval);
+static void raise_trap(CPU *cpu, uint32_t cause, uint64_t tval);
 
-void cpu_init(CPU *cpu, Memory *mem, uint32_t entry_pc) {
+/* Sign-extend `v` from bit XLEN-1: in RV32 the low 32 bits are sign-extended
+ * into the upper half (so every register keeps the sext invariant), in RV64 it
+ * is the identity. The single helper every XLEN-dependent result funnels
+ * through — reg_write applies it, so the executor mostly stays width-agnostic. */
+static inline uint64_t sext_xlen(const CPU *cpu, uint64_t v) {
+    return cpu->xlen == 32 ? (uint64_t)(int64_t)(int32_t)v : v;
+}
+
+/* The interrupt bit of mcause/scause: the top bit of XLEN (bit 31 in RV32, bit
+ * 63 in RV64). Set in the cause for an asynchronous trap, clear for an
+ * exception; a handler tests it to tell the two apart. */
+static inline uint64_t cause_interrupt(const CPU *cpu) {
+    return (uint64_t)1 << (cpu->xlen - 1);
+}
+
+void cpu_init(CPU *cpu, Memory *mem, uint64_t entry_pc, int xlen) {
+    cpu->xlen      = xlen; /* 32 (RV32) or 64 (RV64), chosen by the loader */
     for (int i = 0; i < 32; i++) cpu->regs[i] = 0;
     cpu->pc        = entry_pc;
     cpu->mem       = mem;
@@ -59,49 +74,107 @@ void cpu_init(CPU *cpu, Memory *mem, uint32_t entry_pc) {
     cpu->reserve_addr  = 0;
     mmu_flush(cpu); /* invalidate the TLB */
     memset(cpu->csr, 0, sizeof cpu->csr);
-    /* misa advertises the base and extensions: MXL=1 (RV32), C, I, M, S, U. It
-     * is informational here; reads see this, writes are accepted as WARL storage. */
-    cpu->csr[CSR_MISA] = (1u << 30) | (1u << 2) | (1u << 8) | (1u << 12) |
-                         (1u << 18) | (1u << 20);
+    /* misa advertises the base and extensions: MXL in the top two XLEN bits (1
+     * for RV32, 2 for RV64) plus C, I, M, S, U. Informational here; reads see it,
+     * writes are accepted as WARL storage. */
+    uint64_t mxl = (xlen == 64) ? 2u : 1u;
+    cpu->csr[CSR_MISA] = (mxl << (xlen - 2)) |
+                         (1u << 2) | (1u << 8) | (1u << 12) | (1u << 18) | (1u << 20);
 }
 
-uint32_t reg_read(const CPU *cpu, uint32_t i) {
+uint64_t reg_read(const CPU *cpu, uint32_t i) {
     return (i == 0) ? 0u : cpu->regs[i];
 }
 
-void reg_write(CPU *cpu, uint32_t i, uint32_t value) {
-    if (i != 0) cpu->regs[i] = value; /* x0 stays zero */
+void reg_write(CPU *cpu, uint32_t i, uint64_t value) {
+    if (i != 0) cpu->regs[i] = sext_xlen(cpu, value); /* x0 stays zero */
 }
 
-/* RV32A: a store to the reserved word breaks any outstanding LR reservation, so
- * a later SC.W to it fails. Modelled at word granularity, which is enough for a
+/* RV-A: a store to the reserved word breaks any outstanding LR reservation, so
+ * a later SC to it fails. Modelled at word granularity, which is enough for a
  * single hart — there are no other agents to race the reservation. */
-static void break_reservation(CPU *cpu, uint32_t addr) {
-    if (cpu->reserve_valid && (addr & ~0x3u) == cpu->reserve_addr)
+static void break_reservation(CPU *cpu, uint64_t addr) {
+    if (cpu->reserve_valid && (addr & ~(uint64_t)0x3) == cpu->reserve_addr)
         cpu->reserve_valid = 0;
 }
 
-/* Execute OP-IMM: register/immediate arithmetic (ADDI, SLTI, shifts, ...). */
+/* Execute OP-IMM: register/immediate arithmetic (ADDI, SLTI, shifts, ...).
+ *
+ * Width-agnostic: operands are read at full width and the sext invariant means
+ * add/compare/logic give the right XLEN result once reg_write re-sign-extends.
+ * Only the shifts depend on XLEN — the shift amount is 5 bits in RV32, 6 in
+ * RV64, and the right shifts must work on the architectural width, not the
+ * sign-extended 64-bit container. SRAI vs SRLI is bit 30 (it survives the wider
+ * RV64 shamt, where the funct7 test would not). */
 static void exec_op_imm(CPU *cpu, uint32_t inst) {
-    uint32_t a    = reg_read(cpu, rs1(inst));
-    int32_t  imm  = imm_i(inst);
-    uint32_t shamt = imm & 0x1f; /* shift amount is low 5 bits */
-    uint32_t result = 0;
+    uint64_t a    = reg_read(cpu, rs1(inst));
+    int64_t  imm  = imm_i(inst);                       /* sign-extended to XLEN */
+    uint32_t shamt = (uint32_t)imm & (cpu->xlen == 64 ? 0x3fu : 0x1fu);
+    uint32_t arith = (inst >> 30) & 1;                 /* SRAI when set, else SRLI */
+    uint64_t result = 0;
 
     switch (funct3(inst)) {
-        case 0x0: result = a + (uint32_t)imm; break;                 /* ADDI  */
-        case 0x2: result = ((int32_t)a < imm) ? 1 : 0; break;        /* SLTI  */
-        case 0x3: result = (a < (uint32_t)imm) ? 1 : 0; break;       /* SLTIU */
-        case 0x4: result = a ^ (uint32_t)imm; break;                 /* XORI  */
-        case 0x6: result = a | (uint32_t)imm; break;                 /* ORI   */
-        case 0x7: result = a & (uint32_t)imm; break;                 /* ANDI  */
+        case 0x0: result = a + (uint64_t)imm; break;                 /* ADDI  */
+        case 0x2: result = ((int64_t)a < imm) ? 1 : 0; break;        /* SLTI  */
+        case 0x3: result = (a < (uint64_t)imm) ? 1 : 0; break;       /* SLTIU */
+        case 0x4: result = a ^ (uint64_t)imm; break;                 /* XORI  */
+        case 0x6: result = a | (uint64_t)imm; break;                 /* ORI   */
+        case 0x7: result = a & (uint64_t)imm; break;                 /* ANDI  */
         case 0x1: result = a << shamt; break;                        /* SLLI  */
         case 0x5:
-            if (funct7(inst) == 0x20)
-                result = (uint32_t)((int32_t)a >> shamt);            /* SRAI  */
-            else
-                result = a >> shamt;                                 /* SRLI  */
+            if (arith)                                               /* SRAI  */
+                result = cpu->xlen == 64 ? (uint64_t)((int64_t)a >> shamt)
+                                         : (uint64_t)((int32_t)a >> shamt);
+            else                                                     /* SRLI  */
+                result = cpu->xlen == 64 ? (a >> shamt)
+                                         : ((uint32_t)a >> shamt);
             break;
+    }
+    reg_write(cpu, rd(inst), result);
+}
+
+/* High 64 bits of the 128-bit unsigned product a*b, computed from 32-bit
+ * partials so no 128-bit integer type is needed (this stays portable C11). The
+ * signed high-half multiplies derive from this by a sign correction. */
+static uint64_t mulhu64(uint64_t a, uint64_t b) {
+    uint64_t alo = (uint32_t)a, ahi = a >> 32;
+    uint64_t blo = (uint32_t)b, bhi = b >> 32;
+    uint64_t lo_lo = alo * blo;
+    uint64_t lo_hi = alo * bhi;
+    uint64_t hi_lo = ahi * blo;
+    uint64_t hi_hi = ahi * bhi;
+    uint64_t cross = (lo_lo >> 32) + (uint32_t)lo_hi + (uint32_t)hi_lo;
+    return hi_hi + (lo_hi >> 32) + (hi_lo >> 32) + (cross >> 32);
+}
+
+/* RV64M: the multiply/divide group at full 64-bit width (OP-64, funct7 = 0x01).
+ * MUL is the low 64 bits; the high-half multiplies use mulhu64 plus the sign
+ * corrections (subtract b when a is negative, a when b is negative); divide and
+ * remainder mirror RV32M's defined results for /0 and INT64_MIN / -1. */
+static void exec_muldiv64(CPU *cpu, uint32_t inst) {
+    uint64_t a  = reg_read(cpu, rs1(inst));
+    uint64_t b  = reg_read(cpu, rs2(inst));
+    int64_t  sa = (int64_t)a, sb = (int64_t)b;
+    uint64_t result = 0;
+
+    switch (funct3(inst)) {
+        case 0x0: result = a * b; break;                              /* MUL    */
+        case 0x1: result = mulhu64(a, b) - (sa < 0 ? b : 0)
+                                         - (sb < 0 ? a : 0); break;   /* MULH   */
+        case 0x2: result = mulhu64(a, b) - (sa < 0 ? b : 0); break;   /* MULHSU */
+        case 0x3: result = mulhu64(a, b); break;                      /* MULHU  */
+        case 0x4: /* DIV */
+            if (b == 0)                            result = (uint64_t)-1;
+            else if (sa == INT64_MIN && sb == -1)  result = (uint64_t)INT64_MIN;
+            else                                   result = (uint64_t)(sa / sb);
+            break;
+        case 0x5: result = (b == 0) ? (uint64_t)-1 : (a / b); break;  /* DIVU */
+        case 0x6: /* REM */
+            if (b == 0)                            result = a;
+            else if (sa == INT64_MIN && sb == -1)  result = 0;
+            else                                   result = (uint64_t)(sa % sb);
+            break;
+        case 0x7: result = (b == 0) ? a : (a % b); break;             /* REMU */
     }
     reg_write(cpu, rd(inst), result);
 }
@@ -117,6 +190,7 @@ static void exec_op_imm(CPU *cpu, uint32_t inst) {
  * The high-half multiplies form a 64-bit intermediate product; the three
  * variants differ only in whether each operand is sign- or zero-extended. */
 static void exec_muldiv(CPU *cpu, uint32_t inst) {
+    if (cpu->xlen == 64) { exec_muldiv64(cpu, inst); return; } /* RV64M */
     uint32_t a  = reg_read(cpu, rs1(inst));
     uint32_t b  = reg_read(cpu, rs2(inst));
     int32_t  sa = (int32_t)a, sb = (int32_t)b;
@@ -158,28 +232,29 @@ static void exec_muldiv(CPU *cpu, uint32_t inst) {
 /* Execute OP: register/register arithmetic (ADD, SUB, AND, ...). RV32M shares
  * this opcode; funct7 = 0x01 selects its multiply/divide instructions. */
 static void exec_op(CPU *cpu, uint32_t inst) {
-    if (funct7(inst) == 0x01) { /* RV32M extension */
+    if (funct7(inst) == 0x01) { /* RV32M / RV64M extension */
         exec_muldiv(cpu, inst);
         return;
     }
-    uint32_t a = reg_read(cpu, rs1(inst));
-    uint32_t b = reg_read(cpu, rs2(inst));
-    uint32_t shamt = b & 0x1f;
-    uint32_t result = 0;
+    uint64_t a = reg_read(cpu, rs1(inst));
+    uint64_t b = reg_read(cpu, rs2(inst));
+    uint32_t shamt = (uint32_t)b & (cpu->xlen == 64 ? 0x3fu : 0x1fu);
+    int      alt   = (funct7(inst) == 0x20);   /* SUB (vs ADD), SRA (vs SRL) */
+    uint64_t result = 0;
 
     switch (funct3(inst)) {
-        case 0x0:
-            result = (funct7(inst) == 0x20) ? (a - b) : (a + b);     /* SUB/ADD */
-            break;
+        case 0x0: result = alt ? (a - b) : (a + b); break;           /* SUB/ADD */
         case 0x1: result = a << shamt; break;                        /* SLL  */
-        case 0x2: result = ((int32_t)a < (int32_t)b) ? 1 : 0; break; /* SLT  */
+        case 0x2: result = ((int64_t)a < (int64_t)b) ? 1 : 0; break; /* SLT  */
         case 0x3: result = (a < b) ? 1 : 0; break;                   /* SLTU */
         case 0x4: result = a ^ b; break;                             /* XOR  */
         case 0x5:
-            if (funct7(inst) == 0x20)
-                result = (uint32_t)((int32_t)a >> shamt);            /* SRA  */
-            else
-                result = a >> shamt;                                 /* SRL  */
+            if (alt)                                                 /* SRA  */
+                result = cpu->xlen == 64 ? (uint64_t)((int64_t)a >> shamt)
+                                         : (uint64_t)((int32_t)a >> shamt);
+            else                                                     /* SRL  */
+                result = cpu->xlen == 64 ? (a >> shamt)
+                                         : ((uint32_t)a >> shamt);
             break;
         case 0x6: result = a | b; break;                             /* OR   */
         case 0x7: result = a & b; break;                             /* AND  */
@@ -187,10 +262,84 @@ static void exec_op(CPU *cpu, uint32_t inst) {
     reg_write(cpu, rd(inst), result);
 }
 
+/* Execute OP-IMM-32 (RV64 only): the *W register/immediate ops — ADDIW and the
+ * word shifts SLLIW/SRLIW/SRAIW. Each computes a 32-bit result and sign-extends
+ * it to 64 bits. The shamt is always 5 bits here. */
+static void exec_op_imm32(CPU *cpu, uint32_t inst) {
+    if (cpu->xlen != 64) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+    uint32_t a     = (uint32_t)reg_read(cpu, rs1(inst));
+    int32_t  imm   = imm_i(inst);
+    uint32_t shamt = imm & 0x1f;
+    uint32_t arith = (inst >> 30) & 1;
+    int32_t  result = 0;
+
+    switch (funct3(inst)) {
+        case 0x0: result = (int32_t)(a + (uint32_t)imm); break;      /* ADDIW */
+        case 0x1: result = (int32_t)(a << shamt); break;             /* SLLIW */
+        case 0x5:
+            result = arith ? (int32_t)a >> shamt                     /* SRAIW */
+                           : (int32_t)((uint32_t)a >> shamt);        /* SRLIW */
+            break;
+        default: raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return;
+    }
+    reg_write(cpu, rd(inst), (uint64_t)(int64_t)result);
+}
+
+/* RV64M *W ops (OP-32, funct7 = 0x01): MULW/DIVW/DIVUW/REMW/REMUW — multiply or
+ * divide the low 32 bits and sign-extend the 32-bit result to 64. */
+static void exec_muldivw(CPU *cpu, uint32_t inst) {
+    uint32_t a  = (uint32_t)reg_read(cpu, rs1(inst));
+    uint32_t b  = (uint32_t)reg_read(cpu, rs2(inst));
+    int32_t  sa = (int32_t)a, sb = (int32_t)b;
+    int32_t  result = 0;
+
+    switch (funct3(inst)) {
+        case 0x0: result = (int32_t)(a * b); break;                  /* MULW  */
+        case 0x4: /* DIVW */
+            if (b == 0)                            result = -1;
+            else if (sa == INT32_MIN && sb == -1)  result = INT32_MIN;
+            else                                   result = sa / sb;
+            break;
+        case 0x5: result = (b == 0) ? -1 : (int32_t)(a / b); break;  /* DIVUW */
+        case 0x6: /* REMW */
+            if (b == 0)                            result = sa;
+            else if (sa == INT32_MIN && sb == -1)  result = 0;
+            else                                   result = sa % sb;
+            break;
+        case 0x7: result = (b == 0) ? (int32_t)a : (int32_t)(a % b); break; /* REMUW */
+        default: raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return;
+    }
+    reg_write(cpu, rd(inst), (uint64_t)(int64_t)result);
+}
+
+/* Execute OP-32 (RV64 only): the *W register/register ops — ADDW/SUBW and the
+ * word shifts SLLW/SRLW/SRAW, plus the RV64M *W multiply/divide group. Each
+ * produces a 32-bit result, sign-extended to 64. */
+static void exec_op32(CPU *cpu, uint32_t inst) {
+    if (cpu->xlen != 64) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+    if (funct7(inst) == 0x01) { exec_muldivw(cpu, inst); return; }
+    uint32_t a     = (uint32_t)reg_read(cpu, rs1(inst));
+    uint32_t b     = (uint32_t)reg_read(cpu, rs2(inst));
+    uint32_t shamt = b & 0x1f;
+    int      alt   = (funct7(inst) == 0x20);
+    int32_t  result = 0;
+
+    switch (funct3(inst)) {
+        case 0x0: result = (int32_t)(alt ? (a - b) : (a + b)); break; /* SUBW/ADDW */
+        case 0x1: result = (int32_t)(a << shamt); break;              /* SLLW */
+        case 0x5:
+            result = alt ? (int32_t)a >> shamt                        /* SRAW */
+                         : (int32_t)((uint32_t)a >> shamt);           /* SRLW */
+            break;
+        default: raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return;
+    }
+    reg_write(cpu, rd(inst), (uint64_t)(int64_t)result);
+}
+
 /* Execute BRANCH: conditional PC change. Returns the next PC — the branch target
  * when taken, else the fall-through (pc + the instruction's length, which is 2
  * for a compressed branch and 4 otherwise). */
-static uint32_t exec_branch(CPU *cpu, uint32_t inst, uint32_t ilen) {
+static uint64_t exec_branch(CPU *cpu, uint32_t inst, uint32_t ilen) {
     uint32_t a = reg_read(cpu, rs1(inst));
     uint32_t b = reg_read(cpu, rs2(inst));
     int taken = 0;
@@ -203,26 +352,28 @@ static uint32_t exec_branch(CPU *cpu, uint32_t inst, uint32_t ilen) {
         case 0x6: taken = (a <  b); break;                       /* BLTU */
         case 0x7: taken = (a >= b); break;                       /* BGEU */
     }
-    return taken ? cpu->pc + (uint32_t)imm_b(inst) : cpu->pc + ilen;
+    return taken ? cpu->pc + (uint64_t)imm_b(inst) : cpu->pc + ilen;
 }
 
 /* Execute LOAD: read memory into a register. The address is virtual; translate
  * it first, raising a load page fault if the mapping is missing or unreadable. */
 static void exec_load(CPU *cpu, uint32_t inst) {
-    uint32_t va = reg_read(cpu, rs1(inst)) + (uint32_t)imm_i(inst);
-    uint32_t pa;
+    uint64_t va = reg_read(cpu, rs1(inst)) + (uint64_t)imm_i(inst);
+    uint64_t pa;
     uint32_t fault = mmu_translate(cpu, va, ACC_LOAD, &pa);
     if (fault) { raise_trap(cpu, fault, va); return; }
-    uint32_t result = 0;
+    uint64_t result = 0;
 
     if (cpu->cache) cache_access(cpu->cache, pa, 0); /* observe, don't alter */
 
     switch (funct3(inst)) {
-        case 0x0: result = (uint32_t)(int8_t)mem_read8(cpu->mem, pa); break;  /* LB  */
-        case 0x1: result = (uint32_t)(int16_t)mem_read16(cpu->mem, pa); break;/* LH  */
-        case 0x2: result = mem_read32(cpu->mem, pa); break;                   /* LW  */
-        case 0x4: result = mem_read8(cpu->mem, pa); break;                    /* LBU */
-        case 0x5: result = mem_read16(cpu->mem, pa); break;                   /* LHU */
+        case 0x0: result = (uint64_t)(int64_t)(int8_t) mem_read8 (cpu->mem, pa); break; /* LB  */
+        case 0x1: result = (uint64_t)(int64_t)(int16_t)mem_read16(cpu->mem, pa); break; /* LH  */
+        case 0x2: result = (uint64_t)(int64_t)(int32_t)mem_read32(cpu->mem, pa); break; /* LW  */
+        case 0x3: if (cpu->xlen == 64) result = mem_read64(cpu->mem, pa); break;        /* LD  */
+        case 0x4: result = mem_read8 (cpu->mem, pa); break;                             /* LBU */
+        case 0x5: result = mem_read16(cpu->mem, pa); break;                             /* LHU */
+        case 0x6: if (cpu->xlen == 64) result = mem_read32(cpu->mem, pa); break;        /* LWU */
     }
     reg_write(cpu, rd(inst), result);
 }
@@ -230,19 +381,20 @@ static void exec_load(CPU *cpu, uint32_t inst) {
 /* Execute STORE: write a register to memory, translating the virtual address
  * first (a store page fault if the page is missing or read-only). */
 static void exec_store(CPU *cpu, uint32_t inst) {
-    uint32_t va  = reg_read(cpu, rs1(inst)) + (uint32_t)imm_s(inst);
-    uint32_t val = reg_read(cpu, rs2(inst));
-    uint32_t pa;
+    uint64_t va  = reg_read(cpu, rs1(inst)) + (uint64_t)imm_s(inst);
+    uint64_t val = reg_read(cpu, rs2(inst));
+    uint64_t pa;
     uint32_t fault = mmu_translate(cpu, va, ACC_STORE, &pa);
     if (fault) { raise_trap(cpu, fault, va); return; }
 
-    break_reservation(cpu, pa); /* RV32A: a plain store can void an LR/SC pair */
+    break_reservation(cpu, pa); /* RV-A: a plain store can void an LR/SC pair */
     if (cpu->cache) cache_access(cpu->cache, pa, 1); /* observe, don't alter */
 
     switch (funct3(inst)) {
         case 0x0: mem_write8 (cpu->mem, pa, (uint8_t)val);  break; /* SB */
         case 0x1: mem_write16(cpu->mem, pa, (uint16_t)val); break; /* SH */
-        case 0x2: mem_write32(cpu->mem, pa, val);           break; /* SW */
+        case 0x2: mem_write32(cpu->mem, pa, (uint32_t)val); break; /* SW */
+        case 0x3: if (cpu->xlen == 64) mem_write64(cpu->mem, pa, val); break; /* SD */
     }
 }
 
@@ -263,12 +415,12 @@ static void exec_store(CPU *cpu, uint32_t inst) {
  * because the functional core retires one instruction per "cycle" — the
  * --pipeline overlay is the place that models cycles != instructions. sstatus,
  * sie, and sip return only the S-mode-visible bits of mstatus/mie/mip. */
-static uint32_t csr_read(const CPU *cpu, uint32_t addr) {
+static uint64_t csr_read(const CPU *cpu, uint32_t addr) {
     switch (addr) {
         case CSR_CYCLE:  case CSR_TIME:  case CSR_INSTRET:
-            return (uint32_t)cpu->instret;
+            return cpu->instret; /* RV64: the full counter; RV32: low 32 on write-back */
         case CSR_CYCLEH: case CSR_TIMEH: case CSR_INSTRETH:
-            return (uint32_t)(cpu->instret >> 32);
+            return cpu->instret >> 32; /* RV32 only (illegal on RV64; see exec_csr) */
         case CSR_SSTATUS: return cpu->csr[CSR_MSTATUS] & SSTATUS_MASK;
         case CSR_SIE:     return cpu->csr[CSR_MIE]     & S_INT_MASK;
         case CSR_SIP:     return cpu->csr[CSR_MIP]     & S_INT_MASK;
@@ -280,7 +432,7 @@ static uint32_t csr_read(const CPU *cpu, uint32_t addr) {
 /* Write `val` to CSR `addr`. The read-only and privilege checks happen in
  * exec_csr before we get here, so this just commits the bits — writing the
  * S-mode view CSRs back through the masked window onto mstatus/mie/mip. */
-static void csr_write(CPU *cpu, uint32_t addr, uint32_t val) {
+static void csr_write(CPU *cpu, uint32_t addr, uint64_t val) {
     switch (addr) {
         case CSR_SSTATUS:
             cpu->csr[CSR_MSTATUS] = (cpu->csr[CSR_MSTATUS] & ~SSTATUS_MASK)
@@ -343,7 +495,7 @@ static void legacy_trap(CPU *cpu, uint32_t cause) {
             return;
         default: /* illegal instruction and anything else */
             fprintf(stderr, "trap (cause %u) with no handler at pc=0x%08x\n",
-                    cause, cpu->pc);
+                    cause, (uint32_t)cpu->pc);
             cpu->halt_reason = HALT_ILLEGAL_INSN;
             cpu->halted = 1;
             return;
@@ -358,9 +510,9 @@ static void legacy_trap(CPU *cpu, uint32_t cause) {
  * every trap at the base; an interrupt under a vectored *tvec (low bit set) goes
  * to base + 4*cause instead. cpu->trapped tells cpu_step the PC is now the
  * handler entry, not the next sequential instruction. */
-static void enter_trap(CPU *cpu, uint32_t cause, uint32_t tval, int to_s) {
-    uint32_t s = cpu->csr[CSR_MSTATUS];
-    uint32_t tvec;
+static void enter_trap(CPU *cpu, uint64_t cause, uint64_t tval, int to_s) {
+    uint64_t s = cpu->csr[CSR_MSTATUS];
+    uint64_t tvec;
     if (to_s) {
         cpu->csr[CSR_SEPC]   = cpu->pc;
         cpu->csr[CSR_SCAUSE] = cause;
@@ -382,9 +534,10 @@ static void enter_trap(CPU *cpu, uint32_t cause, uint32_t tval, int to_s) {
         cpu->csr[CSR_MSTATUS] = s;
         tvec = cpu->csr[CSR_MTVEC];
     }
-    uint32_t base = tvec & ~0x3u;
-    if ((cause & CAUSE_INTERRUPT) && (tvec & 0x1u)) /* vectored mode (interrupts) */
-        base += 4u * (cause & ~CAUSE_INTERRUPT);
+    uint64_t intbit = cause_interrupt(cpu);
+    uint64_t base = tvec & ~(uint64_t)0x3;
+    if ((cause & intbit) && (tvec & 0x1u)) /* vectored mode (interrupts) */
+        base += 4u * (cause & ~intbit);
     cpu->pc = base;
     cpu->trapped = 1;
 }
@@ -396,12 +549,12 @@ static void enter_trap(CPU *cpu, uint32_t cause, uint32_t tval, int to_s) {
  * delegates. If the resolved trap vector is still 0, no guest handler exists and
  * we fall back to the built-in SEE; otherwise enter_trap stacks state and
  * vectors into the handler. */
-static void raise_trap(CPU *cpu, uint32_t cause, uint32_t tval) {
+static void raise_trap(CPU *cpu, uint32_t cause, uint64_t tval) {
     int to_s = (cpu->priv <= PRIV_S) &&
                ((cpu->csr[CSR_MEDELEG] >> cause) & 1u);
-    uint32_t tvec = to_s ? cpu->csr[CSR_STVEC] : cpu->csr[CSR_MTVEC];
+    uint64_t tvec = to_s ? cpu->csr[CSR_STVEC] : cpu->csr[CSR_MTVEC];
 
-    if ((tvec & ~0x3u) == 0) { /* no handler installed: built-in SEE */
+    if ((tvec & ~(uint64_t)0x3) == 0) { /* no handler installed: built-in SEE */
         legacy_trap(cpu, cause);
         return;
     }
@@ -446,7 +599,7 @@ static int take_interrupt(CPU *cpu) {
         if (!(pending & (1u << i))) continue;
         int to_s = ((mideleg >> i) & 1u) != 0;
         if (to_s ? s_on : m_on) {
-            enter_trap(cpu, CAUSE_INTERRUPT | i, 0, to_s);
+            enter_trap(cpu, cause_interrupt(cpu) | i, 0, to_s);
             return 1;
         }
     }
@@ -498,13 +651,18 @@ static void exec_csr(CPU *cpu, uint32_t inst) {
     uint32_t addr = (inst >> 20) & 0xfff;
     uint32_t f3   = funct3(inst);
     uint32_t rs1f = rs1(inst);
-    uint32_t src  = (f3 & 0x4) ? rs1f : reg_read(cpu, rs1f);
+    uint64_t src  = (f3 & 0x4) ? rs1f : reg_read(cpu, rs1f);
     int writes = ((f3 & 0x3) == 0x1) || (rs1f != 0);
     int reads  = ((f3 & 0x3) != 0x1) || (rd(inst) != 0);
-    uint32_t old = 0;
+    uint64_t old = 0;
+
+    /* The RV32-only high halves (counters + mstatush) do not exist on RV64. */
+    int rv32_only_csr = (addr == CSR_CYCLEH || addr == CSR_TIMEH ||
+                         addr == CSR_INSTRETH || addr == CSR_MSTATUSH);
 
     if (cpu->priv < ((addr >> 8) & 0x3) ||           /* insufficient privilege */
-        (writes && ((addr >> 10) & 0x3) == 0x3)) {   /* write to a read-only CSR */
+        (writes && ((addr >> 10) & 0x3) == 0x3) ||   /* write to a read-only CSR */
+        (cpu->xlen == 64 && rv32_only_csr)) {        /* RV32-only CSR on RV64 */
         raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst);
         return;
     }
@@ -520,41 +678,45 @@ static void exec_csr(CPU *cpu, uint32_t inst) {
     reg_write(cpu, rd(inst), old);
 }
 
-/* Execute RV32A: load-reserved / store-conditional and the atomic memory
- * operations (AMO*). The AMO opcode is selected by funct3 == 0x2 (the 32-bit
- * "word" width — RV64 adds a doubleword form), and funct5 (the top five bits)
- * picks the operation. The aq/rl ordering bits below it are no-ops on a single
- * in-order hart: there is no reordering or other agent for them to fence.
+/* Execute RV-A: load-reserved / store-conditional and the atomic memory
+ * operations (AMO*). funct3 selects the access width — 0x2 is the 32-bit "word"
+ * (RV32A/RV64A), 0x3 the 64-bit "doubleword" (RV64A only) — and funct5 (the top
+ * five bits) picks the operation. The aq/rl ordering bits below it are no-ops on
+ * a single in-order hart: there is no reordering or other agent for them to
+ * fence.
  *
- * An AMO atomically loads the word at rs1, combines it with rs2, and stores the
- * result back, returning the *old* value in rd — a read-modify-write that no
- * sequence of base loads/stores can do indivisibly. LR/SC split that across two
- * instructions: LR loads and registers a reservation, SC stores only if the
- * reservation still holds (returning 0 on success, 1 on failure). Atomics must
- * be naturally aligned, so a misaligned address faults rather than being
- * silently handled the way base accesses are. */
+ * An AMO atomically loads at rs1, combines with rs2, and stores the result back,
+ * returning the *old* value in rd — a read-modify-write that no sequence of base
+ * loads/stores can do indivisibly. On a .W AMO in RV64 the returned old value is
+ * sign-extended. LR/SC split that across two instructions: LR loads and registers
+ * a reservation, SC stores only if the reservation still holds (0 on success, 1
+ * on failure). Atomics must be naturally aligned, so a misaligned address faults
+ * rather than being silently handled the way base accesses are. */
 static void exec_amo(CPU *cpu, uint32_t inst) {
-    if (funct3(inst) != 0x2) { /* only the word width exists in RV32A */
+    uint32_t f3 = funct3(inst);
+    int is_d = (f3 == 0x3);
+    if (f3 != 0x2 && !(is_d && cpu->xlen == 64)) { /* .W always; .D only on RV64 */
         raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst);
         return;
     }
     uint32_t funct5 = inst >> 27;
-    uint32_t va     = reg_read(cpu, rs1(inst));
+    uint64_t va     = reg_read(cpu, rs1(inst));
 
-    if (va & 0x3) { /* atomics require natural alignment */
+    if (va & (is_d ? 0x7u : 0x3u)) { /* atomics require natural alignment */
         raise_trap(cpu, (funct5 == 0x02) ? CAUSE_LOAD_MISALIGNED
                                           : CAUSE_STORE_MISALIGNED, va);
         return;
     }
     /* Translate once: LR reads (sets A), SC and the AMOs write (set D). */
-    uint32_t addr;
+    uint64_t addr;
     uint32_t fault = mmu_translate(cpu, va,
                                    (funct5 == 0x02) ? ACC_LOAD : ACC_STORE, &addr);
     if (fault) { raise_trap(cpu, fault, va); return; }
     if (cpu->cache) cache_access(cpu->cache, addr, 1); /* observe the access */
 
-    if (funct5 == 0x02) { /* LR.W: load and hold a reservation on the word */
-        uint32_t v = mem_read32(cpu->mem, addr);
+    if (funct5 == 0x02) { /* LR.W/LR.D: load and hold a reservation */
+        uint64_t v = is_d ? mem_read64(cpu->mem, addr)
+                          : (uint64_t)(int64_t)(int32_t)mem_read32(cpu->mem, addr);
         if (cpu->mem->fault) return; /* cpu_step turns the fault into a trap */
         cpu->reserve_valid = 1;
         cpu->reserve_addr  = addr;
@@ -562,10 +724,11 @@ static void exec_amo(CPU *cpu, uint32_t inst) {
         return;
     }
 
-    if (funct5 == 0x03) { /* SC.W: store iff the reservation still holds */
+    if (funct5 == 0x03) { /* SC.W/SC.D: store iff the reservation still holds */
         uint32_t fail = !(cpu->reserve_valid && cpu->reserve_addr == addr);
         if (!fail) {
-            mem_write32(cpu->mem, addr, reg_read(cpu, rs2(inst)));
+            if (is_d) mem_write64(cpu->mem, addr, reg_read(cpu, rs2(inst)));
+            else      mem_write32(cpu->mem, addr, (uint32_t)reg_read(cpu, rs2(inst)));
             if (cpu->mem->fault) return;
         }
         cpu->reserve_valid = 0;          /* SC always clears the reservation */
@@ -573,24 +736,46 @@ static void exec_amo(CPU *cpu, uint32_t inst) {
         return;
     }
 
-    /* AMO*: read the old value, combine with rs2, write the result back. */
-    uint32_t old = mem_read32(cpu->mem, addr);
-    if (cpu->mem->fault) return;
-    uint32_t b = reg_read(cpu, rs2(inst));
-    uint32_t res;
-    switch (funct5) {
-        case 0x01: res = b;                                       break; /* SWAP */
-        case 0x00: res = old + b;                                 break; /* ADD  */
-        case 0x04: res = old ^ b;                                 break; /* XOR  */
-        case 0x0c: res = old & b;                                 break; /* AND  */
-        case 0x08: res = old | b;                                 break; /* OR   */
-        case 0x10: res = ((int32_t)old < (int32_t)b) ? old : b;   break; /* MIN  */
-        case 0x14: res = ((int32_t)old > (int32_t)b) ? old : b;   break; /* MAX  */
-        case 0x18: res = (old < b) ? old : b;                     break; /* MINU */
-        case 0x1c: res = (old > b) ? old : b;                     break; /* MAXU */
-        default: raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return;
+    /* AMO*: read the old value, combine with rs2, write the result back. The two
+     * widths share the operation set; rd gets the (sign-extended, for .W) old. */
+    uint64_t b = reg_read(cpu, rs2(inst));
+    uint64_t old;
+    if (is_d) {
+        old = mem_read64(cpu->mem, addr);
+        if (cpu->mem->fault) return;
+        uint64_t res;
+        switch (funct5) {
+            case 0x01: res = b;                                     break; /* SWAP */
+            case 0x00: res = old + b;                               break; /* ADD  */
+            case 0x04: res = old ^ b;                               break; /* XOR  */
+            case 0x0c: res = old & b;                               break; /* AND  */
+            case 0x08: res = old | b;                               break; /* OR   */
+            case 0x10: res = ((int64_t)old < (int64_t)b) ? old : b; break; /* MIN  */
+            case 0x14: res = ((int64_t)old > (int64_t)b) ? old : b; break; /* MAX  */
+            case 0x18: res = (old < b) ? old : b;                   break; /* MINU */
+            case 0x1c: res = (old > b) ? old : b;                   break; /* MAXU */
+            default: raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return;
+        }
+        mem_write64(cpu->mem, addr, res);
+    } else {
+        uint32_t o = mem_read32(cpu->mem, addr);
+        if (cpu->mem->fault) return;
+        uint32_t bb = (uint32_t)b, r;
+        switch (funct5) {
+            case 0x01: r = bb;                                      break; /* SWAP */
+            case 0x00: r = o + bb;                                  break; /* ADD  */
+            case 0x04: r = o ^ bb;                                  break; /* XOR  */
+            case 0x0c: r = o & bb;                                  break; /* AND  */
+            case 0x08: r = o | bb;                                  break; /* OR   */
+            case 0x10: r = ((int32_t)o < (int32_t)bb) ? o : bb;     break; /* MIN  */
+            case 0x14: r = ((int32_t)o > (int32_t)bb) ? o : bb;     break; /* MAX  */
+            case 0x18: r = (o < bb) ? o : bb;                       break; /* MINU */
+            case 0x1c: r = (o > bb) ? o : bb;                       break; /* MAXU */
+            default: raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return;
+        }
+        mem_write32(cpu->mem, addr, r);
+        old = (uint64_t)(int64_t)(int32_t)o; /* .W returns the sign-extended old */
     }
-    mem_write32(cpu->mem, addr, res);
     if (cpu->mem->fault) return;
     break_reservation(cpu, addr); /* the write voids a reservation on this word */
     reg_write(cpu, rd(inst), old);
@@ -600,9 +785,9 @@ static void exec_amo(CPU *cpu, uint32_t inst) {
  * entry: privilege returns to MPP, MIE is restored from MPIE, MPIE is set, and
  * MPP is reset to the least-privileged mode (U). Returns the PC to resume at —
  * the mepc the handler may have advanced past the trapping instruction. */
-static uint32_t exec_mret(CPU *cpu) {
+static uint64_t exec_mret(CPU *cpu) {
     if (cpu->priv < PRIV_M) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, 0); return cpu->pc; }
-    uint32_t s = cpu->csr[CSR_MSTATUS];
+    uint64_t s = cpu->csr[CSR_MSTATUS];
     uint32_t mpp = (s & MSTATUS_MPP) >> MSTATUS_MPP_SHIFT;
     s = (s & ~MSTATUS_MIE) | ((s & MSTATUS_MPIE) ? MSTATUS_MIE : 0); /* MIE=MPIE */
     s |= MSTATUS_MPIE;                                               /* MPIE=1   */
@@ -616,9 +801,9 @@ static uint32_t exec_mret(CPU *cpu) {
 /* Return from an S-mode trap (SRET). The S-mode mirror of MRET: privilege
  * returns to SPP (U or S), SIE is restored from SPIE, SPIE is set, SPP resets
  * to U. */
-static uint32_t exec_sret(CPU *cpu) {
+static uint64_t exec_sret(CPU *cpu) {
     if (cpu->priv < PRIV_S) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, 0); return cpu->pc; }
-    uint32_t s = cpu->csr[CSR_MSTATUS];
+    uint64_t s = cpu->csr[CSR_MSTATUS];
     uint32_t spp = (s & MSTATUS_SPP) ? PRIV_S : PRIV_U;
     s = (s & ~MSTATUS_SIE) | ((s & MSTATUS_SPIE) ? MSTATUS_SIE : 0); /* SIE=SPIE */
     s |= MSTATUS_SPIE;                                               /* SPIE=1   */
@@ -638,7 +823,7 @@ static uint32_t exec_sret(CPU *cpu) {
  * hart (a nop here — a single hart with no interrupt sources has nothing to
  * wait for), and any other encoding is illegal. A non-zero funct3 (other than
  * the reserved 4) is the Zicsr group. */
-static uint32_t exec_system(CPU *cpu, uint32_t inst) {
+static uint64_t exec_system(CPU *cpu, uint32_t inst) {
     uint32_t f3 = funct3(inst);
 
     if (f3 == 0) {
@@ -692,7 +877,7 @@ void cpu_step(CPU *cpu) {
      * expanded here to the 32-bit instruction it stands for; 0b11 introduces a
      * 32-bit instruction whose upper halfword may lie in the next page, so it is
      * translated separately. Either way decode/execute below is unchanged. */
-    uint32_t lo_pa;
+    uint64_t lo_pa;
     uint32_t fc = mmu_translate(cpu, cpu->pc, ACC_FETCH, &lo_pa);
     if (fc) { raise_trap(cpu, fc, cpu->pc); return; } /* instruction page fault */
     uint16_t lo = mem_read16(cpu->mem, lo_pa);
@@ -703,11 +888,11 @@ void cpu_step(CPU *cpu) {
 
     uint32_t inst, ilen;
     if ((lo & 0x3u) != 0x3u) {           /* 16-bit compressed instruction */
-        inst = rvc_expand(lo);
+        inst = rvc_expand(lo, cpu->xlen == 64);
         ilen = 2;
         if (inst == RVC_ILLEGAL) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, lo); return; }
     } else {                             /* 32-bit instruction: fetch upper half */
-        uint32_t hi_pa;
+        uint64_t hi_pa;
         uint32_t fch = mmu_translate(cpu, cpu->pc + 2, ACC_FETCH, &hi_pa);
         if (fch) { raise_trap(cpu, fch, cpu->pc + 2); return; }
         uint16_t hi = mem_read16(cpu->mem, hi_pa);
@@ -715,7 +900,7 @@ void cpu_step(CPU *cpu) {
         inst = (uint32_t)lo | ((uint32_t)hi << 16);
         ilen = 4;
     }
-    uint32_t next_pc = cpu->pc + ilen; /* default: fall through to the next insn */
+    uint64_t next_pc = cpu->pc + ilen; /* default: fall through to the next insn */
 
     /* DECODE + EXECUTE: dispatch on the opcode field. */
     switch (opcode(inst)) {
@@ -723,27 +908,35 @@ void cpu_step(CPU *cpu) {
             exec_op_imm(cpu, inst);
             break;
 
+        case OP_IMM_32:
+            exec_op_imm32(cpu, inst); /* RV64 ADDIW/SLLIW/SRLIW/SRAIW */
+            break;
+
         case OP_REG:
             exec_op(cpu, inst);
             break;
 
-        case OP_LUI: /* load upper immediate */
-            reg_write(cpu, rd(inst), (uint32_t)imm_u(inst));
+        case OP_REG_32:
+            exec_op32(cpu, inst);     /* RV64 ADDW/SUBW + W ops */
+            break;
+
+        case OP_LUI: /* load upper immediate (sign-extended to XLEN) */
+            reg_write(cpu, rd(inst), (uint64_t)imm_u(inst));
             break;
 
         case OP_AUIPC: /* add upper immediate to PC */
-            reg_write(cpu, rd(inst), cpu->pc + (uint32_t)imm_u(inst));
+            reg_write(cpu, rd(inst), cpu->pc + (uint64_t)imm_u(inst));
             break;
 
         case OP_JAL: /* jump and link (link address is the next instruction) */
             reg_write(cpu, rd(inst), cpu->pc + ilen);
-            next_pc = cpu->pc + (uint32_t)imm_j(inst);
+            next_pc = cpu->pc + (uint64_t)imm_j(inst);
             break;
 
         case OP_JALR: /* jump and link register */
             reg_write(cpu, rd(inst), cpu->pc + ilen);
             /* target = (rs1 + imm) with the low bit cleared */
-            next_pc = (reg_read(cpu, rs1(inst)) + (uint32_t)imm_i(inst)) & ~1u;
+            next_pc = (reg_read(cpu, rs1(inst)) + (uint64_t)imm_i(inst)) & ~(uint64_t)1;
             break;
 
         case OP_BRANCH:
@@ -795,7 +988,7 @@ void cpu_step(CPU *cpu) {
     }
 
     cpu->instret++; /* the instruction retired; drives the counter CSRs */
-    cpu->pc = next_pc;
+    cpu->pc = sext_xlen(cpu, next_pc); /* keep the sext invariant on PC */
 }
 
 const char *halt_reason_str(HaltReason r) {

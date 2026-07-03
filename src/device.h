@@ -76,13 +76,14 @@ void plat_init(Platform *p);
 
 /* Does `addr` fall in any device's MMIO window? The memory layer checks this
  * before its RAM range so device accesses are routed here. */
-int plat_contains(uint32_t addr);
+int plat_contains(uint64_t addr);
 
 /* MMIO access of `size` bytes (1/2/4). Reads return the value (0 for holes);
  * writes commit register effects (a UART transmit prints, a CLINT compare write
- * re-arms the timer, a PLIC complete ends a claim). */
-uint32_t plat_read(Platform *p, uint32_t addr, uint32_t size);
-void     plat_write(Platform *p, uint32_t addr, uint32_t size, uint32_t value);
+ * re-arms the timer, a PLIC complete ends a claim). The address is 64-bit so a
+ * high RV64 physical address never false-matches a sub-4 GiB device window. */
+uint32_t plat_read(Platform *p, uint64_t addr, uint32_t size);
+void     plat_write(Platform *p, uint64_t addr, uint32_t size, uint32_t value);
 
 /* Advance the timer by one tick (called once per CPU step). */
 void plat_tick(Platform *p);
