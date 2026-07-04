@@ -21,6 +21,17 @@
     li   t2, 0
 1:  CHECK 3, t2, 5
 
+    /* JALR where rd == rs1 — the `call` far-thunk pattern (auipc ra,hi;
+     * jalr ra,lo(ra)) a linker emits for a call it cannot reach with a single
+     * jal. The target must be computed from rs1's value BEFORE the link is
+     * written to the same register; writing the link first would clobber the
+     * base and jump to pc+4 (the poison below) instead of the intended target. */
+    la   ra, 1f
+    li   t2, 9
+    jalr ra, 0(ra)           /* target = ra (old) == 1f, not the just-written link */
+    li   t2, 0               /* poison: reached only if the base was clobbered */
+1:  CHECK 4, t2, 9
+
     TEST_END
 
 set42:

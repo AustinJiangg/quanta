@@ -986,9 +986,12 @@ void cpu_step(CPU *cpu) {
             break;
 
         case OP_JALR: /* jump and link register */
-            reg_write(cpu, rd(inst), cpu->pc + ilen);
-            /* target = (rs1 + imm) with the low bit cleared */
+            /* target = (rs1 + imm) with the low bit cleared. Compute it from rs1
+             * BEFORE writing the link register, since rd may alias rs1 — the
+             * `call` far-thunk `auipc ra,hi; jalr ra,lo(ra)` has rd == rs1 == ra,
+             * and writing the link first would clobber the base. */
             next_pc = (reg_read(cpu, rs1(inst)) + (uint64_t)imm_i(inst)) & ~(uint64_t)1;
+            reg_write(cpu, rd(inst), cpu->pc + ilen);
             break;
 
         case OP_BRANCH:
