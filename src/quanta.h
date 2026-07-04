@@ -94,11 +94,14 @@ QuantaStatus quanta_load_image(Quanta *q, uint32_t base, uint32_t size,
  * and enters the firmware with a0 = hartid, a1 = DTB, and a2 = a `fw_dynamic_info`
  * descriptor directing it into the OS in S-mode. `bootargs` is the kernel command
  * line placed in the device tree's /chosen node (NULL or "" for none) — e.g.
- * "earlycon=sbi console=ttyS0" for a Linux guest. Returns QUANTA_ERR_LOAD if
- * either file cannot be loaded or the RAM is too small for the layout. */
+ * "earlycon=sbi console=ttyS0" for a Linux guest. `initrd_path`, if non-NULL, is
+ * a cpio initramfs staged in RAM below the DTB and advertised to the kernel via
+ * /chosen linux,initrd-start/-end (the rootfs from which Linux runs its /init).
+ * Returns QUANTA_ERR_LOAD if a file cannot be loaded or the RAM is too small for
+ * the layout. */
 QuantaStatus quanta_load_firmware(Quanta *q, const char *bios_path,
                                   const char *kernel_path, const char *bootargs,
-                                  uint32_t min_mem);
+                                  const char *initrd_path, uint32_t min_mem);
 
 /* Resolve a symbol's address by name from the ELF at `path`, writing it to
  * `*addr`. Returns QUANTA_OK if found, QUANTA_ERR_LOAD if the file has no such

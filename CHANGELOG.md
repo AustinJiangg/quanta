@@ -9,18 +9,30 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
-- **Boot Linux under OpenSBI** — a mainline **Linux 6.6** kernel (built rv64imac,
-  no float/vector) boots on Quanta all the way to userspace launch: OpenSBI hands
-  off to the kernel, which brings up SBI (TIME/IPI/RFENCE/SRST/HSM), the console,
-  Sv39 paging, memory zones, and reaches PID 1 — panicking only at "unable to
-  mount root fs" with no rootfs attached. `Machine model: quanta,virt`. Run it
-  with `quanta --bios=<opensbi-fw_dynamic> --kernel=Image --memory=256M
-  --max-steps=0 --append="earlycon=uart8250,mmio,0x10000000 console=ttyS0"`. The
-  new **`--append=STRING`** flag sets the kernel command line (the device tree's
-  `/chosen` bootargs). Getting here surfaced one genuine CPU bug — the JALR
+- **Boot Linux to an interactive userspace shell** — a mainline **Linux 6.6**
+  kernel (built rv64imac, no float/vector) boots on Quanta all the way to a real
+  userspace process: OpenSBI hands off to the kernel, which brings up SBI
+  (TIME/IPI/RFENCE/SRST/HSM), the console, Sv39 paging, and memory zones, unpacks
+  an **initramfs**, and runs `/init` as PID 1 — `Machine model: quanta,virt`,
+  `Run /init as init process`, a `quanta$` prompt that echoes typed commands
+  through the kernel's serial tty, and a clean power-down. The rootfs is supplied
+  by the new **`--initrd=FILE`** flag, which stages a cpio archive in RAM below
+  the device tree and points the kernel at it via `/chosen`
+  `linux,initrd-start`/`-end` (the way qemu's `-initrd` does). The userspace is a
+  freestanding `/init` (`tests/linux/init.c`: no libc, raw Linux syscalls, a tiny
+  line shell that powers off via the reboot syscall → SBI SRST) packed by a
+  self-contained newc-cpio builder (`tests/linux/mkcpio.c`, which synthesises the
+  `/dev/console` device node the kernel opens as PID 1's console — no `cpio` tool
+  or root needed). `make linux-initramfs` builds the image; run it with
+  `quanta --bios=<opensbi-fw_dynamic> --kernel=Image --initrd=initramfs.cpio
+  --memory=128M --max-steps=0
+  --append="earlycon=uart8250,mmio,0x10000000 console=ttyS0"`. The **`--append`**
+  flag (also added here) sets the kernel command line (the device tree's `/chosen`
+  bootargs). Getting the kernel this far surfaced one genuine CPU bug — the JALR
   base/link ordering (see Fixed) — that only a binary large enough to need far
-  `call` thunks exercises. Like xv6, it is a manual milestone (external kernel,
-  long runs); no `make` target boots it. (M18)
+  `call` thunks exercises. Like xv6, it is a manual milestone (external kernel and
+  firmware, long runs); no `make` target boots it — see `tests/linux/README.md`.
+  (M18)
 - **OpenSBI firmware boot (`--bios` / `--kernel`)** — Quanta can now boot the way
   a real RISC-V machine does: a real M-mode firmware runs first and hands off to
   an S-mode OS. `quanta --bios=FILE --kernel=FILE` (via the new

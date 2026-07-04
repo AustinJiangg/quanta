@@ -102,6 +102,7 @@ static void dtb_config(const Quanta *q, DtbConfig *cfg, const char *bootargs) {
     cfg->uart_irq   = UART_IRQ;      cfg->plic_ndev  = PLIC_NSOURCES - 1;
     cfg->boot_hart  = 0;             cfg->timebase_freq = 10000000;
     cfg->bootargs   = bootargs;
+    cfg->initrd_start = 0;           cfg->initrd_end = 0; /* set by setup_firmware_boot */
     /* RV64 now walks Sv39 (M18); RV32 uses Sv32. */
     cfg->isa      = rv64 ? "rv64imac_zicsr" : "rv32ima_zicsr_zifencei";
     cfg->mmu_type = rv64 ? "riscv,sv39"     : "riscv,sv32";
@@ -153,18 +154,33 @@ static void setup_boot(Quanta *q) {
 #define FW_PRV_S           1ull           /* next_mode = Supervisor     */
 #define FW_DTB_HEADROOM    0x200000ull    /* 2 MiB above the DTB to grow */
 
-static int setup_firmware_boot(Quanta *q, uint64_t next_addr, const char *bootargs) {
+static int setup_firmware_boot(Quanta *q, uint64_t next_addr, const char *bootargs,
+                               const uint8_t *initrd, size_t initrd_size) {
     DtbConfig cfg;
     dtb_config(q, &cfg, bootargs);
-
-    uint8_t blob[DTB_MAX_SIZE];
-    size_t n = dtb_build(blob, sizeof blob, &cfg);
-    if (n == 0) return -1;
 
     uint64_t top = q->mem.base + q->mem.size;
     uint64_t dtb_addr = (top - FW_DTB_HEADROOM) & ~(uint64_t)7;
     uint64_t info_addr = (dtb_addr - 64) & ~(uint64_t)7; /* just below the DTB */
     if (info_addr <= next_addr) return -1;               /* layout does not fit */
+
+    /* An initramfs, if given, is parked page-aligned just below the fw_dynamic
+     * info/DTB — high in RAM, well clear of the kernel image at next_addr, the
+     * way qemu places an -initrd. The kernel reserves it from the /chosen bounds
+     * we advertise below, so it survives early memory setup. Its physical bounds
+     * must be set on cfg before dtb_build so they land in the tree. */
+    if (initrd && initrd_size) {
+        uint64_t end = info_addr & ~(uint64_t)0xfff;              /* page ceiling */
+        uint64_t start = (end - initrd_size) & ~(uint64_t)0xfff;  /* page-aligned base */
+        if (start <= next_addr) return -1;                        /* no room */
+        if (mem_load(&q->mem, start, initrd, initrd_size) != 0) return -1;
+        cfg.initrd_start = (uint32_t)start;
+        cfg.initrd_end   = (uint32_t)(start + initrd_size);
+    }
+
+    uint8_t blob[DTB_MAX_SIZE];
+    size_t n = dtb_build(blob, sizeof blob, &cfg);
+    if (n == 0) return -1;
     if (mem_load(&q->mem, dtb_addr, blob, n) != 0) return -1;
     q->dtb_addr = (uint32_t)dtb_addr;
 
@@ -206,9 +222,30 @@ static QuantaStatus load_raw_file(Quanta *q, const char *path, uint64_t addr) {
  * both expect this. */
 #define KERNEL_LOAD_OFFSET 0x200000ull
 
+/* Slurp a whole file into a malloc'd buffer (caller frees). Returns QUANTA_OK
+ * and sets the out pointer/length, or an error and leaves the pointer NULL. An
+ * empty file is an error here — an empty initramfs is not useful. */
+static QuantaStatus slurp_file(const char *path, uint8_t **out, size_t *len_out) {
+    *out = NULL; *len_out = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return QUANTA_ERR_LOAD;
+    QuantaStatus st = QUANTA_OK;
+    if (fseek(f, 0, SEEK_END) != 0) st = QUANTA_ERR_LOAD;
+    long n = (st == QUANTA_OK) ? ftell(f) : -1;
+    if (n <= 0 || fseek(f, 0, SEEK_SET) != 0) st = QUANTA_ERR_LOAD;
+    if (st == QUANTA_OK) {
+        uint8_t *buf = malloc((size_t)n);
+        if (!buf) st = QUANTA_ERR_NOMEM;
+        else if (fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); st = QUANTA_ERR_LOAD; }
+        else { *out = buf; *len_out = (size_t)n; }
+    }
+    fclose(f);
+    return st;
+}
+
 QuantaStatus quanta_load_firmware(Quanta *q, const char *bios_path,
                                   const char *kernel_path, const char *bootargs,
-                                  uint32_t min_mem) {
+                                  const char *initrd_path, uint32_t min_mem) {
     if (!q || !bios_path || !kernel_path) return QUANTA_ERR_INVAL;
 
     uint64_t entry;
@@ -220,8 +257,16 @@ QuantaStatus quanta_load_firmware(Quanta *q, const char *bios_path,
     QuantaStatus st = load_raw_file(q, kernel_path, kaddr);
     if (st != QUANTA_OK) return st;
 
-    if (setup_firmware_boot(q, kaddr, bootargs) != 0) return QUANTA_ERR_LOAD;
-    return QUANTA_OK;
+    uint8_t *initrd = NULL;
+    size_t initrd_size = 0;
+    if (initrd_path) {
+        st = slurp_file(initrd_path, &initrd, &initrd_size);
+        if (st != QUANTA_OK) return st;
+    }
+
+    int rc = setup_firmware_boot(q, kaddr, bootargs, initrd, initrd_size);
+    free(initrd);
+    return rc == 0 ? QUANTA_OK : QUANTA_ERR_LOAD;
 }
 
 QuantaStatus quanta_load_elf_ex(Quanta *q, const char *path, uint32_t min_mem) {

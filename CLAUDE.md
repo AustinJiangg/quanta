@@ -41,7 +41,9 @@ and a **virtio-mmio block device** (modern/v2, one split virtqueue, serving the
 the PLIC **S-mode interrupt context** (SEIP, `tests/rv64/test_rv64_plic.S`) — with
 which **upstream xv6-riscv now boots to an interactive shell** on Quanta (built
 `rv64imac_zicsr`, `CPUS=1`; `ls` reads the virtio disk, processes run through
-Sv39) — are implemented
+Sv39), and — through real **OpenSBI** firmware (`--bios`/`--kernel`) plus a
+**cpio initramfs** (`--initrd`, `tests/linux/`) — **mainline Linux 6.6 now boots
+to an interactive userspace shell** — are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
@@ -85,6 +87,7 @@ make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-t
 make check-uart-rx # check UART receive (piped stdin) and the --disk backend (M18)
 make check-virtio  # check the virtio-mmio block device on a --disk image (M18)
 make check-os      # boot the M16 teaching kernel to userspace (needs cross-toolchain)
+make linux-initramfs # build the Linux initramfs (tests/linux/) for the OpenSBI->Linux boot (M18)
 make check-rv64    # RV64IMAC conformance (tests/rv64/), diff vs qemu-riscv64 (M17)
 make check-diff    # differential-test against qemu-riscv32 (needs qemu-user-static)
 make check-arch    # official riscv-arch-test conformance (needs cross-toolchain + clone)
@@ -111,7 +114,10 @@ optional `K`/`M`/`G` suffix, e.g. `--memory=8M`) to grow the guest RAM region
 beyond its ELF image — spare RAM lands above the image for an OS-style guest to
 manage, and the boot DTB advertises the real size (`tests/os/` needs it). Add
 `--disk=FILE` to attach a raw block-device image (read wholly into memory) that
-the virtio-mmio block device serves as an OS's root filesystem (M18). Add
+the virtio-mmio block device serves as an OS's root filesystem (M18). With the
+`--bios`/`--kernel` firmware-boot path, add `--initrd=FILE` to stage a cpio
+initramfs in RAM as the kernel's root filesystem (advertised via the DTB
+`/chosen` `linux,initrd-start`/`-end`) — how Linux reaches its `/init` (M18). Add
 `--max-steps=N` (a count with an optional `K`/`M`/`G`/`T` suffix, `0` = no cap)
 to raise or remove the 100M-instruction runaway guard — an interactive
 full-system guest (a booting OS) legitimately runs billions of instructions. Add
@@ -428,6 +434,16 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   out of `TEST_SRC` and has its own build rule. Skips cleanly without an OpenSBI
   binary (`$QUANTA_OPENSBI` or qemu's default path), like `check-diff` without
   qemu. Also run under `make sanitize`/`make coverage`.
+- `tests/linux/` — the M18 Linux userspace (the `OpenSBI → Linux → /init` boot):
+  `init.c` is a freestanding RV64 `/init` (no libc, raw Linux `ecall` syscalls, a
+  tiny interactive line shell that powers off via the reboot syscall → SBI SRST);
+  `mkcpio.c` is a self-contained host packer that writes the kernel's newc-cpio
+  format directly (synthesising the `/dev/console` node the kernel opens as PID
+  1's console, so no `cpio` tool or root is needed); `mkinitramfs.sh` builds both
+  and packs `build/linux/initramfs.cpio` (`make linux-initramfs`). The kernel
+  `Image` and OpenSBI firmware are external artifacts supplied at run time, so
+  there is no `make` boot target — a manual milestone like xv6; `README.md` has
+  the recipe.
 - `tests/rv64/test_rv64_virtio.S` + `tests/check_virtio.sh` — the M18 virtio-mmio
   block-device test (`make check-virtio`): a bare-metal RV64 machine-mode driver
   probes the device identity, runs the status/feature handshake, sets up a split
@@ -844,23 +860,42 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   `make check-opensbi` pin the round trip (S-mode → SBI console → SBI SRST →
   clean exit).
 - Booting Linux (M18, the mainstream-distro trophy): a mainline **Linux 6.6**
-  `Image` boots on Quanta through OpenSBI to userspace launch (PID 1), panicking
-  only for lack of a rootfs — `Machine model: quanta,virt`, SBI up, `earlycon` on
-  the UART, Sv39 paging, memory zones all printed. Build it rv64imac (Quanta has
-  no F/D/V): from a defconfig kernel, `scripts/config -d FPU -d RISCV_ISA_V
-  -d RISCV_ISA_ZICBOM -d RISCV_ISA_ZICBOZ` then `olddefconfig` (our DTB advertises
-  only `rv64imac_zicsr`, so the kernel's runtime probes stay off those). Build
-  with a **linux-gnu** toolchain (`CROSS_COMPILE=riscv64-linux-gnu-`), not the
-  bare-metal newlib one — the newlib linker cannot `-shared` the kernel's VDSO.
-  Run `quanta --bios=<opensbi-fw_dynamic> --kernel=Image --memory=256M
+  `Image` boots on Quanta through OpenSBI **to an interactive userspace shell** —
+  `Machine model: quanta,virt`, SBI up, `earlycon` on the UART, Sv39 paging,
+  memory zones, `Unpacking initramfs`, `Run /init as init process`, a `quanta$`
+  prompt, and a clean power-down. Build it rv64imac (Quanta has no F/D/V): from a
+  defconfig kernel, `scripts/config -d FPU -d RISCV_ISA_V -d RISCV_ISA_ZICBOM
+  -d RISCV_ISA_ZICBOZ` then `olddefconfig` (our DTB advertises only
+  `rv64imac_zicsr`, so the kernel's runtime probes stay off those). Build with a
+  **linux-gnu** toolchain (`CROSS_COMPILE=riscv64-linux-gnu-`), not the bare-metal
+  newlib one — the newlib linker cannot `-shared` the kernel's VDSO. Run `quanta
+  --bios=<opensbi-fw_dynamic> --kernel=Image --initrd=<cpio> --memory=128M
   --max-steps=0 --append="earlycon=uart8250,mmio,0x10000000 console=ttyS0"`. The
-  `--append` flag sets the kernel command line via the DTB `/chosen` bootargs
-  (see dtb.c's `bootargs`). No `make` target boots it (external kernel, long run),
-  like xv6. The single Quanta change it needed beyond the OpenSBI path was the
-  **JALR far-call fix** below — everything else (Sv39, SBI-via-OpenSBI, the
-  devices) already worked. Next: an initramfs (a hand-written static init making
-  raw Linux syscalls, no libc, since only a bare-metal userspace toolchain is to
-  hand) for a real userspace shell.
+  `--append` flag sets the kernel command line via the DTB `/chosen` bootargs (see
+  dtb.c's `bootargs`). No `make` target boots it (external kernel + firmware, long
+  run), like xv6. Two Quanta changes it needed beyond the OpenSBI path: the **JALR
+  far-call fix** below, and the **initramfs support** next — everything else
+  (Sv39, SBI-via-OpenSBI, the devices) already worked.
+- Linux initramfs / the `--initrd` flag (M18, the Linux-userspace enabler): Linux
+  needs a root filesystem to run `/init`; `--initrd=FILE` supplies one the way
+  qemu's `-initrd` does. `setup_firmware_boot` (quanta.c) parks the cpio blob
+  **page-aligned just below the fw_dynamic info/DTB** — high in RAM, well clear of
+  the kernel image at 0x80200000 — and `dtb.c` advertises its physical bounds in
+  `/chosen` as `linux,initrd-start`/`-end` (two big-endian cells each, a zero-high
+  u64; the kernel reads whatever cell count the property length implies and
+  memblock-reserves the range early, so it survives boot). Only emitted when an
+  initrd is present, so every non-initrd boot is byte-identical. The userspace
+  lives in `tests/linux/`: `init.c` is a freestanding RV64 `/init` (no libc, raw
+  Linux `ecall` syscalls — write/read/reboot; a tiny line shell that powers off
+  via the reboot syscall, which Linux turns into an SBI SRST → the SiFive test
+  device → `HALT_EXIT`), built static/non-PIE/`rv64imac`; `mkcpio.c` is a
+  self-contained newc-cpio packer (a host program — no `cpio` tool and no root,
+  which matters because the archive must carry a **`/dev/console` character-device
+  node** (major 5, minor 1) that the kernel opens as PID 1's stdin/stdout, and an
+  unprivileged `cpio` cannot `mknod` one). `make linux-initramfs` (→
+  `build/linux/initramfs.cpio`) and `tests/linux/README.md` cover the build/boot;
+  a few input bytes piped in before the console is up can race boot (a real user
+  types after the prompt), but the interactive path is clean.
 - The JALR base/link ordering (the Linux-boot fix, and a real correctness bug):
   `exec`'s `OP_JALR` must compute the target from `rs1` **before** writing the
   link register `rd = pc + ilen`, because `rd` can alias `rs1`. The `call`

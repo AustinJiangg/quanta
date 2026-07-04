@@ -57,7 +57,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -235,6 +235,15 @@ check-console: $(BIN) tests/uart_echo.elf
 # OpenSBI binary (QUANTA_OPENSBI, or qemu's default); skips cleanly without it.
 check-opensbi: $(BIN) tests/opensbi_payload.bin
 	@sh tests/check_opensbi.sh
+
+# Build the M18 Linux initramfs (tests/linux/): a freestanding userspace /init
+# packed into a cpio the kernel unpacks as its rootfs, for the OpenSBI -> Linux
+# -> userspace-shell boot. Self-contained (host cc + the riscv64-linux-gnu cross
+# compiler). The kernel Image and OpenSBI firmware are external artifacts supplied
+# at run time, so there is no boot target — see tests/linux/README.md for the
+# recipe. Output: build/linux/initramfs.cpio.
+linux-initramfs:
+	@sh tests/linux/mkinitramfs.sh
 
 # Exercise the M13 platform: the device/interrupt test must exit clean (CLINT
 # timer, software IPI, and a PLIC-routed external interrupt all fire) and its

@@ -811,7 +811,7 @@ Sv39 paging both wait, F/D until a guest needs it and Sv39 for M18.
 - [x] **Commits:** `refactor: parameterise xlen`, `feat: add rv64 base`,
   `test: rv64 conformance and differential`.
 
-## M18 — Sv39 + boot a mainstream OS (Sv39 DONE; OS boot in progress)
+## M18 — Sv39 + boot a mainstream OS (DONE)
 
 Sv39 is in — the three-level page-table scheme RV64 needs, and the second half of
 the M17 "RV64 runs Bare" gap. Rather than a second walker, `mmu.c`'s existing
@@ -906,8 +906,20 @@ before computing the target from the base, so a `jalr rd,off(rd)` (`rd == rs1`,
 the far-`call` thunk a linker emits beyond ~2 MiB) jumped to garbage — invisible
 to xv6/OpenSBI/the suite (all small enough to relax every call to `jal`), fatal to
 a 22 MiB kernel whose cross-section calls broke, so paging silently never came up.
-**Next:** an initramfs (a hand-written static init making raw Linux syscalls, no
-libc) for a userspace shell.
+
+**Linux reaches a userspace shell.** The last piece was an initramfs: a new
+`--initrd=FILE` flag stages a cpio archive in RAM below the DTB and advertises it
+to the kernel via `/chosen` `linux,initrd-start`/`-end` (the way qemu's `-initrd`
+does), so the kernel unpacks it as its root filesystem and runs `/init`. That
+`/init` (`tests/linux/init.c`) is a freestanding RV64 program — no libc, every
+action a raw Linux `ecall` — that drives a tiny line shell over the serial console
+and powers the machine off (reboot syscall → SBI SRST) on command. It is packed
+with a self-contained newc-cpio builder (`tests/linux/mkcpio.c`, no `cpio`/root
+needed, since the archive carries the `/dev/console` device node the kernel opens
+as PID 1's console). **Linux 6.6 now boots all the way to an interactive
+userspace shell** on Quanta: `Unpacking initramfs` → `Run /init as init process`
+→ a `quanta$` prompt that echoes typed commands through the kernel tty and shuts
+down cleanly. `make linux-initramfs` builds the image; see `tests/linux/README.md`.
 
 - [x] **Build (paging):** the three-level Sv39 page-table scheme (a
   descriptor-parameterised generalisation of the Sv32 walk).
@@ -915,18 +927,20 @@ libc) for a userspace shell.
   `--disk` backend, the virtio-mmio block device, the PLIC S-mode context/SEIP,
   the UART THRE one-shot, `--max-steps`, and the full-XLEN branch fix — xv6 boots
   to its shell.
-- [x] **Build (Linux):** boot Linux under OpenSBI. *Done:* the `--bios`/`--kernel`
-  firmware-boot path, the fw_dynamic handoff, the DTB-headroom placement, the
-  SiFive test device, the `--append` kernel cmdline, and the JALR far-call fix —
-  **Linux 6.6 boots to userspace launch** (panics only for lack of a rootfs).
-  *Next:* an initramfs for a userspace shell.
+- [x] **Build (Linux):** boot Linux under OpenSBI to a userspace shell. *Done:*
+  the `--bios`/`--kernel` firmware-boot path, the fw_dynamic handoff, the
+  DTB-headroom placement, the SiFive test device, the `--append` kernel cmdline,
+  the JALR far-call fix, and the `--initrd` cpio initramfs (+ the freestanding
+  `/init` and its self-contained packer) — **Linux 6.6 boots to an interactive
+  userspace shell.**
 - [x] **ISA:** Sv39 address translation; Sstc (`stimecmp`/`menvcfg.STCE`).
 - [x] **Concept:** deeper page-table hierarchies; a real distro's boot
   requirements.
-- [x] **Done when:** xv6-riscv reaches its shell. *(Linux to userspace still to come.)*
+- [x] **Done when:** xv6-riscv reaches its shell — *and* Linux 6.6 reaches an
+  interactive userspace shell via an initramfs.
 - [x] **Commits:** `feat: add sv39 paging`, `feat: add sstc supervisor timer`,
-  `feat: add virtio-mmio block device`, `feat: boot xv6-riscv`.
-  Still to come: `test: boot linux`.
+  `feat: add virtio-mmio block device`, `feat: boot xv6-riscv`,
+  `feat: boot linux under opensbi`, `feat: boot linux to a userspace shell`.
 
 ## M19 — SMP multi-hart (stretch)
 

@@ -172,6 +172,15 @@ size_t dtb_build(uint8_t *buf, size_t cap, const DtbConfig *cfg) {
     begin_node(&f, "chosen");
     prop_str(&f, "stdout-path", "/soc/uart@10000000");
     prop_str(&f, "bootargs", cfg->bootargs ? cfg->bootargs : "");
+    /* An initramfs the firmware staged in RAM: point the kernel at its physical
+     * bounds. Encoded as two big-endian cells (a 64-bit value with a zero high
+     * cell) — the kernel reads whatever cell count the property length implies. */
+    if (cfg->initrd_end > cfg->initrd_start) {
+        uint32_t start[2] = { 0, cfg->initrd_start };
+        uint32_t end[2]   = { 0, cfg->initrd_end };
+        prop_cells(&f, "linux,initrd-start", start, 2);
+        prop_cells(&f, "linux,initrd-end", end, 2);
+    }
     end_node(&f);
 
     /* /cpus — one hart, with its local interrupt controller. */
