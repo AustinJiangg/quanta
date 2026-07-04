@@ -21,6 +21,56 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
   then re-raise), so a killed emulator never leaves the user's shell broken. A
   pipe or file is not a tty, so it is read verbatim and every existing test is
   unaffected. Pinned by `make check-console`, a pty-based test. (M18)
+- **Boot xv6-riscv** — upstream `mit-pdos/xv6-riscv` boots to an interactive
+  shell on Quanta (built integer-only, `rv64imac_zicsr`, `CPUS=1`; run
+  `./quanta --memory=128M --max-steps=0 --disk=fs.img kernel/kernel`): `ls` reads
+  the filesystem off the virtio disk, processes fork/exec through Sv39 paging, and
+  the console echoes host input. Beyond the M18 devices this took four changes — a
+  genuine RV64 bug fix (`exec_branch` compared only the low 32 bits, deciding an
+  xv6 page-table-teardown `bltu`/`bgeu` over high user VAs wrong; it now compares
+  the full XLEN), the PLIC's **S-mode context** (context 1) driving **SEIP** so an
+  S-mode OS claims/completes device interrupts, the 16550 UART's THR-empty
+  interrupt becoming a one-shot (so an always-empty transmitter does not storm an
+  OS that leaves TX interrupts on), and a `--max-steps=N` flag (0 = uncapped) to
+  run an interactive guest past the runaway guard. Pinned indirectly by
+  `tests/rv64/test_rv64_plic.S` (the S-mode interrupt path) and the high-address
+  branch checks in `tests/rv64/test_rv64.S`. (M18)
+- **virtio-mmio block device** — a modern (version 2) block device
+  (`src/device.c`) with one split virtqueue on the qemu `virt` first slot
+  (`VIRTIO_BASE` 0x10001000, PLIC source 1), serving the `--disk` image as an OS's
+  root filesystem — Quanta's first bus-master device, so the platform now carries
+  a guest-RAM pointer (`plat_attach_ram`) for bounds-checked DMA. The driver
+  brings it up through the mmio register file (status/feature handshake, queue
+  addresses, `QUEUE_READY`) and kicks it with `QUEUE_NOTIFY`; `virtio_notify` then
+  walks the available ring and services each descriptor chain synchronously —
+  DMAing sectors to/from the disk image, writing the used ring, and asserting its
+  PLIC interrupt. Inert until a guest programs it. Pinned by
+  `tests/rv64/test_rv64_virtio.S` and `make check-virtio`. (M18)
+- **UART receive and a `--disk` backend** — the 16550 UART gains a *source* for
+  its receive path: `plat_uart_rx` (exposed as `quanta_uart_input`) buffers one
+  host byte and raises the RX interrupt, and `main.c`'s console pump feeds host
+  stdin through it during the run, giving a full-system guest a keyboard. Readiness
+  is a zero-timeout `select`, so stdin's shell-shared flags are never mutated.
+  `--disk=FILE` reads a raw block-device image wholly into an engine-owned buffer
+  (`Platform.disk`) that the virtio device serves. Pinned by `make check-uart-rx`.
+  (M18)
+- **Sstc supervisor-timer extension** — the other way to reach a supervisor timer
+  interrupt (STIP), for an OS that owns M-mode and wants no firmware round-trip
+  (xv6 booted `-bios none`). When `menvcfg.STCE` (bit 63) is set, `sstc_tick`
+  makes STIP a hardware shadow of the `stimecmp` CSR (0x14D) — pending exactly
+  while `time >= stimecmp` — and writing `stimecmp` arms the next tick. `STCE`
+  gates the whole mechanism, so it never fights the SBI timer relay; a guest uses
+  one or the other. Pinned by `tests/rv64/test_rv64_sstc.S`. (M18)
+- **Sv39 virtual memory** — the three-level page-table scheme RV64 needs, closing
+  the "RV64 runs Bare" gap left by M17. Rather than a second walker, `mmu.c`'s
+  Sv32 walk was generalised: one loop now serves both schemes, parameterised by a
+  descriptor (table depth, PTE width, VPN-field width, PPN mask) chosen from
+  `satp.MODE` — Sv32 is 2 levels / 4-byte PTEs, Sv39 is 3 levels / 8-byte PTEs —
+  with the superpage merge, TLB, permission, A/D-writeback, and page-fault paths
+  shared unchanged. Sv39 adds a canonical-VA check (bits [63:39] a sign-extension
+  of bit 38), and `satp.MODE` is now enforced WARL (`mmu_satp_supported` drops a
+  write selecting an unsupported Sv48/Sv57). Every RV32 net stayed bit-for-bit
+  green. Pinned by `tests/rv64/test_rv64_vm.S`. (M18)
 - **RV64 transition (RV64IMAC)** — the core is now width-parameterised and runs
   RV64 as well as RV32, selected per program from the ELF class rather than by a
   separate build. XLEN is a runtime property (`cpu->xlen`): all state is stored in
