@@ -2,9 +2,9 @@ name: CI
 
 # Build the engine library and CLI with two compilers at two optimisation
 # levels, then run the whole suite — conformance, disassembler-vs-objdump, cache,
-# pipeline, the GDB remote stub, the raw-mode interactive console, the MMIO
-# devices — plus the libquanta embedding example. Warnings are errors here, so the
-# tree must stay clean under -Wall -Wextra.
+# pipeline, the GDB remote stub, the raw-mode interactive console, the OpenSBI
+# firmware boot, the MMIO devices — plus the libquanta embedding example. Warnings
+# are errors here, so the tree must stay clean under -Wall -Wextra.
 on: [push, pull_request]
 
 jobs:
@@ -64,6 +64,15 @@ jobs:
       # check-uart-rx); the runner allocates ptys, so no tty is needed on the job.
       - name: Interactive console (raw mode)
         run: make check-console
+
+      # Boot real OpenSBI firmware handing off to an S-mode payload. The `opensbi`
+      # package ships a fw_dynamic build; if it (or the file) is missing the test
+      # skips cleanly, so `|| true` on the install keeps CI green either way.
+      - name: OpenSBI firmware boot
+        run: |
+          sudo apt-get install -y opensbi >/dev/null 2>&1 || true
+          OSBI=$(find /usr -name 'fw_dynamic.elf' 2>/dev/null | grep -i generic | head -1)
+          QUANTA_OPENSBI="${OSBI:-}" make check-opensbi
 
       - name: Platform devices and interrupts
         run: make check-devices

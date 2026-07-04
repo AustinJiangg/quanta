@@ -28,6 +28,8 @@
 typedef struct {
     uint32_t mem_base;        /* RAM base / size (the /memory node's reg)        */
     uint32_t mem_size;
+    uint32_t test_base;       /* SiFive test finisher (poweroff/reboot) window   */
+    uint32_t test_size;
     uint32_t clint_base;      /* CLINT, PLIC, UART windows (the /soc children)    */
     uint32_t clint_size;
     uint32_t plic_base;

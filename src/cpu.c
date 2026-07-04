@@ -910,6 +910,15 @@ void cpu_step(CPU *cpu) {
      * and retires nothing, so we return without fetching. */
     if (cpu->mem->plat) {
         plat_tick(cpu->mem->plat);
+        uint32_t off_code;
+        if (plat_poweroff_requested(cpu->mem->plat, &off_code)) {
+            /* The SiFive test device was written (OpenSBI SRST / Linux poweroff):
+             * stop the machine with the requested status. */
+            cpu->exit_code   = off_code;
+            cpu->halt_reason = HALT_EXIT;
+            cpu->halted      = 1;
+            return;
+        }
         firmware_timer_tick(cpu); /* convert a reached SBI deadline into STIP */
         sstc_tick(cpu);           /* or drive STIP directly from stimecmp (Sstc) */
         if (take_interrupt(cpu)) return;

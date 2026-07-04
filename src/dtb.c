@@ -242,6 +242,16 @@ size_t dtb_build(uint8_t *buf, size_t cap, const DtbConfig *cfg) {
     prop_u32(&f, "interrupts", cfg->uart_irq);
     end_node(&f);
 
+    /* SiFive test finisher: the firmware's (and OS's) poweroff/reboot device.
+     * The compatible is a two-string list — OpenSBI's reset driver binds to
+     * either "sifive,test1" or "sifive,test0". */
+    snprintf(unit, sizeof unit, "test@%x", cfg->test_base);
+    begin_node(&f, unit);
+    static const char test_compat[] = "sifive,test1\0sifive,test0";
+    prop(&f, "compatible", test_compat, (uint32_t)sizeof test_compat);
+    prop_reg(&f, cfg->test_base, cfg->test_size);
+    end_node(&f);
+
     end_node(&f);  /* soc */
     end_node(&f);  /* / */
     put_u32(&f, FDT_END);

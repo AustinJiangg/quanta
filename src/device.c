@@ -22,10 +22,36 @@ void plat_init(Platform *p) {
 }
 
 int plat_contains(uint64_t addr) {
-    return in_window(addr, CLINT_BASE,  CLINT_SIZE)  ||
+    return in_window(addr, TEST_BASE,   TEST_SIZE)   ||
+           in_window(addr, CLINT_BASE,  CLINT_SIZE)  ||
            in_window(addr, PLIC_BASE,   PLIC_SIZE)   ||
            in_window(addr, UART_BASE,   UART_SIZE)   ||
            in_window(addr, VIRTIO_BASE, VIRTIO_SIZE);
+}
+
+/* SiFive test finisher — qemu virt's poweroff/reboot device. A 32-bit write
+ * whose low half is FINISHER_PASS/FAIL/RESET ends the machine; FAIL carries an
+ * exit code in the high half. We cannot reboot, so RESET halts like PASS. The
+ * effect is deferred to plat_poweroff_requested, which the CPU polls. */
+#define FINISHER_FAIL  0x3333u
+#define FINISHER_PASS  0x5555u
+#define FINISHER_RESET 0x7777u
+
+static void test_write(Platform *p, uint32_t value) {
+    switch (value & 0xffffu) {
+        case FINISHER_FAIL:
+            p->poweroff = 1; p->poweroff_code = (value >> 16) & 0xffu; break;
+        case FINISHER_PASS:
+        case FINISHER_RESET:
+            p->poweroff = 1; p->poweroff_code = 0; break;
+        default: break;
+    }
+}
+
+int plat_poweroff_requested(const Platform *p, uint32_t *code) {
+    if (!p->poweroff) return 0;
+    if (code) *code = p->poweroff_code;
+    return 1;
 }
 
 void plat_attach_ram(Platform *p, uint8_t *ram, uint64_t base, uint64_t size) {
@@ -474,7 +500,9 @@ uint32_t plat_read(Platform *p, uint64_t addr, uint32_t size) {
 
 void plat_write(Platform *p, uint64_t addr, uint32_t size, uint32_t value) {
     (void)size; /* CLINT/PLIC/virtio take word writes; the UART is byte-addressed */
-    if (in_window(addr, UART_BASE, UART_SIZE))
+    if (in_window(addr, TEST_BASE, TEST_SIZE))
+        test_write(p, value);
+    else if (in_window(addr, UART_BASE, UART_SIZE))
         uart_write(&p->uart, addr - UART_BASE, (uint8_t)value);
     else if (in_window(addr, CLINT_BASE, CLINT_SIZE))
         clint_write(&p->clint, (addr - CLINT_BASE) & ~3u, value);

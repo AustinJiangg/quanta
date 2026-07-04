@@ -15,6 +15,7 @@
 #   make check-pipeline  check the pipeline model on a hazard workload
 #   make check-gdb    drive the gdb remote stub with a self-contained client
 #   make check-console  exercise the raw-mode interactive console over a pty
+#   make check-opensbi  boot OpenSBI firmware handing off to an S-mode payload
 #   make check-devices  check the MMIO devices and interrupt delivery (M13)
 #   make check-diff   differential-test against a reference sim (qemu-riscv32)
 #   make check-arch   run the official riscv-arch-test conformance suite
@@ -47,6 +48,7 @@ FUZZ_TARGETS := fuzz/fuzz_elf fuzz/fuzz_decode
 # RISC-V cross-toolchain (override if yours is named differently).
 RVCC      ?= riscv64-unknown-elf-gcc
 RVOBJDUMP ?= riscv64-unknown-elf-objdump
+RVOBJCOPY ?= riscv64-unknown-elf-objcopy
 RVCFLAGS  ?= -march=rv32i -mabi=ilp32 -nostdlib -nostartfiles -Ttext=0x80000000
 
 SRC     := $(wildcard src/*.c)
@@ -55,7 +57,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-devices check-sbi check-uart-rx check-virtio check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -91,7 +93,9 @@ examples/embed: examples/embed.c $(LIB)
 # host input to terminate, so keep it out of the general suites (make check runs
 # input-less; check-disasm executes under --trace; check-diff runs qemu, which
 # does not model the UART MMIO). It has its own target and the pattern rule builds it.
-TEST_SRC := $(filter-out tests/uart_echo.S,$(wildcard tests/*.S))
+# opensbi_payload is an rv64 S-mode payload built to a raw .bin (not a standalone
+# test ELF); it has its own rule and is driven by check-opensbi.
+TEST_SRC := $(filter-out tests/uart_echo.S tests/opensbi_payload.S,$(wildcard tests/*.S))
 TEST_ELF := $(TEST_SRC:.S=.elf)
 
 tests: $(TEST_ELF)
@@ -99,6 +103,16 @@ tests: $(TEST_ELF)
 tests/%.elf: tests/%.S
 	$(RVCC) $(RVCFLAGS) -o $@ $<
 	@echo "Built $@ — disassemble with: $(RVOBJDUMP) -d $@"
+
+# The OpenSBI firmware-boot payload: a raw rv64 S-mode image loaded at 0x80200000
+# (like a Linux Image), built -mno-relax so `la` on its in-RAM message stays
+# PC-relative (gp is 0). Its own rule (rv64, objcopy to binary), not the rv32
+# tests/%.elf pattern; driven by check-opensbi.
+tests/opensbi_payload.bin: tests/opensbi_payload.S
+	$(RVCC) -march=rv64imac_zicsr -mabi=lp64 -mno-relax -nostdlib -nostartfiles \
+		-Ttext=0x80200000 -o tests/opensbi_payload.elf $<
+	$(RVOBJCOPY) -O binary tests/opensbi_payload.elf $@
+	@echo "Built $@ (rv64 S-mode payload for check-opensbi)"
 
 # tests/test_muldiv.S exercises the RV32M extension, which the base -march=rv32i
 # assembler rejects. Enable M for just this one ELF; the rest of the suite stays
@@ -215,6 +229,13 @@ check-gdb: $(BIN) tests/hello.elf
 check-console: $(BIN) tests/uart_echo.elf
 	@sh tests/check_console.sh
 
+# Boot a real M-mode firmware (OpenSBI, fw_dynamic) that hands off to an S-mode
+# payload — the way a RISC-V machine boots, and the path Linux takes. The payload
+# prints via the SBI console and shuts down via SBI SRST (a clean exit). Needs an
+# OpenSBI binary (QUANTA_OPENSBI, or qemu's default); skips cleanly without it.
+check-opensbi: $(BIN) tests/opensbi_payload.bin
+	@sh tests/check_opensbi.sh
+
 # Exercise the M13 platform: the device/interrupt test must exit clean (CLINT
 # timer, software IPI, and a PLIC-routed external interrupt all fire) and its
 # UART console output must reach stdout.
@@ -290,8 +311,8 @@ sanitize:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
-		check-console check-devices check-sbi check-uart-rx check-virtio check-os \
-		check-rv64 check-diff
+		check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio \
+		check-os check-rv64 check-diff
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
 # the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`
@@ -322,7 +343,7 @@ COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
 
 coverage:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-devices check-sbi check-uart-rx check-virtio check-os
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-os
 	@sh tests/coverage.sh
 
 # Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),

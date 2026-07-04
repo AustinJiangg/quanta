@@ -24,7 +24,12 @@
  * Usage:
  *   quanta [--version] [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]]
  *          [--pipeline] [--memory=SIZE] [--max-steps=N] [--gdb[=PORT]] [--signature=FILE]
- *          [--disk=FILE] [program.elf]
+ *          [--disk=FILE] [--bios=FILE --kernel=FILE] [program.elf]
+ *
+ * --bios (an M-mode firmware ELF, e.g. OpenSBI) with --kernel (a raw S-mode OS
+ * image, e.g. a Linux Image) boots the way a real machine does: the firmware runs
+ * first and hands off to the OS in S-mode. Without --bios, a program.elf is run
+ * directly in M-mode (Quanta acting as the SEE/SBI).
  *
  * A running guest can take console input: host stdin is pumped into the UART's
  * receive path during the run, so a full-system guest has a keyboard. When stdin
@@ -346,6 +351,8 @@ int main(int argc, char **argv) {
     const char *path = NULL;
     const char *sigfile = NULL; /* --signature=FILE: arch-test signature dump */
     const char *diskpath = NULL; /* --disk=FILE: raw block-device backing image */
+    const char *bios = NULL;    /* --bios=FILE: M-mode firmware ELF (OpenSBI) */
+    const char *kernel = NULL;  /* --kernel=FILE: raw S-mode OS image (Linux Image) */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
             printf("quanta %s\n", quanta_version());
@@ -402,11 +409,24 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--disk needs a file path\n");
                 return 2;
             }
+        } else if (strncmp(argv[i], "--bios=", 7) == 0) {
+            bios = argv[i] + 7;
+            if (bios[0] == '\0') {
+                fprintf(stderr, "--bios needs a firmware ELF path\n");
+                return 2;
+            }
+        } else if (strncmp(argv[i], "--kernel=", 9) == 0) {
+            kernel = argv[i] + 9;
+            if (kernel[0] == '\0') {
+                fprintf(stderr, "--kernel needs an OS image path\n");
+                return 2;
+            }
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--max-steps=N] "
-                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [program.elf]\n",
+                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] "
+                    "[--bios=FILE --kernel=FILE] [program.elf]\n",
                     argv[0]);
             return 2;
         } else if (path == NULL) {
@@ -414,7 +434,8 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--max-steps=N] "
-                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [program.elf]\n",
+                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] "
+                    "[--bios=FILE --kernel=FILE] [program.elf]\n",
                     argv[0]);
             return 2;
         }
@@ -426,16 +447,32 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* --bios selects the firmware boot path: an M-mode firmware (OpenSBI) that
+     * hands off to an S-mode OS image (--kernel), the way a real machine boots. */
+    if (bios && !kernel) {
+        fprintf(stderr, "--bios needs --kernel (the S-mode OS image to boot)\n");
+        quanta_destroy(q);
+        return 2;
+    }
+    if (kernel && !bios) {
+        fprintf(stderr, "--kernel needs --bios (the M-mode firmware to boot it)\n");
+        quanta_destroy(q);
+        return 2;
+    }
+
     /* Load the program first, since it can fail. The demo maps a fixed region
      * and copies the hardcoded image; an ELF gets a region sized to its load
      * image, and the loader prints its own diagnostics on failure. */
-    int demo = (path == NULL);
-    QuantaStatus st = demo
+    int demo = (path == NULL && bios == NULL);
+    QuantaStatus st = bios
+        ? quanta_load_firmware(q, bios, kernel, mem_req)
+        : demo
         ? quanta_load_image(q, MEM_BASE, MEM_SIZE,
                             demo_program, sizeof demo_program, MEM_BASE)
         : quanta_load_elf_ex(q, path, mem_req);
     if (st != QUANTA_OK) {
-        if (demo) fprintf(stderr, "failed to load demo program\n");
+        if (demo)      fprintf(stderr, "failed to load demo program\n");
+        else if (bios) fprintf(stderr, "failed to load firmware/kernel\n");
         quanta_destroy(q);
         return 1;
     }
@@ -457,6 +494,15 @@ int main(int argc, char **argv) {
         printf("Quanta — RV%d emulator\n", quanta_xlen(q) ? quanta_xlen(q) : 32);
         if (demo) {
             printf("No ELF given; running the built-in demo program.\n\n");
+        } else if (bios) {
+            /* Firmware boot: the M-mode firmware (entry) will hand off to the
+             * S-mode OS at 0x80200000; a2 points at the fw_dynamic descriptor. */
+            printf("Firmware %s (entry = 0x%0*llx, dtb = 0x%0*llx)\n",
+                   bios, w, (unsigned long long)entry,
+                   w, (unsigned long long)quanta_dtb_addr(q));
+            printf("Kernel:  %s\n", kernel);
+            if (diskpath) printf("Disk:    %s\n", diskpath);
+            printf("\n");
         } else {
             /* The loader hands the guest a device tree per the RISC-V boot
              * contract: a0 = hartid, a1 = dtb (reported here for visibility). */

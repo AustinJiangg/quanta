@@ -89,6 +89,23 @@ static void start_at(Quanta *q, uint64_t entry, int xlen) {
     q->loaded = 1;
 }
 
+/* Describe this machine for the device-tree builder. Shared by both boot
+ * handoffs (Quanta-as-firmware in setup_boot, and an M-mode firmware payload in
+ * setup_firmware_boot). */
+static void dtb_config(const Quanta *q, DtbConfig *cfg) {
+    int rv64 = (q->cpu.xlen == 64);
+    cfg->mem_base   = (uint32_t)q->mem.base; cfg->mem_size = (uint32_t)q->mem.size;
+    cfg->test_base  = TEST_BASE;     cfg->test_size  = TEST_SIZE;
+    cfg->clint_base = CLINT_BASE;    cfg->clint_size = CLINT_SIZE;
+    cfg->plic_base  = PLIC_BASE;     cfg->plic_size  = PLIC_SIZE;
+    cfg->uart_base  = UART_BASE;     cfg->uart_size  = UART_SIZE;
+    cfg->uart_irq   = UART_IRQ;      cfg->plic_ndev  = PLIC_NSOURCES - 1;
+    cfg->boot_hart  = 0;             cfg->timebase_freq = 10000000;
+    /* RV64 now walks Sv39 (M18); RV32 uses Sv32. */
+    cfg->isa      = rv64 ? "rv64imac_zicsr" : "rv32ima_zicsr_zifencei";
+    cfg->mmu_type = rv64 ? "riscv,sv39"     : "riscv,sv32";
+}
+
 /* The RISC-V boot handoff (M14): describe this machine in a flattened device
  * tree, drop it at the top of guest memory, and enter the guest the way firmware
  * does — a0 = boot hart id, a1 = the DTB's physical address — with sp moved just
@@ -97,18 +114,8 @@ static void start_at(Quanta *q, uint64_t entry, int xlen) {
  * under a page) and sits in the loader's stack headroom; if it somehow does not
  * fit, we leave start_at's plain entry state untouched (a0/a1 = 0). */
 static void setup_boot(Quanta *q) {
-    int rv64 = (q->cpu.xlen == 64);
-    DtbConfig cfg = {
-        .mem_base   = (uint32_t)q->mem.base, .mem_size = (uint32_t)q->mem.size,
-        .clint_base = CLINT_BASE,    .clint_size = CLINT_SIZE,
-        .plic_base  = PLIC_BASE,     .plic_size  = PLIC_SIZE,
-        .uart_base  = UART_BASE,     .uart_size  = UART_SIZE,
-        .uart_irq   = UART_IRQ,      .plic_ndev  = PLIC_NSOURCES - 1,
-        .boot_hart  = 0,             .timebase_freq = 10000000,
-        /* RV64 now walks Sv39 (M18); RV32 uses Sv32. */
-        .isa      = rv64 ? "rv64imac_zicsr" : "rv32ima_zicsr_zifencei",
-        .mmu_type = rv64 ? "riscv,sv39"     : "riscv,sv32",
-    };
+    DtbConfig cfg;
+    dtb_config(q, &cfg);
 
     uint8_t blob[DTB_MAX_SIZE];
     size_t n = dtb_build(blob, sizeof blob, &cfg);
@@ -122,6 +129,97 @@ static void setup_boot(Quanta *q) {
     reg_write(&q->cpu, 2, (addr - 16) & ~(uint32_t)0xf); /* sp: 16-aligned, below the DTB */
     reg_write(&q->cpu, 10, cfg.boot_hart);               /* a0 = hartid */
     reg_write(&q->cpu, 11, addr);                        /* a1 = DTB pointer */
+}
+
+/* The boot handoff when an M-mode firmware (OpenSBI, fw_dynamic) enters the OS
+ * instead of Quanta doing it directly. Two differences from setup_boot:
+ *
+ *  - The DTB is placed LOW, with headroom above it, because OpenSBI expands the
+ *    FDT *in place* (fdt_open_into) to add its own nodes (reserved-memory for the
+ *    firmware region, PMP, ...). A tree jammed against the top of RAM overflows
+ *    the last page — so we park it 2 MiB below the top and leave that slack for
+ *    the firmware to grow into.
+ *  - We hand the firmware a `fw_dynamic_info` descriptor (magic "OSBI", version 2)
+ *    in a2, per OpenSBI's fw_dynamic contract, telling it to enter the payload at
+ *    `next_addr` in S-mode. a0 = hartid, a1 = DTB, PC = firmware entry (already
+ *    set by start_at). The fields are written explicitly little-endian so the
+ *    handoff is host-endianness-independent, like elf.c.
+ *
+ * Returns 0 on success, -1 if the RAM is too small for the firmware/kernel/DTB
+ * layout. */
+#define FW_DYNAMIC_MAGIC   0x4942534full  /* "OSBI"                     */
+#define FW_DYNAMIC_VERSION 2ull           /* has the boot_hart field    */
+#define FW_PRV_S           1ull           /* next_mode = Supervisor     */
+#define FW_DTB_HEADROOM    0x200000ull    /* 2 MiB above the DTB to grow */
+
+static int setup_firmware_boot(Quanta *q, uint64_t next_addr) {
+    DtbConfig cfg;
+    dtb_config(q, &cfg);
+
+    uint8_t blob[DTB_MAX_SIZE];
+    size_t n = dtb_build(blob, sizeof blob, &cfg);
+    if (n == 0) return -1;
+
+    uint64_t top = q->mem.base + q->mem.size;
+    uint64_t dtb_addr = (top - FW_DTB_HEADROOM) & ~(uint64_t)7;
+    uint64_t info_addr = (dtb_addr - 64) & ~(uint64_t)7; /* just below the DTB */
+    if (info_addr <= next_addr) return -1;               /* layout does not fit */
+    if (mem_load(&q->mem, dtb_addr, blob, n) != 0) return -1;
+    q->dtb_addr = (uint32_t)dtb_addr;
+
+    uint64_t words[6] = { FW_DYNAMIC_MAGIC, FW_DYNAMIC_VERSION,
+                          next_addr, FW_PRV_S, 0 /*options*/, 0 /*boot_hart*/ };
+    uint8_t info[48];
+    for (int i = 0; i < 6; i++)
+        for (int b = 0; b < 8; b++)
+            info[i * 8 + b] = (uint8_t)(words[i] >> (8 * b));
+    if (mem_load(&q->mem, info_addr, info, sizeof info) != 0) return -1;
+
+    reg_write(&q->cpu, 10, cfg.boot_hart); /* a0 = hartid */
+    reg_write(&q->cpu, 11, dtb_addr);      /* a1 = DTB */
+    reg_write(&q->cpu, 12, info_addr);     /* a2 = &fw_dynamic_info */
+    return 0;
+}
+
+/* Read a whole file into guest memory at `addr` (a raw image: OpenSBI's S-mode
+ * payload or a Linux Image). Mirrors quanta_attach_disk's file handling. */
+static QuantaStatus load_raw_file(Quanta *q, const char *path, uint64_t addr) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return QUANTA_ERR_LOAD;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return QUANTA_ERR_LOAD; }
+    long n = ftell(f);
+    if (n < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return QUANTA_ERR_LOAD; }
+
+    QuantaStatus st = QUANTA_OK;
+    uint8_t *buf = (n > 0) ? malloc((size_t)n) : NULL;
+    if (n > 0 && !buf) st = QUANTA_ERR_NOMEM;
+    else if (n > 0 && fread(buf, 1, (size_t)n, f) != (size_t)n) st = QUANTA_ERR_LOAD;
+    else if (mem_load(&q->mem, addr, buf, (size_t)n) != 0) st = QUANTA_ERR_RANGE;
+    free(buf);
+    fclose(f);
+    return st;
+}
+
+/* Where an OS payload is loaded above the firmware (the qemu 'virt' convention:
+ * 2 MiB above RAM base, so 0x80200000). Linux's Image and OpenSBI's next stage
+ * both expect this. */
+#define KERNEL_LOAD_OFFSET 0x200000ull
+
+QuantaStatus quanta_load_firmware(Quanta *q, const char *bios_path,
+                                  const char *kernel_path, uint32_t min_mem) {
+    if (!q || !bios_path || !kernel_path) return QUANTA_ERR_INVAL;
+
+    uint64_t entry;
+    int xlen;
+    if (elf_load(bios_path, &q->mem, &entry, &xlen, min_mem) != 0) return QUANTA_ERR_LOAD;
+    start_at(q, entry, xlen);
+
+    uint64_t kaddr = q->mem.base + KERNEL_LOAD_OFFSET;
+    QuantaStatus st = load_raw_file(q, kernel_path, kaddr);
+    if (st != QUANTA_OK) return st;
+
+    if (setup_firmware_boot(q, kaddr) != 0) return QUANTA_ERR_LOAD;
+    return QUANTA_OK;
 }
 
 QuantaStatus quanta_load_elf_ex(Quanta *q, const char *path, uint32_t min_mem) {

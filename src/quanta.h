@@ -85,6 +85,18 @@ QuantaStatus quanta_load_elf_ex(Quanta *q, const char *path, uint32_t min_mem);
 QuantaStatus quanta_load_image(Quanta *q, uint32_t base, uint32_t size,
                                const void *image, size_t len, uint32_t entry);
 
+/* Boot an M-mode firmware that hands off to an S-mode OS — the way a real RISC-V
+ * machine boots (OpenSBI, then Linux). Loads the firmware ELF (`bios_path`, e.g.
+ * OpenSBI's fw_dynamic build) at its link address and the raw OS image
+ * (`kernel_path`, e.g. a Linux `Image`) 2 MiB above RAM base (0x80200000, the
+ * qemu 'virt' convention), sizes RAM to at least `min_mem` bytes, builds the boot
+ * device tree (placed low with headroom so the firmware can expand it in place),
+ * and enters the firmware with a0 = hartid, a1 = DTB, and a2 = a `fw_dynamic_info`
+ * descriptor directing it into the OS in S-mode. Returns QUANTA_ERR_LOAD if
+ * either file cannot be loaded or the RAM is too small for the layout. */
+QuantaStatus quanta_load_firmware(Quanta *q, const char *bios_path,
+                                  const char *kernel_path, uint32_t min_mem);
+
 /* Resolve a symbol's address by name from the ELF at `path`, writing it to
  * `*addr`. Returns QUANTA_OK if found, QUANTA_ERR_LOAD if the file has no such
  * symbol or no symbol table, QUANTA_ERR_INVAL on a NULL argument. Reads the

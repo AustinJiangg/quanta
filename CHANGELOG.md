@@ -9,6 +9,22 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **OpenSBI firmware boot (`--bios` / `--kernel`)** — Quanta can now boot the way
+  a real RISC-V machine does: a real M-mode firmware runs first and hands off to
+  an S-mode OS. `quanta --bios=FILE --kernel=FILE` (via the new
+  `quanta_load_firmware` engine API) loads an M-mode firmware ELF — upstream
+  **OpenSBI's fw_dynamic** build, which qemu ships prebuilt — at 0x80000000 and a
+  raw S-mode OS image at 0x80200000 (the qemu `virt` kernel address a Linux
+  `Image` also uses), and enters the firmware with `a0`=hartid, `a1`=DTB, and
+  `a2` = a `fw_dynamic_info` descriptor directing it into the OS in S-mode. The
+  boot DTB is placed with headroom (OpenSBI expands the FDT in place). **Upstream
+  OpenSBI v1.3 boots on Quanta** and hands off to an S-mode payload that prints
+  through the SBI console and powers off cleanly — Quanta's own SBI is bypassed
+  (OpenSBI is the firmware), so this exercises Quanta purely as an M-mode machine.
+  A **SiFive test finisher** device (qemu `virt`'s poweroff/reboot at 0x100000)
+  gives OpenSBI's SRST (and a future Linux's poweroff) a clean exit. Pinned by
+  `make check-opensbi` (skips without an OpenSBI binary, like `check-diff` without
+  qemu). The groundwork for booting Linux. (M18)
 - **Raw-mode interactive console** — when stdin is a terminal, a run now puts it
   in raw mode (mirroring qemu's `-nographic` console: character-at-a-time input,
   no host echo, and Ctrl-C plus flow-control keys delivered to the guest as

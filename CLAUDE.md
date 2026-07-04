@@ -79,6 +79,7 @@ make check-cache   # check the cache model on a locality workload (needs cross-t
 make check-pipeline # check the pipeline model on a hazard workload (needs cross-toolchain)
 make check-gdb     # drive the gdb remote stub with a self-contained client (needs python3)
 make check-console # exercise the raw-mode interactive console over a pty (needs python3 + cross-toolchain)
+make check-opensbi # boot OpenSBI firmware handing off to an S-mode payload (needs an OpenSBI binary)
 make check-devices # check the MMIO devices and interrupt delivery (needs cross-toolchain)
 make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-toolchain)
 make check-uart-rx # check UART receive (piped stdin) and the --disk backend (M18)
@@ -273,6 +274,8 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
 - `src/main.c` — the CLI driver, a thin client over `quanta.h`: argument parsing,
   the `--trace` narration, the `--pipeline`/`--cache` overlays, the `--gdb` stub
   hand-off, the `--signature` arch-test dump, `--disk` attachment, the
+  `--bios`/`--kernel` firmware-boot path (loads an M-mode firmware that hands off
+  to an S-mode OS via `quanta_load_firmware`), the
   `--max-steps` runaway cap (0 = uncapped, for a booting OS), and the console
   input pump (host stdin → the UART, via a zero-timeout `select`, with a tty put
   in raw mode for the run and restored on every exit path — see the console-input
@@ -415,6 +418,16 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   escapes, and the safety property that a `SIGTERM` restores the terminal it
   saved. Self-contained (no riscv `gdb`, like `gdb_client.py`); skips cleanly
   without python3. Also run under `make sanitize`/`make coverage`.
+- `tests/opensbi_payload.S` + `tests/check_opensbi.sh` — the OpenSBI firmware-boot
+  test (`make check-opensbi`, M18 / the road to Linux): boots the qemu-prebuilt
+  OpenSBI (fw_dynamic) as `--bios` and a small rv64 S-mode payload as `--kernel`,
+  asserting OpenSBI hands off to S-mode, the payload prints through the SBI console
+  (an `ecall` serviced by OpenSBI running on Quanta), and the machine shuts down
+  cleanly via SBI SRST (the SiFive test device → exit 0). The payload is built to
+  a raw `.bin` at 0x80200000 (`-mno-relax`, like a Linux Image), so it is filtered
+  out of `TEST_SRC` and has its own build rule. Skips cleanly without an OpenSBI
+  binary (`$QUANTA_OPENSBI` or qemu's default path), like `check-diff` without
+  qemu. Also run under `make sanitize`/`make coverage`.
 - `tests/rv64/test_rv64_virtio.S` + `tests/check_virtio.sh` — the M18 virtio-mmio
   block-device test (`make check-virtio`): a bare-metal RV64 machine-mode driver
   probes the device identity, runs the status/feature handshake, sets up a split
@@ -805,6 +818,43 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   checks. When debugging an OS boot, shrink `PHYSTOP` (e.g. to 8 MiB) so `kinit`
   is fast, and patch a guest `printk` into the failing kernel path — cheaper than
   a multi-hundred-million-instruction `--trace`.
+- Booting under OpenSBI firmware (M18, the road to Linux): unlike xv6 (which owns
+  M-mode itself via `-bios none`), the mainstream path runs a real M-mode firmware
+  that hands off to an S-mode OS. `quanta --bios=FILE --kernel=FILE` does this
+  (`quanta_load_firmware` in quanta.c): it loads the firmware ELF (OpenSBI's
+  **fw_dynamic** build — qemu ships one at `/usr/share/qemu/opensbi-riscv64-
+  generic-fw_dynamic.elf`) at 0x80000000 and the raw OS image at **0x80200000**
+  (`base + 2 MiB`, the qemu `virt` kernel address a Linux `Image` also expects),
+  and enters the firmware in M-mode with `a0`=hartid, `a1`=DTB, and `a2` = a
+  **`fw_dynamic_info`** descriptor (magic `0x4942534f` "OSBI", version 2,
+  `next_addr`=the OS, `next_mode`=1=S). OpenSBI reads that struct *immediately* at
+  entry (`ld a0,0(a2)` in fw_base.S) — pass `a2`=0 and it faults reading null, so
+  the descriptor is mandatory, not optional. Two placement rules `setup_firmware_boot`
+  encodes: **(1)** the DTB is parked 2 MiB below the top of RAM (`FW_DTB_HEADROOM`),
+  not jammed against it, because OpenSBI expands the FDT *in place* (`fdt_open_into`,
+  a backward `memmove`) to add its own reserved-memory/PMP nodes — a top-of-RAM
+  DTB overflows the last page (the first bug hit, `mtval` one past `mem_size`).
+  **(2)** the `fw_dynamic_info` sits just below the DTB, read once at entry. With
+  those, upstream **OpenSBI v1.3 boots on Quanta** — full platform init from our
+  DTB (`uart8250`, `aclint-mtimer`, `aclint-mswi`, 64 PMP entries), then it drops
+  to S-mode at 0x80200000. Quanta's own `sbi.c` is **bypassed** here (it only runs
+  the SEE while `mtvec` is 0; OpenSBI sets `mtvec`), so OpenSBI *is* the SBI the
+  S-mode OS calls — Quanta just has to be a correct M-mode machine, which it
+  already was (no CSR/instruction gaps surfaced). `tests/opensbi_payload.S` +
+  `make check-opensbi` pin the round trip (S-mode → SBI console → SBI SRST →
+  clean exit). Next: a Linux `Image` in place of the payload (Stage C), which
+  needs a richer DTB (`bootargs`/`chosen`, and possibly F/D `sstatus.FS` handling).
+- SiFive test finisher device (M18, the clean-shutdown enabler): OpenSBI's SRST
+  and Linux's poweroff/reboot need a hardware reset device. `device.c` models the
+  qemu `virt` one at **0x100000** (`TEST_BASE`): a 32-bit write of `0x5555`
+  (PASS), `0x3333`+code (FAIL), or `0x7777` (RESET, treated as PASS since we can't
+  reboot) requests power-off. A device can't stop the hart itself, so it sets
+  `Platform.poweroff`/`poweroff_code` and the CPU polls `plat_poweroff_requested`
+  at the top of each step (right after `plat_tick`), halting with `HALT_EXIT` and
+  the code. It is advertised in the DTB as a `test@100000` node with
+  `compatible = "sifive,test1\0sifive,test0"`, which OpenSBI's fdt reset driver
+  binds to. Inert for every pre-M18 guest (none write 0x100000, which was
+  previously just unmapped low memory).
 - `--trace` writes to stderr, leaving the guest's own stdout (`write`) clean;
   "changed registers" are recovered by diffing a register snapshot taken around
   `cpu_step`, so the core isn't instrumented. The disassembler prints the common

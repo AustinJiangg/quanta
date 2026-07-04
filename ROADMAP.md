@@ -879,15 +879,37 @@ The interactive console is now clean: when stdin is a tty the run puts it in raw
 mode (the qemu `-nographic` recipe — character-at-a-time, no host echo, Ctrl-C
 and flow-control keys delivered to the guest, `Ctrl-A x` to quit) and restores it
 on every exit path (after the loop, via `atexit`, and from signal handlers), so a
-guest's shell reads and echoes exactly once with no line buffering. Next up:
-Linux + OpenSBI (needing a fuller SBI and far longer runs) follows xv6.
+guest's shell reads and echoes exactly once with no line buffering.
+
+**Toward Linux: the OpenSBI firmware path.** The mainstream path runs a real
+M-mode firmware that hands off to an S-mode OS (as opposed to xv6, which owns
+M-mode itself). `quanta --bios=<opensbi> --kernel=<image>` now boots that way
+(`quanta_load_firmware`): it loads OpenSBI's **fw_dynamic** build (qemu ships one)
+at 0x80000000 and the raw OS image at 0x80200000, and enters the firmware with a
+`fw_dynamic_info` descriptor in `a2` directing it into S-mode. Two placement rules
+made it work — the DTB is parked with headroom (OpenSBI expands the FDT in place),
+and the descriptor sits just below it. **Upstream OpenSBI v1.3 boots on Quanta**:
+full platform init from Quanta's device tree (`uart8250`, `aclint-mtimer/mswi`,
+64 PMP entries) and a clean hand-off to an S-mode payload, which prints through
+the SBI console (an `ecall` serviced by OpenSBI *on Quanta*) and powers off via
+SBI SRST — which needed a **SiFive test finisher** device (0x100000) for clean
+shutdown. Quanta's own `sbi.c` is bypassed on this path: OpenSBI is the SBI, so
+Quanta only has to be a correct M-mode machine, which it already was (no CSR or
+instruction gaps surfaced). `tests/opensbi_payload.S` + `make check-opensbi` pin
+it. **Next:** swap the payload for a Linux `Image` — needing a richer DTB
+(`chosen`/`bootargs`, `earlycon`) and whatever S-mode/FPU (`sstatus.FS`) gaps a
+distro kernel surfaces, then an initramfs for a userspace shell.
 
 - [x] **Build (paging):** the three-level Sv39 page-table scheme (a
   descriptor-parameterised generalisation of the Sv32 walk).
 - [x] **Build (OS boot):** boot xv6-riscv. *Done:* Sstc timer, UART receive, the
   `--disk` backend, the virtio-mmio block device, the PLIC S-mode context/SEIP,
   the UART THRE one-shot, `--max-steps`, and the full-XLEN branch fix — xv6 boots
-  to its shell. *Next:* Linux + OpenSBI.
+  to its shell.
+- [ ] **Build (Linux):** boot Linux under OpenSBI. *Done:* the `--bios`/`--kernel`
+  firmware-boot path, the fw_dynamic handoff, the DTB-headroom placement, and the
+  SiFive test device — OpenSBI v1.3 boots and hands off to an S-mode payload.
+  *Next:* a real Linux `Image` (richer DTB + initramfs).
 - [x] **ISA:** Sv39 address translation; Sstc (`stimecmp`/`menvcfg.STCE`).
 - [x] **Concept:** deeper page-table hierarchies; a real distro's boot
   requirements.

@@ -26,6 +26,8 @@
  * de-facto qemu 'virt' layout so guest software and device trees line up.
  */
 
+#define TEST_BASE   0x00100000u   /* SiFive test finisher (qemu virt poweroff/reboot) */
+#define TEST_SIZE   0x00001000u
 #define CLINT_BASE  0x02000000u
 #define CLINT_SIZE  0x00010000u
 #define PLIC_BASE   0x0c000000u
@@ -116,6 +118,12 @@ typedef struct Platform {
     uint8_t *ram;
     uint64_t ram_base;
     uint64_t ram_size;
+    /* SiFive test finisher: a write of FINISHER_PASS/FAIL/RESET requests machine
+     * power-off. The CPU polls plat_poweroff_requested each step and halts, since
+     * a device model cannot stop the hart itself. This is how OpenSBI's SRST and
+     * Linux's poweroff/reboot actually end a firmware boot. */
+    int      poweroff;      /* a power-off has been requested */
+    uint32_t poweroff_code; /* exit status to report (0 on PASS/RESET) */
 } Platform;
 
 /* Reset all devices: zeroed register files, mtimecmp parked at all-ones so the
@@ -151,5 +159,10 @@ int plat_uart_rx(Platform *p, uint8_t byte);
 /* The interrupt-pending bits the platform drives (MTIP/MSIP/MEIP), to be merged
  * into mip. The CPU pulls this each step rather than the devices pushing it. */
 uint32_t plat_mip_bits(Platform *p);
+
+/* Has the SiFive test device been written to request power-off? If so, returns 1
+ * and stores the exit status in *code; the CPU then halts the machine (a device
+ * cannot stop the hart itself). The CPU polls this once per step. */
+int plat_poweroff_requested(const Platform *p, uint32_t *code);
 
 #endif /* QUANTA_DEVICE_H */
