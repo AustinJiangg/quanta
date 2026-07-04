@@ -48,19 +48,21 @@ static uint8_t uart_lsr(const Uart *u) {
     return (uint8_t)(0x60u | (u->rx_have ? 0x01u : 0x00u));
 }
 
-/* Is the UART asserting its interrupt line? Received-data (IER bit 0) when a
- * byte waits, or transmit-holding-empty (IER bit 1) — which, as our transmitter
- * is always empty, stays asserted until software clears that enable. */
+/* Is the UART asserting its interrupt line? Received-data (IER bit 0) when a byte
+ * waits, or transmit-holding-empty (IER bit 1) while a THRE interrupt is pending.
+ * THRE is a one-shot (thre_ip), set when THR is written or the TX interrupt is
+ * enabled and cleared by reading IIR — so an always-empty transmitter does not
+ * assert the line forever (which would storm an OS that leaves TX ints enabled). */
 static int uart_asserted(const Uart *u) {
-    return ((u->ier & 0x01u) && u->rx_have) || ((u->ier & 0x02u) != 0);
+    return ((u->ier & 0x01u) && u->rx_have) || ((u->ier & 0x02u) && u->thre_ip);
 }
 
 /* Interrupt-identification register: RX outranks THRE; bit 0 set means "no
  * interrupt pending". */
 static uint8_t uart_iir(const Uart *u) {
-    if ((u->ier & 0x01u) && u->rx_have) return 0x04u; /* received data available */
-    if (u->ier & 0x02u)                 return 0x02u; /* THR empty */
-    return 0x01u;                                     /* none pending */
+    if ((u->ier & 0x01u) && u->rx_have)  return 0x04u; /* received data available */
+    if ((u->ier & 0x02u) && u->thre_ip)  return 0x02u; /* THR empty */
+    return 0x01u;                                      /* none pending */
 }
 
 static uint32_t uart_read(Uart *u, uint32_t off) {
@@ -71,7 +73,11 @@ static uint32_t uart_read(Uart *u, uint32_t off) {
             u->rx_have = 0;
             return u->rx;
         case 1: return dlab ? u->dlm : u->ier;
-        case 2: return uart_iir(u);
+        case 2: {
+            uint8_t iir = uart_iir(u);
+            if (iir == 0x02u) u->thre_ip = 0; /* reading IIR clears a THRE interrupt */
+            return iir;
+        }
         case 3: return u->lcr;
         case 4: return u->mcr;
         case 5: return uart_lsr(u);
@@ -88,8 +94,13 @@ static void uart_write(Uart *u, uint32_t off, uint8_t val) {
             if (dlab) { u->dll = val; return; }
             putchar((int)val);          /* THR: transmit to the host console */
             fflush(stdout);
+            u->thre_ip = 1;             /* THR emptied (instantly): re-arm THRE int */
             return;
-        case 1: if (dlab) u->dlm = val; else u->ier = (uint8_t)(val & 0x0fu); return;
+        case 1:
+            if (dlab) { u->dlm = val; return; }
+            u->ier = (uint8_t)(val & 0x0fu);
+            if (u->ier & 0x02u) u->thre_ip = 1; /* enabling TX int with THR empty asserts */
+            return;
         case 2: return;                 /* FCR (FIFO control): accepted, ignored */
         case 3: u->lcr = val; return;
         case 4: u->mcr = val; return;
@@ -342,43 +353,51 @@ static uint32_t plic_lines(const Platform *p) {
     return lines;
 }
 
-/* The highest-priority source that is asserting, enabled, above the threshold,
- * and not already in service. 0 means nothing to present. Ties break toward the
- * lower source number. */
-static uint32_t plic_best(const Platform *p) {
+/* The highest-priority source that is asserting, enabled for context `ctx`, above
+ * that context's threshold, and not already in service there. 0 means nothing to
+ * present. Ties break toward the lower source number. Context 0 is hart 0 M-mode
+ * (drives MEIP), context 1 is hart 0 S-mode (drives SEIP). */
+static uint32_t plic_best(const Platform *p, uint32_t ctx) {
     const Plic *pl = &p->plic;
     uint32_t lines = plic_lines(p);
     uint32_t best = 0, best_prio = 0;
     for (uint32_t s = 1; s < PLIC_NSOURCES; s++) {
-        if (!(lines & (1u << s)))        continue;
-        if (!(pl->enable & (1u << s)))   continue;
-        if (s == pl->claimed)            continue;
-        if (pl->priority[s] <= pl->threshold) continue;
+        if (!(lines & (1u << s)))                  continue;
+        if (!(pl->enable[ctx] & (1u << s)))        continue;
+        if (s == pl->claimed[ctx])                 continue;
+        if (pl->priority[s] <= pl->threshold[ctx]) continue;
         if (pl->priority[s] > best_prio) { best = s; best_prio = pl->priority[s]; }
     }
     return best;
 }
 
-/* Claim the pending interrupt: return its source and mark it in service so it is
- * not presented again until completed. */
-static uint32_t plic_claim(Platform *p) {
-    uint32_t s = plic_best(p);
-    if (s) p->plic.claimed = s;
+/* Claim the pending interrupt for `ctx`: return its source and mark it in service
+ * so it is not presented again until completed. */
+static uint32_t plic_claim(Platform *p, uint32_t ctx) {
+    uint32_t s = plic_best(p, ctx);
+    if (s) p->plic.claimed[ctx] = s;
     return s;
 }
 
+/* The per-context enable bitmap lives at 0x2000 + ctx*0x80 (one word covers the
+ * 32 sources we model); the threshold/claim pair at 0x200000 + ctx*0x1000
+ * (threshold at +0, claim/complete at +4) — the qemu virt PLIC layout. */
 static uint32_t plic_read(Platform *p, uint32_t off) {
     if (off < 0x1000u) {                       /* per-source priority */
         uint32_t s = off / 4u;
         return (s < PLIC_NSOURCES) ? p->plic.priority[s] : 0u;
     }
-    switch (off) {
-        case 0x1000: return plic_lines(p);     /* pending bitmap (sources 0..31) */
-        case 0x2000: return p->plic.enable;    /* context-0 enables */
-        case 0x200000: return p->plic.threshold;
-        case 0x200004: return plic_claim(p);   /* claim (read has the side effect) */
-        default: return 0;
+    if (off == 0x1000u) return plic_lines(p);  /* pending bitmap (sources 0..31) */
+    if (off >= 0x2000u && off < 0x2000u + PLIC_NCONTEXTS * 0x80u) {
+        uint32_t rel = off - 0x2000u;
+        return ((rel % 0x80u) == 0) ? p->plic.enable[rel / 0x80u] : 0u;
     }
+    if (off >= 0x200000u && off < 0x200000u + PLIC_NCONTEXTS * 0x1000u) {
+        uint32_t rel = off - 0x200000u, ctx = rel / 0x1000u, reg = rel % 0x1000u;
+        if (reg == 0) return p->plic.threshold[ctx];
+        if (reg == 4) return plic_claim(p, ctx); /* claim (read has the side effect) */
+    }
+    return 0;
 }
 
 static void plic_write(Platform *p, uint32_t off, uint32_t val) {
@@ -387,13 +406,16 @@ static void plic_write(Platform *p, uint32_t off, uint32_t val) {
         if (s >= 1u && s < PLIC_NSOURCES) p->plic.priority[s] = val;
         return;
     }
-    switch (off) {
-        case 0x2000:   p->plic.enable = val; return;
-        case 0x200000: p->plic.threshold = val; return;
-        case 0x200004:                          /* complete: end the claim */
-            if (val == p->plic.claimed) p->plic.claimed = 0;
-            return;
-        default: return;
+    if (off >= 0x2000u && off < 0x2000u + PLIC_NCONTEXTS * 0x80u) {
+        uint32_t rel = off - 0x2000u;
+        if ((rel % 0x80u) == 0) p->plic.enable[rel / 0x80u] = val;
+        return;
+    }
+    if (off >= 0x200000u && off < 0x200000u + PLIC_NCONTEXTS * 0x1000u) {
+        uint32_t rel = off - 0x200000u, ctx = rel / 0x1000u, reg = rel % 0x1000u;
+        if (reg == 0) p->plic.threshold[ctx] = val;
+        else if (reg == 4 && val == p->plic.claimed[ctx])
+            p->plic.claimed[ctx] = 0;           /* complete: end the claim */
     }
 }
 
@@ -466,6 +488,7 @@ uint32_t plat_mip_bits(Platform *p) {
     uint32_t bits = 0;
     if (p->clint.mtime >= p->clint.mtimecmp) bits |= MIP_MTIP;
     if (p->clint.msip & 1u)                  bits |= MIP_MSIP;
-    if (plic_best(p) != 0)                   bits |= MIP_MEIP;
+    if (plic_best(p, 0) != 0)                bits |= MIP_MEIP; /* M-mode context */
+    if (plic_best(p, 1) != 0)                bits |= MIP_SEIP; /* S-mode context */
     return bits;
 }

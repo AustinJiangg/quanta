@@ -10,6 +10,7 @@ quanta \- from-scratch RISC-V (RV32) instruction-set emulator
 .RB [ \-\-cache [ =\fISIZE\fR:\fIWAYS\fR:\fIBLOCK\fR ]]
 .RB [ \-\-pipeline ]
 .RB [ \-\-memory=\fISIZE\fR ]
+.RB [ \-\-max-steps=\fIN\fR ]
 .RB [ \-\-gdb [ =\fIPORT\fR ]]
 .RB [ \-\-signature=\fIFILE\fR ]
 .RB [ \-\-disk=\fIFILE\fR ]
@@ -85,6 +86,20 @@ image plus its stack is smaller, the spare RAM lands above the image for an
 OS-style guest to manage, and the boot device tree's
 .B /memory
 node reports the true size. Omitted, the region is sized to the image as before.
+.TP
+.BI \-\-max-steps= N
+Cap the run at
+.I N
+retired instructions as a runaway guard (an optional
+.BR K ,
+.BR M ,
+.BR G ,
+or
+.B T
+suffix multiplies by a power of 1000). The default is 100 million; pass
+.B 0
+to remove the cap, which an interactive full-system guest (a booting OS) needs,
+since it legitimately runs billions of instructions.
 .TP
 .BR \-\-gdb [ =\fIPORT\fR ]
 Start a GDB remote stub on TCP

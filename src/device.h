@@ -36,14 +36,18 @@
 #define VIRTIO_SIZE 0x00001000u
 
 /* A handful of PLIC sources is plenty; the UART is wired to source 10 and the
- * virtio block device to source 1, as on qemu virt. One hart, one interrupt
- * context (hart 0, M-mode). */
-#define PLIC_NSOURCES 32u
-#define UART_IRQ      10u
-#define VIRTIO_IRQ    1u
+ * virtio block device to source 1, as on qemu virt. One hart, but two interrupt
+ * contexts: context 0 = hart 0 M-mode (drives MEIP), context 1 = hart 0 S-mode
+ * (drives SEIP). An OS like xv6 runs in S-mode and uses context 1. */
+#define PLIC_NSOURCES  32u
+#define PLIC_NCONTEXTS 2u
+#define UART_IRQ       10u
+#define VIRTIO_IRQ     1u
 
 /* mip/mie bit positions the platform drives — read-only reflections of device
- * state from software's point of view (machine software/timer/external). */
+ * state from software's point of view (machine/supervisor software/timer/
+ * external). The PLIC's M-mode context drives MEIP, its S-mode context SEIP. */
+#define MIP_SEIP (1u << 9)
 #define MIP_MSIP (1u << 3)
 #define MIP_MTIP (1u << 7)
 #define MIP_MEIP (1u << 11)
@@ -63,13 +67,15 @@ typedef struct {
     uint8_t dlm;     /* divisor latch high (baud; ignored) */
     int     rx_have; /* a byte is buffered for receive */
     uint8_t rx;      /* the buffered receive byte */
+    uint8_t thre_ip; /* THR-empty interrupt pending (set on THR write / TX-int enable,
+                      * cleared by reading IIR) — so it does not assert forever */
 } Uart;
 
 typedef struct {
-    uint32_t priority[PLIC_NSOURCES]; /* per-source priority (0 disables) */
-    uint32_t enable;                  /* context-0 source-enable bitmap */
-    uint32_t threshold;               /* context-0 priority threshold */
-    uint32_t claimed;                 /* source currently in service (0 = none) */
+    uint32_t priority[PLIC_NSOURCES];      /* per-source priority (0 disables) */
+    uint32_t enable[PLIC_NCONTEXTS];       /* per-context source-enable bitmap */
+    uint32_t threshold[PLIC_NCONTEXTS];    /* per-context priority threshold */
+    uint32_t claimed[PLIC_NCONTEXTS];      /* source in service per context (0 = none) */
 } Plic;
 
 /* A virtio-mmio block device (modern / version 2) with one split virtqueue. The

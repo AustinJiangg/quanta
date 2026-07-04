@@ -28,7 +28,7 @@ for elf in "$@"; do
     fi
 
     case "$elf" in
-    *_priv.elf|*_vm.elf|*_sstc.elf)
+    *_priv.elf|*_vm.elf|*_sstc.elf|*_plic.elf)
         echo "OK    $elf (quanta exit 0; supervisor/paging, no qemu differential)"
         ;;
     *)

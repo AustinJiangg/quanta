@@ -21,7 +21,7 @@
  *
  * Usage:
  *   quanta [--version] [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]]
- *          [--pipeline] [--memory=SIZE] [--gdb[=PORT]] [--signature=FILE]
+ *          [--pipeline] [--memory=SIZE] [--max-steps=N] [--gdb[=PORT]] [--signature=FILE]
  *          [--disk=FILE] [program.elf]
  *
  * A running guest can take console input: host stdin is pumped into the UART's
@@ -92,6 +92,28 @@ static int parse_size(const char *s, uint32_t *out) {
     return 0;
 }
 
+/* Parse an instruction-count cap with an optional K/M/G/T (1000-based) suffix,
+ * e.g. "500M" or "2G". 0 means "no cap" — for an interactive full-system guest
+ * (a booting OS) that legitimately runs billions of instructions. Writes the
+ * result to *out; returns 0 on success, -1 on a malformed value. Uses decimal
+ * multipliers, unlike parse_size's 1024-based memory sizes. */
+static int parse_steps(const char *s, uint64_t *out) {
+    if (!s || !*s) return -1;
+    char *end;
+    unsigned long long v = strtoull(s, &end, 0);
+    unsigned long long mul = 1;
+    switch (*end) {
+        case 'K': case 'k': mul = 1000ULL;                      end++; break;
+        case 'M': case 'm': mul = 1000ULL * 1000;               end++; break;
+        case 'G': case 'g': mul = 1000ULL * 1000 * 1000;        end++; break;
+        case 'T': case 't': mul = 1000ULL * 1000 * 1000 * 1000; end++; break;
+        default: break;
+    }
+    if (*end != '\0') return -1;
+    *out = (uint64_t)v * mul;
+    return 0;
+}
+
 /* Execute one instruction and narrate it to stderr: the PC, the raw word, its
  * disassembly, and any register the step changed (with the new value), plus the
  * redirect target when control does not simply fall through. Trace goes to
@@ -157,14 +179,13 @@ static void console_pump(Quanta *q) {
 
 /* Step until the program halts, or a safety limit is hit so a buggy program can
  * never spin forever. With trace set, narrate each instruction to stderr; with a
- * pipeline, feed it each retired instruction. Returns the instruction count. */
-static uint64_t run_until_halt(Quanta *q, int trace, Pipeline *pipe) {
+ * pipeline, feed it each retired instruction. `max_steps` caps the run as a
+ * runaway guard (0 = no cap, for an interactive full-system guest that
+ * legitimately runs billions of instructions). Returns the instruction count. */
+static uint64_t run_until_halt(Quanta *q, int trace, Pipeline *pipe,
+                               uint64_t max_steps) {
     uint64_t steps = 0;
-    /* A generous runaway guard: high enough to let real workloads (loops over
-     * arrays, deep call chains) run to completion, low enough that a program
-     * that never halts still stops in about a second instead of hanging. */
-    const uint64_t max_steps = 100ull * 1000 * 1000;
-    while (quanta_halt_reason(q) == QUANTA_RUN && steps < max_steps) {
+    while (quanta_halt_reason(q) == QUANTA_RUN && (max_steps == 0 || steps < max_steps)) {
         /* Feed any waiting console input to the UART, occasionally — often enough
          * to feel responsive, rarely enough that the select() is not a per-
          * instruction tax. Harmless when no input is waiting. */
@@ -236,6 +257,7 @@ int main(int argc, char **argv) {
     int gdb_port = 1234;            /* the conventional gdbserver/qemu port */
     uint32_t csize = 1024, cways = 2, cblock = 32; /* default L1 geometry */
     uint32_t mem_req = 0;          /* --memory: minimum guest RAM (0 = image-sized) */
+    uint64_t max_steps = 100ull * 1000 * 1000; /* --max-steps runaway cap (0 = none) */
     const char *path = NULL;
     const char *sigfile = NULL; /* --signature=FILE: arch-test signature dump */
     const char *diskpath = NULL; /* --disk=FILE: raw block-device backing image */
@@ -266,6 +288,13 @@ int main(int argc, char **argv) {
                         argv[i] + 9);
                 return 2;
             }
+        } else if (strncmp(argv[i], "--max-steps=", 12) == 0) {
+            if (parse_steps(argv[i] + 12, &max_steps) != 0) {
+                fprintf(stderr, "bad --max-steps '%s' "
+                        "(want a count with an optional K/M/G/T suffix, or 0 for "
+                        "no cap)\n", argv[i] + 12);
+                return 2;
+            }
         } else if (strcmp(argv[i], "--gdb") == 0) {
             gdb_on = 1;
         } else if (strncmp(argv[i], "--gdb=", 6) == 0) {
@@ -291,7 +320,7 @@ int main(int argc, char **argv) {
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
-                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] "
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--max-steps=N] "
                     "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [program.elf]\n",
                     argv[0]);
             return 2;
@@ -299,7 +328,7 @@ int main(int argc, char **argv) {
             path = argv[i];
         } else {
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
-                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] "
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--max-steps=N] "
                     "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [program.elf]\n",
                     argv[0]);
             return 2;
@@ -393,7 +422,7 @@ int main(int argc, char **argv) {
     if (pipe_on) pipeline_init(&pipe);
 
     /* Any output the program writes via syscalls appears here, mid-run. */
-    uint64_t steps = run_until_halt(q, trace, pipe_on ? &pipe : NULL);
+    uint64_t steps = run_until_halt(q, trace, pipe_on ? &pipe : NULL, max_steps);
 
     QuantaHalt halt = quanta_halt_reason(q);
 

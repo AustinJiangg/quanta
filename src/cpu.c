@@ -340,15 +340,20 @@ static void exec_op32(CPU *cpu, uint32_t inst) {
  * when taken, else the fall-through (pc + the instruction's length, which is 2
  * for a compressed branch and 4 otherwise). */
 static uint64_t exec_branch(CPU *cpu, uint32_t inst, uint32_t ilen) {
-    uint32_t a = reg_read(cpu, rs1(inst));
-    uint32_t b = reg_read(cpu, rs2(inst));
+    /* Compare the full XLEN-wide register values. Registers are stored
+     * sign-extended to 64 bits (the Spike convention), so an RV32 comparison is
+     * correct too: sign-extension preserves both the signed and the unsigned
+     * ordering of the low 32 bits. Truncating to 32 bits here would break RV64
+     * branches whose operands differ above bit 31 (e.g. high user VAs). */
+    uint64_t a = reg_read(cpu, rs1(inst));
+    uint64_t b = reg_read(cpu, rs2(inst));
     int taken = 0;
 
     switch (funct3(inst)) {
         case 0x0: taken = (a == b); break;                       /* BEQ  */
         case 0x1: taken = (a != b); break;                       /* BNE  */
-        case 0x4: taken = ((int32_t)a <  (int32_t)b); break;     /* BLT  */
-        case 0x5: taken = ((int32_t)a >= (int32_t)b); break;     /* BGE  */
+        case 0x4: taken = ((int64_t)a <  (int64_t)b); break;     /* BLT  */
+        case 0x5: taken = ((int64_t)a >= (int64_t)b); break;     /* BGE  */
         case 0x6: taken = (a <  b); break;                       /* BLTU */
         case 0x7: taken = (a >= b); break;                       /* BGEU */
     }
@@ -571,7 +576,10 @@ static void raise_trap(CPU *cpu, uint32_t cause, uint64_t tval) {
 static uint32_t effective_mip(CPU *cpu) {
     uint32_t mip = cpu->csr[CSR_MIP];
     if (cpu->mem->plat) {
-        mip &= ~(MIP_MSIP | MIP_MTIP | MIP_MEIP);
+        /* The PLIC/CLINT own these bits (M/S external via the two PLIC contexts,
+         * machine software/timer via the CLINT); recompute them from device
+         * state. Software-writable bits (SSIP, STIP) are left as-is. */
+        mip &= ~(MIP_MSIP | MIP_MTIP | MIP_MEIP | MIP_SEIP);
         mip |= plat_mip_bits(cpu->mem->plat);
         cpu->csr[CSR_MIP] = mip; /* so a CSR read of mip sees the live bits */
     }

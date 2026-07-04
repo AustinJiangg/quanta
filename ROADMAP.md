@@ -857,26 +857,40 @@ deterministic-friendly, exactly as planned: it processes the descriptor chain
 synchronously on `QUEUE_NOTIFY`, then asserts PLIC IRQ 1 — safe because xv6 holds
 `vdisk_lock` with interrupts off until it sleeps. The device is a bus master, so
 the platform now carries a pointer to guest RAM (`plat_attach_ram`) for DMA.
-**Then, remaining for xv6:** build it integer-only (`rv64imac`, no F/D),
-`CPUS=1`, and boot to the shell — and there set the boot DTB's
-`mmu-type = "riscv,sv39"` (still `riscv,none` from the M17 Bare era) and add
-raw-mode terminal handling for a clean interactive console.
-Linux + OpenSBI (needing a fuller SBI, a `mmu-type = "riscv,sv39"` DTB, and far
-longer runs) follows xv6.
+**xv6-riscv now boots to its shell.** Built integer-only (`rv64imac_zicsr`, no
+F/D) with `CPUS=1`, upstream `mit-pdos/xv6-riscv` boots on Quanta all the way to
+an interactive shell — `ls` reads the filesystem off the virtio disk, `echo`
+runs, processes fork/exec through Sv39 paging, and the console echoes host input.
+Getting there took four Quanta changes beyond the M18 devices: **(a)** a genuine
+RV64 bug fix — `exec_branch` compared the low 32 bits of the operands, so a
+`bgeu`/`bltu` on values differing above bit 31 (xv6's page-table teardown loop
+runs over high user VAs like `0x3ffffff000`..`0x4000000000`) was decided wrong;
+now it compares the full XLEN; **(b)** the PLIC gained its **S-mode context**
+(context 1) driving **SEIP** — an S-mode OS claims/completes device interrupts
+through the context-1 registers (enable `0x2080`, threshold/claim `0x201xxx`),
+not the M-mode context `test_irq.S` used; **(c)** the 16550 UART's THR-empty
+interrupt became a one-shot (set on THR write / TX-int enable, cleared by reading
+IIR) so an always-empty transmitter no longer storms an OS that leaves TX
+interrupts on; **(d)** a `--max-steps=N` flag (0 = uncapped) lets an interactive
+guest run past the runaway guard. The boot DTB's `mmu-type` for RV64 is now
+`riscv,sv39`. `tests/rv64/test_rv64_plic.S` pins the S-mode external-interrupt
+path and the branch fix is pinned by `tests/rv64/test_rv64.S` (qemu-verified).
+Still to polish: raw-mode terminal handling for a fully clean interactive console.
+Linux + OpenSBI (needing a fuller SBI and far longer runs) follows xv6.
 
 - [x] **Build (paging):** the three-level Sv39 page-table scheme (a
   descriptor-parameterised generalisation of the Sv32 walk).
-- [ ] **Build (OS boot):** boot xv6-riscv, then Linux + OpenSBI. *In progress:*
-  Sstc timer, UART receive, the `--disk` backend, and the virtio-mmio block
-  device are all done; the xv6 integration (build + boot to shell + DTB
-  `mmu-type` + raw console) is next.
+- [x] **Build (OS boot):** boot xv6-riscv. *Done:* Sstc timer, UART receive, the
+  `--disk` backend, the virtio-mmio block device, the PLIC S-mode context/SEIP,
+  the UART THRE one-shot, `--max-steps`, and the full-XLEN branch fix — xv6 boots
+  to its shell. *Next:* Linux + OpenSBI.
 - [x] **ISA:** Sv39 address translation; Sstc (`stimecmp`/`menvcfg.STCE`).
-- [ ] **Concept:** deeper page-table hierarchies; a real distro's boot
+- [x] **Concept:** deeper page-table hierarchies; a real distro's boot
   requirements.
-- [ ] **Done when:** xv6-riscv reaches its shell; Linux boots to userspace.
+- [x] **Done when:** xv6-riscv reaches its shell. *(Linux to userspace still to come.)*
 - [x] **Commits:** `feat: add sv39 paging`, `feat: add sstc supervisor timer`,
-  `feat: add virtio-mmio block device`.
-  Still to come: `test: boot xv6-riscv`, `test: boot linux`.
+  `feat: add virtio-mmio block device`, `feat: boot xv6-riscv`.
+  Still to come: `test: boot linux`.
 
 ## M19 — SMP multi-hart (stretch)
 

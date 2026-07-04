@@ -120,6 +120,41 @@
     ld   t4, 0(t3)
     CHECK 27, t4, 0xbb
 
+    /* ---- branches compare the full XLEN, not the low 32 bits ----
+     * Operands that differ only above bit 31: a low-32 truncation in the
+     * comparison gets these wrong (e.g. `bgeu 0x3ffffff000, 0x4000000000` wrongly
+     * taken, since the low words are 0xfffff000 vs 0), which is exactly what
+     * blocked booting an OS whose page-table loops span high addresses.
+     * qemu-riscv64 pins the correct behaviour. */
+    li   t0, 0x3ffffff000           /* low32 = 0xfffff000 */
+    li   t1, 0x4000000000           /* low32 = 0x00000000; t0 < t1 as u64 */
+    li   t3, 0
+    bgeu t0, t1, 1f                 /* t0 >= t1 (unsigned)? no -> fall through */
+    li   t3, 1
+1:  CHECK 28, t3, 1                 /* bgeu correctly not taken */
+    li   t3, 0
+    bltu t0, t1, 2f                 /* t0 < t1 (unsigned)? yes -> branch */
+    j    3f
+2:  li   t3, 1
+3:  CHECK 29, t3, 1                 /* bltu correctly taken */
+
+    li   t0, 0x100000000            /* 2^32, low32 = 0 */
+    li   t1, 0x200000000            /* 2^33, low32 = 0 */
+    li   t3, 0
+    blt  t0, t1, 4f                 /* signed: 2^32 < 2^33 -> branch */
+    j    5f
+4:  li   t3, 1
+5:  CHECK 30, t3, 1                 /* blt correctly taken */
+    li   t3, 0
+    bge  t1, t0, 6f                 /* signed: 2^33 >= 2^32 -> branch */
+    j    7f
+6:  li   t3, 1
+7:  CHECK 31, t3, 1                 /* bge correctly taken */
+    li   t3, 0
+    beq  t0, t1, 8f                 /* differ above bit 31 -> not equal */
+    li   t3, 1
+8:  CHECK 32, t3, 1                 /* beq correctly not taken */
+
     TEST_END
 
     .section .data

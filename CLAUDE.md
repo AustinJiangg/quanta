@@ -37,8 +37,11 @@ of **M18** — **Sv39 virtual memory** on RV64 (the three-level page-table walk,
 sharing the walker with Sv32, `tests/rv64/test_rv64_vm.S`), the **Sstc**
 supervisor-timer extension (`stimecmp`/`menvcfg.STCE`, `tests/rv64/test_rv64_sstc.S`),
 and a **virtio-mmio block device** (modern/v2, one split virtqueue, serving the
-`--disk` image by DMA, `tests/rv64/test_rv64_virtio.S`, `make check-virtio`) —
-all steps toward booting a mainstream OS (xv6-riscv next) — are implemented
+`--disk` image by DMA, `tests/rv64/test_rv64_virtio.S`, `make check-virtio`), plus
+the PLIC **S-mode interrupt context** (SEIP, `tests/rv64/test_rv64_plic.S`) — with
+which **upstream xv6-riscv now boots to an interactive shell** on Quanta (built
+`rv64imac_zicsr`, `CPUS=1`; `ls` reads the virtio disk, processes run through
+Sv39) — are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
@@ -107,6 +110,9 @@ beyond its ELF image — spare RAM lands above the image for an OS-style guest t
 manage, and the boot DTB advertises the real size (`tests/os/` needs it). Add
 `--disk=FILE` to attach a raw block-device image (read wholly into memory) that
 the virtio-mmio block device serves as an OS's root filesystem (M18). Add
+`--max-steps=N` (a count with an optional `K`/`M`/`G`/`T` suffix, `0` = no cap)
+to raise or remove the 100M-instruction runaway guard — an interactive
+full-system guest (a booting OS) legitimately runs billions of instructions. Add
 `--signature=FILE` to dump the
 architectural-test signature region (the words between the
 `begin_signature`/`end_signature` ELF symbols, in the suite's reference format) —
@@ -140,10 +146,14 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   MMIO: each `mem_read*`/`mem_write*` checks `plat_contains(addr)` first and
   dispatches device accesses to `device.c`, otherwise hits the flat RAM array.
 - `src/device.{h,c}` — the MMIO device models (M13): a CLINT (`mtime`/`mtimecmp`
-  timer + `msip` IPI), a PLIC (priority/enable/threshold + claim/complete), and a
-  16550 UART (transmit prints to stdout; receive via `plat_uart_rx`, which buffers
-  a host byte and — with RX interrupts enabled — raises the UART's PLIC source,
-  the input half of the console the CLI pumps stdin into, M18). M18 adds a
+  timer + `msip` IPI), a PLIC (priority/enable/threshold + claim/complete, with a
+  per-hart **M-mode context 0 → MEIP** and **S-mode context 1 → SEIP** so an
+  S-mode OS routes device interrupts, M18), and a 16550 UART (transmit prints to
+  stdout; receive via `plat_uart_rx`, which buffers a host byte and — with RX
+  interrupts enabled — raises the UART's PLIC source, the input half of the
+  console the CLI pumps stdin into, M18; its THR-empty interrupt is a one-shot
+  `thre_ip`, so an always-empty transmitter does not storm an OS leaving TX
+  interrupts on). M18 adds a
   **virtio-mmio block device** (`virtio_*`, modern/v2, one split virtqueue,
   PLIC source 1): the driver programs it through the mmio register file and kicks
   it with `QUEUE_NOTIFY`, on which `virtio_notify` walks the available ring and
@@ -259,7 +269,8 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   corners (the other is `main.c`'s console input).
 - `src/main.c` — the CLI driver, a thin client over `quanta.h`: argument parsing,
   the `--trace` narration, the `--pipeline`/`--cache` overlays, the `--gdb` stub
-  hand-off, the `--signature` arch-test dump, `--disk` attachment, and the console
+  hand-off, the `--signature` arch-test dump, `--disk` attachment, the
+  `--max-steps` runaway cap (0 = uncapped, for a booting OS), and the console
   input pump (host stdin → the UART, via a zero-timeout `select`) — all driving
   the machine through the public API (no engine internals). Its own POSIX
   feature macro is local to the file, mirroring `gdbstub.c`. Loads an ELF named
@@ -402,6 +413,14 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   and excluded from `check-rv64`'s generic runner (`RV64_RUN`); it is built
   `-mno-relax` so `la` on its in-RAM queue stays PC-relative (see gotchas). Also
   run under `make sanitize`/`make coverage`.
+- `tests/rv64/test_rv64_plic.S` — the M18 S-mode external-interrupt test (run by
+  `make check-rv64`): an M-mode shim delegates the supervisor external interrupt
+  and drops to S-mode, which arms the PLIC's **S-mode context** (context 1) for
+  the UART source, raises a UART interrupt, and takes it as a supervisor external
+  interrupt — claiming through the context-1 registers and asserting the claimed
+  source is the UART, the path a booting xv6's `virtio_disk_intr`/`uartintr`
+  reach. Uses M-mode CSRs + MMIO, so it is quanta-only (excluded from the
+  qemu-riscv64 differential like `*_priv`/`*_vm`/`*_sstc`).
 - `tests/coverage.sh` — collects gcov line coverage after an instrumented build
   (`make coverage`): prefers lcov (HTML under `build/coverage`) and falls back to
   plain gcov. Observability only, like the cache/pipeline overlays.
@@ -433,6 +452,14 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   the **shift amount** (5 bits RV32, 6 bits RV64), and the width-defining ops
   need an `xlen` branch. `imm_*` immediates sign-extend to 64 for both widths, so
   PC/address arithmetic uses `(uint64_t)imm_*` and masks like `& ~(uint64_t)1`.
+  A subtle corollary the OS-boot work exposed: **branch comparisons must use the
+  full 64-bit register values** (`exec_branch` reads `uint64_t`, casts `int64_t`
+  for BLT/BGE), not the low 32 bits. Truncating breaks an RV64 `bltu`/`bgeu`
+  whose operands differ above bit 31 (e.g. a page-table loop bound `0x4000000000`
+  vs a VA `0x3ffffff000`). Sign-extended storage means the same full-width
+  compare is also correct for RV32 (sext preserves both signed and unsigned
+  ordering of the low 32 bits), so one code path serves both. Pinned by the
+  high-address branch checks in `tests/rv64/test_rv64.S` (qemu-verified).
 - Because registers/PC are sign-extended internally, the **public API returns the
   architectural value masked to XLEN** (`xlen_val()` in `quanta.c`): RV32
   `quanta_reg`/`quanta_pc` hand back the low 32 bits (zero-extended), so a
@@ -599,9 +626,15 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   (after `mmu_translate`) — `test_vm`'s `0x10000000` is a deliberately-unmapped
   *VA* that faults at translation, never reaching the UART there. `mtime` ticks
   once per `cpu_step` (deterministic, not wall-clock), and `mtimecmp` resets to
-  all-ones so the timer is quiet until armed. `MTIP`/`MSIP`/`MEIP` are read-only
-  reflections of device state, recomputed into `mip` each step by `effective_mip`
-  (software-writable `mip` bits like `SSIP` are left alone). Interrupts are taken
+  all-ones so the timer is quiet until armed. `MTIP`/`MSIP`/`MEIP`/`SEIP` are
+  read-only reflections of device state, recomputed into `mip` each step by
+  `effective_mip` (software-writable `mip` bits like `SSIP`/`STIP` are left
+  alone). The PLIC has **two contexts** (M18): context 0 = hart-0 M-mode → MEIP,
+  context 1 = hart-0 S-mode → SEIP, each with its own enable/threshold/claim (the
+  qemu virt layout: S-context enable at `0x2080`, threshold/claim at `0x201000`/
+  `0x201004`). An S-mode OS (xv6) claims/completes through context 1 and takes
+  the interrupt as SEIP once it delegates bit 9 via `mideleg` — `test_irq.S`
+  drives context 0, `test_rv64_plic.S` context 1. Interrupts are taken
   at the instruction boundary **before** fetch, so `*epc` is the interrupted
   instruction and the handler resumes it (do **not** advance `*epc` the way a
   synchronous handler skips its trapping instruction). `enter_trap` is shared by
@@ -730,6 +763,25 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   page-table/user pages), just with little spare RAM. `--trace` is the debugging
   tool when changing it — there is no qemu differential net for an S-mode paging
   guest.
+- Booting xv6 (M18, the mainstream-OS trophy): upstream `mit-pdos/xv6-riscv`
+  boots to an interactive shell on Quanta. It is entered in M-mode at
+  `0x80000000` (like every ELF) and drops to S-mode itself in `start.c` — needing
+  neither OpenSBI nor Quanta's SBI — so the enter-in-M-mode contract fits it.
+  Build it integer-only (Quanta has no RV64F/D): override the upstream
+  `-march=rv64gc` to `-march=rv64imac_zicsr_zifencei -mabi=lp64` and build
+  `CPUS=1` (Quanta is single-hart). Run `./quanta --memory=128M --max-steps=0
+  --disk=fs.img kernel/kernel` — `128M` matches xv6's hardcoded `PHYSTOP`
+  (`0x88000000`), `--max-steps=0` lifts the runaway guard (xv6 `memset`s all
+  128 MiB in `kinit` alone, ~billions of instructions), and `--disk` supplies the
+  virtio root fs. The four Quanta pieces this needed beyond the M18 devices: the
+  full-XLEN branch fix (above), the PLIC S-mode context/SEIP (xv6 routes device
+  interrupts to S-mode), the UART THRE one-shot (xv6 leaves TX interrupts on —
+  a level-asserting THRE would storm), and `--max-steps`. No `make` target boots
+  xv6 (its source is external and runs are long); it is a manual milestone,
+  pinned indirectly by `test_rv64_plic.S` (S-mode interrupts) and the branch
+  checks. When debugging an OS boot, shrink `PHYSTOP` (e.g. to 8 MiB) so `kinit`
+  is fast, and patch a guest `printk` into the failing kernel path — cheaper than
+  a multi-hundred-million-instruction `--trace`.
 - `--trace` writes to stderr, leaving the guest's own stdout (`write`) clean;
   "changed registers" are recovered by diffing a register snapshot taken around
   `cpu_step`, so the core isn't instrumented. The disassembler prints the common

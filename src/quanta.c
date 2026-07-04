@@ -105,9 +105,9 @@ static void setup_boot(Quanta *q) {
         .uart_base  = UART_BASE,     .uart_size  = UART_SIZE,
         .uart_irq   = UART_IRQ,      .plic_ndev  = PLIC_NSOURCES - 1,
         .boot_hart  = 0,             .timebase_freq = 10000000,
-        /* RV64 runs Bare until Sv39 (M18), so it advertises no MMU. */
+        /* RV64 now walks Sv39 (M18); RV32 uses Sv32. */
         .isa      = rv64 ? "rv64imac_zicsr" : "rv32ima_zicsr_zifencei",
-        .mmu_type = rv64 ? "riscv,none"     : "riscv,sv32",
+        .mmu_type = rv64 ? "riscv,sv39"     : "riscv,sv32",
     };
 
     uint8_t blob[DTB_MAX_SIZE];
