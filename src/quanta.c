@@ -23,12 +23,20 @@ const char *quanta_version(void) {
 #define QUANTA_DEFAULT_MAX_STEPS (100ULL * 1000 * 1000)
 
 /*
- * The handle owns every piece of the machine. CPU holds a borrowed pointer to
- * Memory (and, when enabled, the Cache), so the three live together here and
- * are wired up by the loaders.
+ * The handle owns every piece of the machine. Each CPU (hart) holds a borrowed
+ * pointer to the shared Memory (and, when enabled, the Cache); with SMP (M19)
+ * several harts share that one memory and the one Platform, and a round-robin
+ * scheduler interleaves them one instruction at a time on the host thread — a
+ * deterministic model of concurrency. harts[0] is the boot hart; nharts == 1 is
+ * the ordinary uniprocessor.
  */
 struct Quanta {
-    CPU      cpu;
+    CPU      harts[QUANTA_MAX_HARTS];
+    int      nharts;    /* number of active harts (1..QUANTA_MAX_HARTS) */
+    int      sched;     /* round-robin cursor for the incremental quanta_step */
+    int      m_halted;      /* the whole machine has stopped */
+    HaltReason m_reason;    /* why (meaningful once m_halted) */
+    uint32_t m_exit;        /* machine exit status */
     Memory   mem;
     Cache    cache;
     Platform plat;    /* MMIO devices: CLINT timer/IPI, PLIC, 16550 UART (M13) */
@@ -64,7 +72,38 @@ static QuantaStatus in_range(const Memory *mem, uint64_t addr, size_t len,
 }
 
 Quanta *quanta_create(void) {
-    return calloc(1, sizeof(Quanta)); /* NULL on OOM */
+    Quanta *q = calloc(1, sizeof(Quanta)); /* NULL on OOM */
+    if (q) q->nharts = 1;                  /* a uniprocessor unless --harts asks for more */
+    return q;
+}
+
+QuantaStatus quanta_set_harts(Quanta *q, int nharts) {
+    if (!q || q->loaded) return QUANTA_ERR_INVAL;      /* set before loading */
+    if (nharts < 1 || nharts > (int)QUANTA_MAX_HARTS) return QUANTA_ERR_INVAL;
+    q->nharts = nharts;
+    return QUANTA_OK;
+}
+
+/* Update the machine-level halt state, polled after every hart step. The whole
+ * machine stops on a global power-off (the SiFive test device / SBI SRST routed
+ * through the platform) or once every hart has individually halted. On all-halted
+ * an abnormal hart reason (a fault) is surfaced ahead of a clean exit, so a
+ * secondary hart's crash is not masked by the boot hart's clean stop. */
+static void machine_poll_halt(Quanta *q) {
+    uint32_t code;
+    if (plat_poweroff_requested(&q->plat, &code)) {
+        q->m_halted = 1; q->m_reason = HALT_EXIT; q->m_exit = code;
+        return;
+    }
+    int abnormal = -1;
+    for (int i = 0; i < q->nharts; i++) {
+        if (!q->harts[i].halted) return;               /* someone is still running */
+        if (q->harts[i].halt_reason != HALT_EXIT && abnormal < 0) abnormal = i;
+    }
+    int who = (abnormal >= 0) ? abnormal : 0;
+    q->m_halted = 1;
+    q->m_reason = q->harts[who].halt_reason;
+    q->m_exit   = q->harts[who].exit_code;
 }
 
 void quanta_destroy(Quanta *q) {
@@ -75,17 +114,30 @@ void quanta_destroy(Quanta *q) {
     free(q);
 }
 
-/* Shared tail of the loaders: attach the CPU to memory at `entry`, re-attach the
- * cache if one is enabled, and set sp to the top of the region (16-byte aligned
- * per the RISC-V ABI) so the program can call functions and spill locals. */
+/* Shared tail of the loaders: reset the platform, then bring up every hart at
+ * `entry` sharing the one memory. Each hart gets its id in mhartid (and a0 later,
+ * at the boot handoff), the cache if one is enabled, and sp at the top of the
+ * region (16-byte aligned per the RISC-V ABI) — an SMP guest repartitions its own
+ * per-hart stacks early using mhartid. All harts start running; the firmware boot
+ * path parks the secondaries (see setup_firmware_boot). */
 static void start_at(Quanta *q, uint64_t entry, int xlen) {
-    cpu_init(&q->cpu, &q->mem, entry, xlen); /* xlen from the ELF class (raw: 32) */
-    if (q->cache_on) q->cpu.cache = &q->cache;
+    if (q->nharts < 1) q->nharts = 1;
     plat_init(&q->plat);      /* reset the MMIO devices */
     q->mem.plat = &q->plat;   /* attach them so MMIO is dispatched and timers tick */
     plat_attach_ram(&q->plat, q->mem.data, q->mem.base, q->mem.size); /* virtio DMA */
+    plat_set_harts(&q->plat, q->harts, q->nharts); /* CLINT/atomics reach every hart */
+
+    uint64_t sp = (q->mem.base + q->mem.size) & ~(uint64_t)0xf;
+    for (int i = 0; i < q->nharts; i++) {
+        cpu_init(&q->harts[i], &q->mem, entry, xlen); /* xlen from the ELF class (raw: 32) */
+        q->harts[i].hartid = (uint32_t)i;
+        q->harts[i].csr[CSR_MHARTID] = (uint64_t)i;
+        if (q->cache_on) q->harts[i].cache = &q->cache;
+        reg_write(&q->harts[i], 2, sp);
+    }
     q->dtb_addr = 0;          /* set only by the boot handoff below (ELF path) */
-    reg_write(&q->cpu, 2, (q->mem.base + q->mem.size) & ~(uint64_t)0xf);
+    q->sched = 0;
+    q->m_halted = 0; q->m_reason = HALT_NONE; q->m_exit = 0;
     q->loaded = 1;
 }
 
@@ -93,7 +145,7 @@ static void start_at(Quanta *q, uint64_t entry, int xlen) {
  * handoffs (Quanta-as-firmware in setup_boot, and an M-mode firmware payload in
  * setup_firmware_boot). `bootargs` is the kernel command line (NULL for none). */
 static void dtb_config(const Quanta *q, DtbConfig *cfg, const char *bootargs) {
-    int rv64 = (q->cpu.xlen == 64);
+    int rv64 = (q->harts[0].xlen == 64);
     cfg->mem_base   = (uint32_t)q->mem.base; cfg->mem_size = (uint32_t)q->mem.size;
     cfg->test_base  = TEST_BASE;     cfg->test_size  = TEST_SIZE;
     cfg->clint_base = CLINT_BASE;    cfg->clint_size = CLINT_SIZE;
@@ -101,6 +153,7 @@ static void dtb_config(const Quanta *q, DtbConfig *cfg, const char *bootargs) {
     cfg->uart_base  = UART_BASE;     cfg->uart_size  = UART_SIZE;
     cfg->uart_irq   = UART_IRQ;      cfg->plic_ndev  = PLIC_NSOURCES - 1;
     cfg->boot_hart  = 0;             cfg->timebase_freq = 10000000;
+    cfg->nharts     = (uint32_t)q->nharts;
     cfg->bootargs   = bootargs;
     cfg->initrd_start = 0;           cfg->initrd_end = 0; /* set by setup_firmware_boot */
     /* RV64 now walks Sv39 (M18); RV32 uses Sv32. */
@@ -128,9 +181,15 @@ static void setup_boot(Quanta *q) {
     if (mem_load(&q->mem, addr, blob, n) != 0) return;
     q->dtb_addr = addr;
 
-    reg_write(&q->cpu, 2, (addr - 16) & ~(uint32_t)0xf); /* sp: 16-aligned, below the DTB */
-    reg_write(&q->cpu, 10, cfg.boot_hart);               /* a0 = hartid */
-    reg_write(&q->cpu, 11, addr);                        /* a1 = DTB pointer */
+    /* Enter every hart the way qemu's `-bios none` does: PC at the entry (set by
+     * start_at), a0 = this hart's id, a1 = the DTB, sp below the tree. An SMP OS
+     * (xv6 CPUS>1) dispatches on a0/mhartid from here. */
+    uint64_t new_sp = (addr - 16) & ~(uint64_t)0xf;
+    for (int i = 0; i < q->nharts; i++) {
+        reg_write(&q->harts[i], 2, new_sp);          /* sp: 16-aligned, below the DTB */
+        reg_write(&q->harts[i], 10, (uint64_t)i);    /* a0 = this hart's id */
+        reg_write(&q->harts[i], 11, addr);           /* a1 = DTB pointer */
+    }
 }
 
 /* The boot handoff when an M-mode firmware (OpenSBI, fw_dynamic) enters the OS
@@ -192,9 +251,18 @@ static int setup_firmware_boot(Quanta *q, uint64_t next_addr, const char *bootar
             info[i * 8 + b] = (uint8_t)(words[i] >> (8 * b));
     if (mem_load(&q->mem, info_addr, info, sizeof info) != 0) return -1;
 
-    reg_write(&q->cpu, 10, cfg.boot_hart); /* a0 = hartid */
-    reg_write(&q->cpu, 11, dtb_addr);      /* a1 = DTB */
-    reg_write(&q->cpu, 12, info_addr);     /* a2 = &fw_dynamic_info */
+    reg_write(&q->harts[0], 10, cfg.boot_hart); /* a0 = hartid */
+    reg_write(&q->harts[0], 11, dtb_addr);      /* a1 = DTB */
+    reg_write(&q->harts[0], 12, info_addr);     /* a2 = &fw_dynamic_info */
+
+    /* SMP under an M-mode firmware (OpenSBI, then Linux SMP) needs every hart to
+     * enter the firmware and be released by SBI HSM hart_start — not yet modelled.
+     * So on the firmware path the secondaries stay parked and only the boot hart
+     * runs; the direct ELF path (setup_boot) is the SMP route (xv6 CPUS>1). */
+    for (int i = 1; i < q->nharts; i++) {
+        q->harts[i].halted = 1;
+        q->harts[i].halt_reason = HALT_EXIT;    /* parked, not a fault */
+    }
     return 0;
 }
 
@@ -335,7 +403,8 @@ QuantaStatus quanta_enable_cache(Quanta *q, uint32_t size_bytes,
         return QUANTA_ERR_INVAL;
     }
     q->cache_on = 1;
-    if (q->loaded) q->cpu.cache = &q->cache; /* attach if already running */
+    if (q->loaded)                                /* attach to every hart if running */
+        for (int i = 0; i < q->nharts; i++) q->harts[i].cache = &q->cache;
     return QUANTA_OK;
 }
 
@@ -343,24 +412,37 @@ void quanta_cache_report(const Quanta *q, FILE *out) {
     if (q && q->cache_on) cache_report(&q->cache, out);
 }
 
+/* Advance the machine by one hart-instruction, round-robin across the harts —
+ * the incremental stepper the CLI's trace loop and the GDB stub drive. The shared
+ * platform timer ticks once at the start of each round (cursor back at hart 0), so
+ * mtime advances at one rate whatever the hart count; on a uniprocessor this is
+ * exactly "tick, then step hart 0" as before. A halted hart's slot is a no-op. */
 QuantaHalt quanta_step(Quanta *q) {
     if (!q || !q->loaded) return QUANTA_RUN;
-    if (!q->cpu.halted) cpu_step(&q->cpu);
-    return map_halt(q->cpu.halt_reason);
+    if (q->m_halted) return map_halt(q->m_reason);
+    if (q->sched == 0) plat_tick(&q->plat);
+    CPU *h = &q->harts[q->sched];
+    if (!h->halted) cpu_step(h);
+    q->sched = (q->sched + 1) % q->nharts;
+    machine_poll_halt(q);
+    return q->m_halted ? map_halt(q->m_reason) : QUANTA_RUN;
 }
 
 QuantaHalt quanta_run(Quanta *q, uint64_t max_steps, uint64_t *steps_out) {
     uint64_t cap = max_steps ? max_steps : QUANTA_DEFAULT_MAX_STEPS;
     uint64_t steps = 0;
     if (q && q->loaded) {
-        while (!q->cpu.halted && steps < cap) {
-            cpu_step(&q->cpu);
-            steps++;
+        while (!q->m_halted && steps < cap) {
+            if (q->sched == 0) plat_tick(&q->plat);   /* one tick per scheduler round */
+            CPU *h = &q->harts[q->sched];
+            if (!h->halted) { cpu_step(h); steps++; } /* count only real instructions */
+            q->sched = (q->sched + 1) % q->nharts;
+            machine_poll_halt(q);
         }
     }
     if (steps_out) *steps_out = steps;
     if (!q || !q->loaded) return QUANTA_RUN;
-    return q->cpu.halted ? map_halt(q->cpu.halt_reason) : QUANTA_HALT_STEP_LIMIT;
+    return q->m_halted ? map_halt(q->m_reason) : QUANTA_HALT_STEP_LIMIT;
 }
 
 int quanta_uart_input(Quanta *q, uint8_t byte) {
@@ -373,21 +455,21 @@ int quanta_uart_input(Quanta *q, uint8_t byte) {
  * 32 bits to hand back the real 32-bit value (zero-extended); RV64 is unchanged.
  * This also keeps a returned PC a valid address for quanta_read_u32/mem access. */
 static uint64_t xlen_val(const Quanta *q, uint64_t v) {
-    return q->cpu.xlen == 64 ? v : (v & 0xffffffffu);
+    return q->harts[0].xlen == 64 ? v : (v & 0xffffffffu);
 }
 
 uint64_t quanta_reg(const Quanta *q, int i) {
     if (!q || i < 0 || i > 31) return 0;
-    return xlen_val(q, reg_read(&q->cpu, (uint32_t)i));
+    return xlen_val(q, reg_read(&q->harts[0], (uint32_t)i));
 }
 
 void quanta_set_reg(Quanta *q, int i, uint64_t value) {
-    if (q && i >= 0 && i <= 31) reg_write(&q->cpu, (uint32_t)i, value);
+    if (q && i >= 0 && i <= 31) reg_write(&q->harts[0], (uint32_t)i, value);
 }
 
-uint64_t quanta_pc(const Quanta *q) { return q ? xlen_val(q, q->cpu.pc) : 0; }
-void     quanta_set_pc(Quanta *q, uint64_t pc) { if (q) q->cpu.pc = pc; }
-int      quanta_xlen(const Quanta *q) { return (q && q->loaded) ? q->cpu.xlen : 0; }
+uint64_t quanta_pc(const Quanta *q) { return q ? xlen_val(q, q->harts[0].pc) : 0; }
+void     quanta_set_pc(Quanta *q, uint64_t pc) { if (q) q->harts[0].pc = pc; }
+int      quanta_xlen(const Quanta *q) { return (q && q->loaded) ? q->harts[0].xlen : 0; }
 
 QuantaStatus quanta_mem_read(const Quanta *q, uint64_t addr,
                              void *dst, size_t len) {
@@ -423,11 +505,11 @@ uint32_t quanta_read_u32(const Quanta *q, uint64_t addr, int *ok) {
 }
 
 QuantaHalt quanta_halt_reason(const Quanta *q) {
-    if (!q || !q->cpu.halted) return QUANTA_RUN;
-    return map_halt(q->cpu.halt_reason);
+    if (!q || !q->m_halted) return QUANTA_RUN;
+    return map_halt(q->m_reason);
 }
 
-uint32_t quanta_exit_code(const Quanta *q)  { return q ? q->cpu.exit_code : 0; }
+uint32_t quanta_exit_code(const Quanta *q)  { return q ? q->m_exit : 0; }
 uint64_t quanta_fault_addr(const Quanta *q) { return q ? xlen_val(q, q->mem.fault_addr) : 0; }
 uint64_t quanta_mem_base(const Quanta *q)   { return q ? q->mem.base : 0; }
 uint64_t quanta_mem_size(const Quanta *q)   { return q ? q->mem.size : 0; }

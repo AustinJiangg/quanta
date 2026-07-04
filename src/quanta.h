@@ -32,6 +32,12 @@ extern "C" {
  * CLI's --version. */
 const char *quanta_version(void);
 
+/* The most harts the machine can model (SMP, M19). A run uses 1..this many,
+ * chosen with quanta_set_harts / the CLI's --harts. */
+#ifndef QUANTA_MAX_HARTS
+#define QUANTA_MAX_HARTS 8u
+#endif
+
 /* Opaque emulator instance. Create with quanta_create(), free with
  * quanta_destroy(). */
 typedef struct Quanta Quanta;
@@ -64,6 +70,15 @@ Quanta *quanta_create(void);
 
 /* Free an instance and its guest memory. A NULL handle is ignored. */
 void quanta_destroy(Quanta *q);
+
+/* Configure the machine with `nharts` harts (1..QUANTA_MAX_HARTS) for SMP (M19).
+ * Must be called before loading a program. All harts share one memory and one
+ * platform; a deterministic round-robin scheduler interleaves them one
+ * instruction at a time, and each gets its id in mhartid (and a0 at boot). Returns
+ * QUANTA_ERR_INVAL if a program is already loaded or the count is out of range.
+ * The default (no call) is 1 hart. Only the direct ELF/image boot brings up all
+ * harts; the firmware (--bios) path parks the secondaries. */
+QuantaStatus quanta_set_harts(Quanta *q, int nharts);
 
 /* --- loading --- */
 

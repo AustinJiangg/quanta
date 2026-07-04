@@ -103,10 +103,11 @@ typedef enum {
     HALT_MEM_FAULT         /* fetch/load/store outside mapped memory */
 } HaltReason;
 
-typedef struct {
+typedef struct CPU {
     uint64_t regs[32];      /* x0..x31; x0 is always zero (sext_xlen in RV32) */
     uint64_t pc;            /* program counter */
     int      xlen;          /* register width in bits: 32 (RV32) or 64 (RV64) */
+    uint32_t hartid;        /* this hart's id (mhartid; a0 at boot); 0 on a uniprocessor */
     Memory  *mem;           /* attached memory (not owned by the CPU) */
     struct Cache *cache;    /* optional cache model; NULL if off (not owned) */
     int      halted;        /* set when execution should stop */

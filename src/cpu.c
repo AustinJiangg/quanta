@@ -61,6 +61,7 @@ void cpu_init(CPU *cpu, Memory *mem, uint64_t entry_pc, int xlen) {
     cpu->xlen      = xlen; /* 32 (RV32) or 64 (RV64), chosen by the loader */
     for (int i = 0; i < 32; i++) cpu->regs[i] = 0;
     cpu->pc        = entry_pc;
+    cpu->hartid    = 0;    /* the engine overrides per hart before running (M19) */
     cpu->mem       = mem;
     cpu->cache     = NULL;
     cpu->halted      = 0;
@@ -91,11 +92,21 @@ void reg_write(CPU *cpu, uint32_t i, uint64_t value) {
 }
 
 /* RV-A: a store to the reserved word breaks any outstanding LR reservation, so
- * a later SC to it fails. Modelled at word granularity, which is enough for a
- * single hart — there are no other agents to race the reservation. */
+ * a later SC to it fails. Modelled at word granularity. Under SMP (M19) a store
+ * on any hart must void *every other* hart's reservation to the same word — that
+ * is the cross-hart contention LR/SC exists to handle — so we sweep the sibling
+ * harts the platform points at; on a uniprocessor it is just this hart. */
 static void break_reservation(CPU *cpu, uint64_t addr) {
-    if (cpu->reserve_valid && (addr & ~(uint64_t)0x3) == cpu->reserve_addr)
+    uint64_t word = addr & ~(uint64_t)0x3;
+    Platform *plat = cpu->mem->plat;
+    if (plat && plat->harts && plat->nharts > 1) {
+        for (int i = 0; i < plat->nharts; i++) {
+            CPU *h = &plat->harts[i];
+            if (h->reserve_valid && h->reserve_addr == word) h->reserve_valid = 0;
+        }
+    } else if (cpu->reserve_valid && cpu->reserve_addr == word) {
         cpu->reserve_valid = 0;
+    }
 }
 
 /* Execute OP-IMM: register/immediate arithmetic (ADDI, SLTI, shifts, ...).
@@ -580,7 +591,7 @@ static uint32_t effective_mip(CPU *cpu) {
          * machine software/timer via the CLINT); recompute them from device
          * state. Software-writable bits (SSIP, STIP) are left as-is. */
         mip &= ~(MIP_MSIP | MIP_MTIP | MIP_MEIP | MIP_SEIP);
-        mip |= plat_mip_bits(cpu->mem->plat);
+        mip |= plat_mip_bits(cpu->mem->plat, cpu->hartid);
         cpu->csr[CSR_MIP] = mip; /* so a CSR read of mip sees the live bits */
     }
     return mip;
@@ -622,7 +633,7 @@ static int take_interrupt(CPU *cpu) {
  * fresh deadline), and flag it so firmware_timer_tick converts it to STIP once
  * mtime reaches it. */
 void cpu_arm_supervisor_timer(CPU *cpu, uint64_t deadline) {
-    if (cpu->mem->plat) cpu->mem->plat->clint.mtimecmp = deadline;
+    if (cpu->mem->plat) cpu->mem->plat->clint.mtimecmp[cpu->hartid] = deadline;
     cpu->csr[CSR_MIP] &= ~(1u << IRQ_STIMER);
     cpu->sbi_timer_armed = 1;
 }
@@ -636,7 +647,7 @@ void cpu_arm_supervisor_timer(CPU *cpu, uint64_t deadline) {
  * to S-mode when the OS has delegated and enabled it. */
 static void firmware_timer_tick(CPU *cpu) {
     if (!cpu->sbi_timer_armed) return;
-    if (plat_mip_bits(cpu->mem->plat) & MIP_MTIP) {
+    if (plat_mip_bits(cpu->mem->plat, cpu->hartid) & MIP_MTIP) {
         cpu->csr[CSR_MIP] |= (1u << IRQ_STIMER);
         cpu->sbi_timer_armed = 0;
     }
@@ -772,8 +783,9 @@ static void exec_amo(CPU *cpu, uint32_t inst) {
             if (is_d) mem_write64(cpu->mem, addr, reg_read(cpu, rs2(inst)));
             else      mem_write32(cpu->mem, addr, (uint32_t)reg_read(cpu, rs2(inst)));
             if (cpu->mem->fault) return;
+            break_reservation(cpu, addr); /* a successful SC voids other harts' too */
         }
-        cpu->reserve_valid = 0;          /* SC always clears the reservation */
+        cpu->reserve_valid = 0;          /* SC always clears its own reservation */
         reg_write(cpu, rd(inst), fail);  /* 0 = success, 1 = failure */
         return;
     }
@@ -905,11 +917,11 @@ void cpu_step(CPU *cpu) {
     cpu->mem->fault = 0;
     cpu->trapped = 0; /* set by raise_trap if this step vectors into a handler */
 
-    /* Advance the platform timer and take any pending interrupt before fetch,
-     * at this instruction boundary. A taken interrupt vectors into the handler
-     * and retires nothing, so we return without fetching. */
+    /* Take any pending interrupt before fetch, at this instruction boundary. A
+     * taken interrupt vectors into the handler and retires nothing, so we return
+     * without fetching. (The platform timer advances once per scheduler round,
+     * driven by the engine, so mtime ticks at one rate no matter the hart count.) */
     if (cpu->mem->plat) {
-        plat_tick(cpu->mem->plat);
         uint32_t off_code;
         if (plat_poweroff_requested(cpu->mem->plat, &off_code)) {
             /* The SiFive test device was written (OpenSBI SRST / Linux poweroff):

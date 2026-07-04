@@ -9,6 +9,23 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **SMP multi-hart (`--harts=N`)** — Quanta now models up to 8 harts sharing one
+  memory and platform (`--harts=N`, or `quanta_set_harts` in the engine API). A
+  deterministic single-threaded round-robin scheduler interleaves the harts one
+  instruction at a time, so runs stay reproducible while the guest still sees real
+  interleaving. The CLINT gains per-hart `msip`/`mtimecmp` (a hart IPIs another by
+  writing its `msip`); the PLIC gains per-hart M/S contexts driving each hart's
+  MEIP/SEIP; `mhartid` reports each hart's id (delivered in `a0` at boot); and the
+  boot device tree describes one `cpu@h` node per hart. The direct ELF/image boot
+  brings up every hart at the entry (the qemu `-bios none` convention); the
+  firmware `--bios` path parks the secondaries (SMP Linux under OpenSBI, which
+  needs SBI HSM, is future work). Pinned by `make check-smp`
+  (`tests/rv64/test_rv64_smp.S`): four harts verify their `mhartid`, contend on one
+  shared counter with LR/SC (the total must reach `NHARTS*ITERS` with no lost
+  updates), sync on a barrier, and pass a CLINT IPI hart-to-hart as a real machine
+  software interrupt. And **upstream xv6-riscv boots SMP** (`--harts=3`) to its
+  shell. (M19)
+
 - **Boot Linux to an interactive userspace shell** — a mainline **Linux 6.6**
   kernel (built rv64imac, no float/vector) boots on Quanta all the way to a real
   userspace process: OpenSBI hands off to the kernel, which brings up SBI
@@ -195,6 +212,14 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Fixed
 
+- **A successful `sc` did not void other harts' reservations** — the store-
+  conditional path cleared only the issuing hart's LR/SC reservation, not the
+  reservations sibling harts held on the same word, so under SMP two harts could
+  each `sc` successfully over the other's read-modify-write and lose an update
+  (a plain store and the AMOs already broke sibling reservations; `sc` did not).
+  A successful `sc` now breaks every hart's reservation to that word, like any
+  other store. Invisible before SMP (a single hart has no siblings); caught by the
+  new `make check-smp` contended-counter test. (M19)
 - **JALR clobbered its base when the link register aliased it** — `OP_JALR` wrote
   the link (`rd = pc + ilen`) before computing the target from `rs1`, so a
   `jalr rd, off(rd)` with `rd == rs1` jumped to `pc + ilen + off` instead of the

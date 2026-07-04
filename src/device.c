@@ -18,7 +18,14 @@ static int in_window(uint64_t addr, uint32_t base, uint32_t size) {
 
 void plat_init(Platform *p) {
     memset(p, 0, sizeof *p);
-    p->clint.mtimecmp = (uint64_t)-1; /* parked: no timer interrupt until armed */
+    for (uint32_t h = 0; h < QUANTA_MAX_HARTS; h++)
+        p->clint.mtimecmp[h] = (uint64_t)-1; /* parked: no timer until armed */
+    p->nharts = 1;
+}
+
+void plat_set_harts(Platform *p, struct CPU *harts, int n) {
+    p->harts  = harts;
+    p->nharts = n;
 }
 
 int plat_contains(uint64_t addr) {
@@ -449,28 +456,34 @@ static void plic_write(Platform *p, uint32_t off, uint32_t val) {
  * CLINT.
  * ------------------------------------------------------------------------ */
 
+/* The CLINT lays its per-hart registers out on the qemu virt map: msip[h] at
+ * 0x0000 + h*4, mtimecmp[h] at 0x4000 + h*8, and the shared mtime at 0xbff8.
+ * The offset is already word-aligned, so the hart index falls straight out of
+ * it; accesses beyond QUANTA_MAX_HARTS read as 0 / are dropped. */
 static uint32_t clint_read(Clint *c, uint32_t off) {
-    switch (off) {
-        case 0x0000: return c->msip & 1u;
-        case 0x4000: return (uint32_t)c->mtimecmp;
-        case 0x4004: return (uint32_t)(c->mtimecmp >> 32);
-        case 0xbff8: return (uint32_t)c->mtime;
-        case 0xbffc: return (uint32_t)(c->mtime >> 32);
-        default: return 0;
+    if (off < QUANTA_MAX_HARTS * 4u)                 /* msip[h] */
+        return c->msip[off / 4u] & 1u;
+    if (off >= 0x4000u && off < 0x4000u + QUANTA_MAX_HARTS * 8u) {
+        uint32_t rel = off - 0x4000u, h = rel / 8u;  /* mtimecmp[h] lo/hi */
+        return (rel & 4u) ? (uint32_t)(c->mtimecmp[h] >> 32) : (uint32_t)c->mtimecmp[h];
     }
+    if (off == 0xbff8u) return (uint32_t)c->mtime;
+    if (off == 0xbffcu) return (uint32_t)(c->mtime >> 32);
+    return 0;
 }
 
 static void clint_write(Clint *c, uint32_t off, uint32_t val) {
-    switch (off) {
-        case 0x0000: c->msip = val & 1u; return;
-        case 0x4000: c->mtimecmp = (c->mtimecmp & 0xffffffff00000000ull) | val; return;
-        case 0x4004: c->mtimecmp = (c->mtimecmp & 0x00000000ffffffffull)
-                                 | ((uint64_t)val << 32); return;
-        case 0xbff8: c->mtime = (c->mtime & 0xffffffff00000000ull) | val; return;
-        case 0xbffc: c->mtime = (c->mtime & 0x00000000ffffffffull)
-                              | ((uint64_t)val << 32); return;
-        default: return;
+    if (off < QUANTA_MAX_HARTS * 4u) { c->msip[off / 4u] = val & 1u; return; }
+    if (off >= 0x4000u && off < 0x4000u + QUANTA_MAX_HARTS * 8u) {
+        uint32_t rel = off - 0x4000u, h = rel / 8u;
+        if (rel & 4u) c->mtimecmp[h] = (c->mtimecmp[h] & 0x00000000ffffffffull)
+                                     | ((uint64_t)val << 32);
+        else          c->mtimecmp[h] = (c->mtimecmp[h] & 0xffffffff00000000ull) | val;
+        return;
     }
+    if (off == 0xbff8u) { c->mtime = (c->mtime & 0xffffffff00000000ull) | val; return; }
+    if (off == 0xbffcu) { c->mtime = (c->mtime & 0x00000000ffffffffull)
+                                   | ((uint64_t)val << 32); return; }
 }
 
 /* ------------------------------------------------------------------------
@@ -512,11 +525,14 @@ void plat_write(Platform *p, uint64_t addr, uint32_t size, uint32_t value) {
         virtio_write(p, (uint32_t)(addr - VIRTIO_BASE) & ~3u, value);
 }
 
-uint32_t plat_mip_bits(Platform *p) {
+uint32_t plat_mip_bits(Platform *p, uint32_t hart) {
     uint32_t bits = 0;
-    if (p->clint.mtime >= p->clint.mtimecmp) bits |= MIP_MTIP;
-    if (p->clint.msip & 1u)                  bits |= MIP_MSIP;
-    if (plic_best(p, 0) != 0)                bits |= MIP_MEIP; /* M-mode context */
-    if (plic_best(p, 1) != 0)                bits |= MIP_SEIP; /* S-mode context */
+    if (hart < QUANTA_MAX_HARTS) {
+        if (p->clint.mtime >= p->clint.mtimecmp[hart]) bits |= MIP_MTIP;
+        if (p->clint.msip[hart] & 1u)                  bits |= MIP_MSIP;
+    }
+    /* qemu virt PLIC context layout: 2*hart = M-mode (MEIP), 2*hart+1 = S (SEIP). */
+    if (plic_best(p, 2u * hart)      != 0) bits |= MIP_MEIP;
+    if (plic_best(p, 2u * hart + 1u) != 0) bits |= MIP_SEIP;
     return bits;
 }

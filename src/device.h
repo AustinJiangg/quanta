@@ -37,12 +37,21 @@
 #define VIRTIO_BASE 0x10001000u   /* qemu virt's first virtio-mmio slot (xv6's VIRTIO0) */
 #define VIRTIO_SIZE 0x00001000u
 
+/* The maximum number of harts the machine models (M19). CLINT compares/IPIs and
+ * PLIC contexts are sized for this; a run uses 1..QUANTA_MAX_HARTS, chosen with
+ * --harts. The canonical definition is in quanta.h (the public header); guarded
+ * here so device.h stands alone for the files that include only it. */
+#ifndef QUANTA_MAX_HARTS
+#define QUANTA_MAX_HARTS 8u
+#endif
+
 /* A handful of PLIC sources is plenty; the UART is wired to source 10 and the
- * virtio block device to source 1, as on qemu virt. One hart, but two interrupt
- * contexts: context 0 = hart 0 M-mode (drives MEIP), context 1 = hart 0 S-mode
- * (drives SEIP). An OS like xv6 runs in S-mode and uses context 1. */
+ * virtio block device to source 1, as on qemu virt. Each hart has two interrupt
+ * contexts on the qemu virt layout: context 2*h = hart h M-mode (drives its
+ * MEIP), context 2*h+1 = hart h S-mode (drives its SEIP). An OS like xv6 runs in
+ * S-mode and uses the odd contexts. */
 #define PLIC_NSOURCES  32u
-#define PLIC_NCONTEXTS 2u
+#define PLIC_NCONTEXTS (2u * QUANTA_MAX_HARTS)
 #define UART_IRQ       10u
 #define VIRTIO_IRQ     1u
 
@@ -55,9 +64,9 @@
 #define MIP_MEIP (1u << 11)
 
 typedef struct {
-    uint64_t mtime;     /* free-running counter; one tick per retired-or-trapped step */
-    uint64_t mtimecmp;  /* hart 0 compare; MTIP asserted while mtime >= mtimecmp */
-    uint32_t msip;      /* hart 0 software interrupt pending (bit 0 only) */
+    uint64_t mtime;                        /* free-running counter, shared by all harts */
+    uint64_t mtimecmp[QUANTA_MAX_HARTS];   /* per-hart compare; MTIP while mtime >= it */
+    uint32_t msip[QUANTA_MAX_HARTS];       /* per-hart software interrupt (IPI; bit 0) */
 } Clint;
 
 typedef struct {
@@ -107,12 +116,21 @@ typedef struct {
     uint64_t size;
 } Disk;
 
+struct CPU; /* the harts, for cross-hart IPIs and LR/SC reservations (M19) */
+
 typedef struct Platform {
     Clint   clint;
     Uart    uart;
     Plic    plic;
     Virtio  virtio;
     Disk    disk;
+    /* The harts sharing this platform (M19): the engine points these at its hart
+     * array so the CLINT/atomics reach every hart. A store on any hart breaks the
+     * others' reservations here, and hart 0 is the boot hart. nharts is 1 on a
+     * uniprocessor, in which case harts may stay NULL (each hart owns its own
+     * reservation state). */
+    struct CPU *harts;
+    int      nharts;
     /* Guest RAM, for virtio DMA (the block device is a bus master). Set by
      * plat_attach_ram after the loader initialises memory; NULL disables DMA. */
     uint8_t *ram;
@@ -135,6 +153,11 @@ void plat_init(Platform *p);
  * against it: `ram[0]` maps to physical address `base`, spanning `size` bytes. */
 void plat_attach_ram(Platform *p, uint8_t *ram, uint64_t base, uint64_t size);
 
+/* Point the platform at the engine's hart array (M19): `harts[0..n)` are the
+ * harts, needed for cross-hart IPIs and LR/SC reservation breaking. n is 1 on a
+ * uniprocessor. */
+void plat_set_harts(Platform *p, struct CPU *harts, int n);
+
 /* Does `addr` fall in any device's MMIO window? The memory layer checks this
  * before its RAM range so device accesses are routed here. */
 int plat_contains(uint64_t addr);
@@ -156,9 +179,11 @@ void plat_tick(Platform *p);
  * retry). This is the host-input side of the console — the CLI feeds stdin here. */
 int plat_uart_rx(Platform *p, uint8_t byte);
 
-/* The interrupt-pending bits the platform drives (MTIP/MSIP/MEIP), to be merged
- * into mip. The CPU pulls this each step rather than the devices pushing it. */
-uint32_t plat_mip_bits(Platform *p);
+/* The interrupt-pending bits the platform drives for hart `hart` (its MTIP/MSIP
+ * from the CLINT, and MEIP/SEIP from its two PLIC contexts), to be merged into
+ * that hart's mip. The CPU pulls this each step rather than the devices pushing
+ * it. */
+uint32_t plat_mip_bits(Platform *p, uint32_t hart);
 
 /* Has the SiFive test device been written to request power-off? If so, returns 1
  * and stores the exit status in *code; the CPU then halts the machine (a device

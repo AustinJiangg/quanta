@@ -43,7 +43,9 @@ which **upstream xv6-riscv now boots to an interactive shell** on Quanta (built
 `rv64imac_zicsr`, `CPUS=1`; `ls` reads the virtio disk, processes run through
 Sv39), and — through real **OpenSBI** firmware (`--bios`/`--kernel`) plus a
 **cpio initramfs** (`--initrd`, `tests/linux/`) — **mainline Linux 6.6 now boots
-to an interactive userspace shell** — are implemented
+to an interactive userspace shell**, and **SMP multi-hart** (`--harts=N`, up to 8
+harts on a deterministic round-robin scheduler, M19) on which upstream **xv6 boots
+across 3 harts** — are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
@@ -86,6 +88,7 @@ make check-devices # check the MMIO devices and interrupt delivery (needs cross-
 make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-toolchain)
 make check-uart-rx # check UART receive (piped stdin) and the --disk backend (M18)
 make check-virtio  # check the virtio-mmio block device on a --disk image (M18)
+make check-smp     # check SMP: 4 harts, contended LR/SC, a CLINT IPI (M19)
 make check-os      # boot the M16 teaching kernel to userspace (needs cross-toolchain)
 make linux-initramfs # build the Linux initramfs (tests/linux/) for the OpenSBI->Linux boot (M18)
 make check-rv64    # RV64IMAC conformance (tests/rv64/), diff vs qemu-riscv64 (M17)
@@ -121,6 +124,9 @@ initramfs in RAM as the kernel's root filesystem (advertised via the DTB
 `--max-steps=N` (a count with an optional `K`/`M`/`G`/`T` suffix, `0` = no cap)
 to raise or remove the 100M-instruction runaway guard — an interactive
 full-system guest (a booting OS) legitimately runs billions of instructions. Add
+`--harts=N` (1..8) to model an SMP machine: N harts share the memory and devices,
+interleaved by a deterministic round-robin scheduler (M19); the direct ELF/image
+boot brings them all up, and xv6 boots on `--harts=3`. Add
 `--signature=FILE` to dump the
 architectural-test signature region (the words between the
 `begin_signature`/`end_signature` ELF symbols, in the suite's reference format) —
@@ -156,9 +162,11 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   MMIO: each `mem_read*`/`mem_write*` checks `plat_contains(addr)` first and
   dispatches device accesses to `device.c`, otherwise hits the flat RAM array.
 - `src/device.{h,c}` — the MMIO device models (M13): a CLINT (`mtime`/`mtimecmp`
-  timer + `msip` IPI), a PLIC (priority/enable/threshold + claim/complete, with a
-  per-hart **M-mode context 0 → MEIP** and **S-mode context 1 → SEIP** so an
-  S-mode OS routes device interrupts, M18), and a 16550 UART (transmit prints to
+  timer + `msip` IPI, both **per-hart arrays** on the qemu virt map so any hart
+  IPIs another and each has its own timer, M19), a PLIC (priority/enable/threshold
+  + claim/complete, with **per-hart contexts `2h`→MEIP / `2h+1`→SEIP** so an S-mode
+  OS routes device interrupts to the right hart, M18/M19; `plat_mip_bits(p, hart)`
+  is the per-hart pull), and a 16550 UART (transmit prints to
   stdout; receive via `plat_uart_rx`, which buffers a host byte and — with RX
   interrupts enabled — raises the UART's PLIC source, the input half of the
   console the CLI pumps stdin into, M18; its THR-empty interrupt is a one-shot
@@ -462,6 +470,18 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   source is the UART, the path a booting xv6's `virtio_disk_intr`/`uartintr`
   reach. Uses M-mode CSRs + MMIO, so it is quanta-only (excluded from the
   qemu-riscv64 differential like `*_priv`/`*_vm`/`*_sstc`).
+- `tests/rv64/test_rv64_smp.S` + `tests/check_smp.sh` — the M19 SMP test
+  (`make check-smp`, run with `--harts=4`): all four harts enter at the entry with
+  `a0`=hartid; each checks `mhartid`, does 500 LR/SC increments of one shared
+  counter (the round-robin scheduler makes sibling `sc` stores break a hart's
+  reservation mid-sequence, so the total must still be `4*500` — a broken
+  cross-hart reservation loses updates), and joins an `amoadd.d` barrier. Then
+  hart 0 verifies the total and sends hart 1 a CLINT IPI, taken as a real machine
+  software interrupt. A clean exit 0 means every stage passed; a non-zero code
+  (16/17/18) is the failing stage, written to the SiFive test finisher. Built
+  `-mno-relax` (like the virtio test — `la` on its in-RAM words must stay
+  PC-relative, gp is not the global pointer). Quanta-only, excluded from
+  `check-rv64`'s generic runner (`RV64_RUN`).
 - `tests/coverage.sh` — collects gcov line coverage after an instrumented build
   (`make coverage`): prefers lcov (HTML under `build/coverage`) and falls back to
   plain gcov. Observability only, like the cache/pipeline overlays.
@@ -896,6 +916,38 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   `build/linux/initramfs.cpio`) and `tests/linux/README.md` cover the build/boot;
   a few input bytes piped in before the console is up can race boot (a real user
   types after the prompt), but the interactive path is clean.
+- SMP multi-hart (M19, `--harts=N`): the machine models up to `QUANTA_MAX_HARTS`
+  (8) harts sharing one `Memory` and one `Platform`. Concurrency is **a single
+  host thread, round-robin** — the engine's `quanta_run`/`quanta_step` scheduler
+  steps `harts[0..nharts)` one instruction each in turn — so runs stay
+  deterministic (no host threads, no wall-clock races) while the guest still sees
+  real interleaving. Design points a future change must preserve: **(1)** the
+  shared `mtime` ticks **once per scheduler round** (when the round-robin cursor is
+  back at hart 0), not once per hart-step, so time advances at one rate whatever
+  the hart count — `plat_tick` moved out of `cpu_step` into the scheduler for this.
+  **(2)** Everything per-hart keys off `cpu->hartid`: the CLINT has `msip[h]`/
+  `mtimecmp[h]` arrays (a hart IPIs another by writing its `msip`), the PLIC has
+  contexts `2h`(M)/`2h+1`(S) driving that hart's MEIP/SEIP, and `plat_mip_bits(p,
+  hart)` / the trap path read them by id; `mhartid` and boot-time `a0` carry the
+  id. **(3)** Cross-hart LR/SC: a store on any hart voids every *other* hart's
+  reservation to that word — `break_reservation` sweeps `plat->harts` (the engine
+  points the platform at its hart array via `plat_set_harts`). A successful **`sc`
+  must break siblings too** (it was the one store path that didn't — a real bug the
+  SMP test caught). **(4)** The machine stops on a **global** power-off (SiFive
+  test / SBI SRST via the platform) or when **every** hart has halted
+  (`machine_poll_halt`); an abnormal hart reason is surfaced ahead of a clean exit
+  so a secondary crash is not masked. **(5)** Boot: the direct ELF/image path
+  (`setup_boot`) brings up all harts at the entry with `a0`=hartid (the qemu
+  `-bios none` convention — xv6 dispatches on it); the firmware `--bios` path parks
+  the secondaries (`halted=1`), because SMP under OpenSBI/Linux needs SBI HSM
+  `hart_start` and all harts entering the firmware, which is **future work**. The
+  DTB emits one `cpu@h` node per hart (phandle `PHANDLE_CPU_INTC(h)` = `16+h`) and
+  wires every hart into the CLINT/PLIC `interrupts-extended`; `DTB_MAX_SIZE` was
+  bumped to 4 KiB to hold 8 cpu nodes. `nharts==1` is byte-identical to the
+  pre-M19 uniprocessor (verified across the whole suite). Pinned by
+  `test_rv64_smp.S`/`make check-smp`, and xv6 boots `--harts=3` (a manual trophy,
+  like the single-hart xv6/Linux boots — the same `kernel/kernel` binary, since
+  xv6's `CPUS` is only a runtime qemu `-smp` flag and `NCPU`=8).
 - The JALR base/link ordering (the Linux-boot fix, and a real correctness bug):
   `exec`'s `OP_JALR` must compute the target from `rs1` **before** writing the
   link register `rd = pc + ilen`, because `rd` can alias `rs1`. The `call`

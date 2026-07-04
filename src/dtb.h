@@ -4,6 +4,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Max harts described (SMP, M19). Canonical definition in quanta.h; guarded here
+ * so dtb.c (which includes only this header) can size its interrupt arrays. */
+#ifndef QUANTA_MAX_HARTS
+#define QUANTA_MAX_HARTS 8u
+#endif
+
 /*
  * Flattened device tree (FDT) generation (M14).
  *
@@ -39,6 +45,7 @@ typedef struct {
     uint32_t uart_irq;        /* UART's PLIC source number                       */
     uint32_t plic_ndev;       /* highest PLIC source (riscv,ndev)                 */
     uint32_t boot_hart;       /* boot hart id (a0, and boot_cpuid_phys)          */
+    uint32_t nharts;          /* number of harts to describe (>=1; SMP, M19)     */
     uint32_t timebase_freq;   /* /cpus timebase-frequency (informational)        */
     const char *isa;          /* cpu@0 riscv,isa string, e.g. "rv32ima_zicsr"    */
     const char *mmu_type;     /* cpu@0 mmu-type, e.g. "riscv,sv32" / "riscv,none" */
@@ -47,9 +54,10 @@ typedef struct {
     uint32_t initrd_end;      /* firmware placed in RAM); both 0 = no initrd        */
 } DtbConfig;
 
-/* A comfortable upper bound on the blob this builder emits; the fixed tree is
- * well under 1 KiB. Callers can size a stack buffer with this. */
-#define DTB_MAX_SIZE 2048u
+/* A comfortable upper bound on the blob this builder emits; a uniprocessor tree
+ * is well under 1 KiB, and a full QUANTA_MAX_HARTS SMP tree (one cpu node each)
+ * still fits here. Callers can size a stack buffer with this. */
+#define DTB_MAX_SIZE 4096u
 
 /* Serialise the device tree for `cfg` into `buf` (capacity `cap`). Returns the
  * number of bytes written, or 0 if anything would not fit (the caller can then

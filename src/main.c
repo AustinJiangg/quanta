@@ -23,7 +23,7 @@
  *
  * Usage:
  *   quanta [--version] [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]]
- *          [--pipeline] [--memory=SIZE] [--max-steps=N] [--gdb[=PORT]] [--signature=FILE]
+ *          [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] [--gdb[=PORT]] [--signature=FILE]
  *          [--disk=FILE] [--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]]
  *          [program.elf]
  *
@@ -358,6 +358,7 @@ int main(int argc, char **argv) {
     const char *kernel = NULL;  /* --kernel=FILE: raw S-mode OS image (Linux Image) */
     const char *append = NULL;  /* --append=STRING: kernel command line (DTB bootargs) */
     const char *initrd = NULL;  /* --initrd=FILE: cpio initramfs (the kernel's rootfs) */
+    int nharts = 1;             /* --harts=N: number of harts for SMP (M19) */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
             printf("quanta %s\n", quanta_version());
@@ -434,10 +435,17 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--initrd needs a file path\n");
                 return 2;
             }
+        } else if (strncmp(argv[i], "--harts=", 8) == 0) {
+            if (sscanf(argv[i] + 8, "%d", &nharts) != 1 ||
+                nharts < 1 || nharts > (int)QUANTA_MAX_HARTS) {
+                fprintf(stderr, "bad --harts '%s' (want 1..%u)\n",
+                        argv[i] + 8, QUANTA_MAX_HARTS);
+                return 2;
+            }
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
-                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--max-steps=N] "
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] "
                     "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] "
                     "[--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]] "
                     "[program.elf]\n",
@@ -447,7 +455,7 @@ int main(int argc, char **argv) {
             path = argv[i];
         } else {
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
-                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--max-steps=N] "
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] "
                     "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] "
                     "[--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]] "
                     "[program.elf]\n",
@@ -460,6 +468,13 @@ int main(int argc, char **argv) {
     if (!q) {
         fprintf(stderr, "failed to allocate emulator\n");
         return 1;
+    }
+
+    /* Configure SMP before loading, so the boot handoff brings up every hart. */
+    if (quanta_set_harts(q, nharts) != QUANTA_OK) {
+        fprintf(stderr, "failed to configure %d harts\n", nharts);
+        quanta_destroy(q);
+        return 2;
     }
 
     /* --bios selects the firmware boot path: an M-mode firmware (OpenSBI) that

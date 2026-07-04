@@ -57,7 +57,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-smp check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -163,9 +163,10 @@ $(KOS_ELF): $(KOS_SRC) tests/os/kernel.ld
 # against qemu-riscv64.
 RV64_SRC := $(wildcard tests/rv64/*.S)
 RV64_ELF := $(RV64_SRC:.S=.elf)
-# The virtio test needs a --disk image, so it runs under check-virtio rather than
-# the generic exit-0/differential runner; build it, but keep it out of that list.
-RV64_RUN := $(filter-out tests/rv64/test_rv64_virtio.elf,$(RV64_ELF))
+# The virtio test needs a --disk image and the SMP test needs --harts, so they
+# run under their own targets (check-virtio, check-smp) rather than the generic
+# exit-0/differential runner; build them, but keep them out of that list.
+RV64_RUN := $(filter-out tests/rv64/test_rv64_virtio.elf tests/rv64/test_rv64_smp.elf,$(RV64_ELF))
 RV64FLAGS := -march=rv64imac_zicsr -mabi=lp64 -nostdlib -nostartfiles \
              -Ttext=0x80000000 -Itests
 
@@ -185,6 +186,11 @@ tests/rv64/test_rv64_priv.elf: RV64FLAGS := $(subst rv64imac_zicsr,rv64ima_zicsr
 # — so relaxed addresses would be garbage. Disable relaxation to keep `la`
 # PC-relative (auipc+addi) and gp-independent.
 tests/rv64/test_rv64_virtio.elf: RV64FLAGS += -mno-relax
+
+# The SMP test takes the address of its in-RAM shared words (counter/barrier/flag)
+# and its IPI handler with `la`, and sets no global pointer — so like the virtio
+# test it must keep `la` PC-relative, not have it relaxed to a gp-relative load.
+tests/rv64/test_rv64_smp.elf: RV64FLAGS += -mno-relax
 
 # Run the RV32I conformance suite (tests/test_*.S) through the emulator. Each
 # test exits 0 on success or the number of its first failed check, which quanta
@@ -284,6 +290,14 @@ check-rv64: $(BIN) $(RV64_ELF)
 check-virtio: $(BIN) tests/rv64/test_rv64_virtio.elf
 	@sh tests/check_virtio.sh
 
+# Exercise SMP (M19): boot the multi-hart test with --harts=4 and assert a clean
+# exit 0 — every hart saw its own mhartid, the contended LR/SC counter reached
+# NHARTS*ITERS with no lost updates, and a CLINT IPI was delivered hart-to-hart.
+# Quanta-only (machine-mode + multi-hart + MMIO); a non-zero exit is the failing
+# stage's id.
+check-smp: $(BIN) tests/rv64/test_rv64_smp.elf
+	@sh tests/check_smp.sh
+
 # Differential test: compare quanta against a reference simulator (qemu-riscv32
 # by default; override with REF=...) on the sample programs. Skips cleanly if
 # the reference simulator is not installed.
@@ -321,7 +335,7 @@ sanitize:
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
 		check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio \
-		check-os check-rv64 check-diff
+		check-smp check-os check-rv64 check-diff
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
 # the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`
@@ -352,7 +366,7 @@ COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
 
 coverage:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-os
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-smp check-os
 	@sh tests/coverage.sh
 
 # Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),

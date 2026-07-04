@@ -942,14 +942,48 @@ down cleanly. `make linux-initramfs` builds the image; see `tests/linux/README.m
   `feat: add virtio-mmio block device`, `feat: boot xv6-riscv`,
   `feat: boot linux under opensbi`, `feat: boot linux to a userspace shell`.
 
-## M19 — SMP multi-hart (stretch)
+## M19 — SMP multi-hart (DONE)
 
-- [ ] **Build:** multiple harts with CLINT IPIs, exercising the M10 atomics
+Quanta now models up to `QUANTA_MAX_HARTS` (8) harts sharing one memory and one
+platform, chosen with `--harts=N`. Concurrency is modelled deterministically: a
+single-threaded round-robin scheduler in the engine interleaves the harts one
+instruction at a time, so runs stay reproducible (no host threads, no wall-clock
+nondeterminism) while still exposing real interleaving to the guest. The pieces:
+
+- **Per-hart CLINT** — `msip[h]`/`mtimecmp[h]` arrays on the qemu virt map, so a
+  hart IPIs another by writing its `msip` and each hart has its own timer compare;
+  the shared `mtime` ticks once per scheduler round (one rate regardless of hart
+  count).
+- **Per-hart PLIC contexts** — context `2h`/`2h+1` drive hart `h`'s MEIP/SEIP, so
+  external interrupts route to the right hart's M- or S-mode.
+- **Per-hart interrupt state** — `plat_mip_bits(p, hart)` and the trap path key
+  off `cpu->hartid`; `mhartid` reads the hart's id, delivered in `a0` at boot.
+- **Cross-hart atomics** — a store on any hart (a plain store, an AMO, *or a
+  successful `sc`*) voids every other hart's LR/SC reservation to that word — the
+  contention LR/SC exists to handle. Fixing the `sc` case (it was clearing only
+  its own reservation) was a real correctness bug the SMP test caught.
+- **Boot** — the direct ELF/image path brings up every hart at the entry with
+  `a0`=hartid (the qemu `-bios none` convention), so an SMP guest dispatches on
+  `mhartid`. (The firmware `--bios` path parks the secondaries; SMP Linux under
+  OpenSBI, which needs SBI HSM `hart_start`, is future work.)
+- **Device tree** — one `cpu@h` node per hart with its own interrupt-controller
+  phandle, and CLINT/PLIC `interrupts-extended` wiring every hart.
+
+Pinned by `tests/rv64/test_rv64_smp.S` + `make check-smp`: four harts each verify
+their `mhartid`, hammer one shared counter with LR/SC under contention (the total
+must land at `NHARTS*ITERS` with no lost updates — a broken reservation loses
+some), sync on a barrier, and pass a CLINT IPI hart-to-hart as a real machine
+software interrupt. And the trophy: **upstream xv6-riscv boots SMP** (`--harts=3`)
+to its shell — `hart 1 starting` / `hart 2 starting`, processes scheduled across
+harts, spinlocks (its atomics) correct under the interleaving.
+
+- [x] **Build:** multiple harts with CLINT IPIs, exercising the M10 atomics
   under real contention.
-- [ ] **ISA:** none new — multi-hart coordination.
-- [ ] **Concept:** shared memory, memory ordering, and inter-hart interrupts.
-- [ ] **Done when:** an SMP guest boots and schedules across harts.
-- [ ] **Commits:** `feat: add smp multi-hart support`.
+- [x] **ISA:** none new — multi-hart coordination.
+- [x] **Concept:** shared memory, memory ordering, and inter-hart interrupts.
+- [x] **Done when:** an SMP guest boots and schedules across harts — the SMP
+  conformance test passes and xv6-riscv boots to its shell on 3 harts.
+- [x] **Commits:** `feat: add smp multi-hart support`.
 
 ## How to use this roadmap
 

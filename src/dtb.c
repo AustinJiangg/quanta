@@ -36,9 +36,11 @@
 #define RSVMAP_SIZE     16u                       /* one terminating (0,0) entry */
 #define STRUCT_OFF      (HEADER_SIZE + RSVMAP_SIZE) /* 56: 8-aligned, 4-aligned  */
 
-/* phandle ids referenced by the interrupt wiring (any nonzero unique values). */
-#define PHANDLE_CPU_INTC 1u  /* the hart's local interrupt controller */
-#define PHANDLE_PLIC     2u  /* the platform-level interrupt controller */
+/* phandle ids referenced by the interrupt wiring (any nonzero unique values).
+ * Each hart's local interrupt controller gets its own phandle, from a base high
+ * enough not to collide with the PLIC's (SMP, M19). */
+#define PHANDLE_PLIC     2u          /* the platform-level interrupt controller */
+#define PHANDLE_CPU_INTC(h) (16u + (h))  /* hart h's local interrupt controller */
 
 /* Builder state. The struct block is written into out[STRUCT_OFF..]; strings
  * accumulate in a side buffer until finalisation. `ok` latches to 0 on the
@@ -183,26 +185,29 @@ size_t dtb_build(uint8_t *buf, size_t cap, const DtbConfig *cfg) {
     }
     end_node(&f);
 
-    /* /cpus — one hart, with its local interrupt controller. */
+    /* /cpus — one node per hart, each with its local interrupt controller. */
+    uint32_t nharts = cfg->nharts ? cfg->nharts : 1;
     begin_node(&f, "cpus");
     prop_u32(&f, "#address-cells", 1);
     prop_u32(&f, "#size-cells", 0);
     prop_u32(&f, "timebase-frequency", cfg->timebase_freq);
-    snprintf(unit, sizeof unit, "cpu@%x", cfg->boot_hart);
-    begin_node(&f, unit);
-    prop_str(&f, "device_type", "cpu");
-    prop_u32(&f, "reg", cfg->boot_hart);
-    prop_str(&f, "status", "okay");
-    prop_str(&f, "compatible", "riscv");
-    prop_str(&f, "riscv,isa", cfg->isa);
-    prop_str(&f, "mmu-type", cfg->mmu_type);
-    begin_node(&f, "interrupt-controller");
-    prop_u32(&f, "#interrupt-cells", 1);
-    prop_empty(&f, "interrupt-controller");
-    prop_str(&f, "compatible", "riscv,cpu-intc");
-    prop_u32(&f, "phandle", PHANDLE_CPU_INTC);
-    end_node(&f);  /* interrupt-controller */
-    end_node(&f);  /* cpu@0 */
+    for (uint32_t h = 0; h < nharts; h++) {
+        snprintf(unit, sizeof unit, "cpu@%x", h);
+        begin_node(&f, unit);
+        prop_str(&f, "device_type", "cpu");
+        prop_u32(&f, "reg", h);
+        prop_str(&f, "status", "okay");
+        prop_str(&f, "compatible", "riscv");
+        prop_str(&f, "riscv,isa", cfg->isa);
+        prop_str(&f, "mmu-type", cfg->mmu_type);
+        begin_node(&f, "interrupt-controller");
+        prop_u32(&f, "#interrupt-cells", 1);
+        prop_empty(&f, "interrupt-controller");
+        prop_str(&f, "compatible", "riscv,cpu-intc");
+        prop_u32(&f, "phandle", PHANDLE_CPU_INTC(h));
+        end_node(&f);  /* interrupt-controller */
+        end_node(&f);  /* cpu@h */
+    }
     end_node(&f);  /* cpus */
 
     /* /memory@<base> — the RAM the loader gave this machine. */
@@ -219,24 +224,36 @@ size_t dtb_build(uint8_t *buf, size_t cap, const DtbConfig *cfg) {
     prop_str(&f, "compatible", "simple-bus");
     prop_empty(&f, "ranges");
 
-    /* CLINT: machine software (IPI, irq 3) and timer (irq 7) into the hart. */
+    /* Each hart contributes a (phandle, cause) pair to the interrupt controllers'
+     * `interrupts-extended`: the CLINT wires each hart's software (3) and timer
+     * (7) lines, the PLIC each hart's machine-external (11) and supervisor-external
+     * (9) lines. Sized for the worst case (all harts) — well under DTB_MAX_SIZE. */
+    uint32_t irqs[4 * QUANTA_MAX_HARTS];
+
+    /* CLINT: machine software (IPI, irq 3) and timer (irq 7) into each hart. */
     snprintf(unit, sizeof unit, "clint@%x", cfg->clint_base);
     begin_node(&f, unit);
     prop_str(&f, "compatible", "riscv,clint0");
     prop_reg(&f, cfg->clint_base, cfg->clint_size);
-    uint32_t clint_irqs[4] = { PHANDLE_CPU_INTC, 3, PHANDLE_CPU_INTC, 7 };
-    prop_cells(&f, "interrupts-extended", clint_irqs, 4);
+    for (uint32_t h = 0; h < nharts; h++) {
+        irqs[4 * h + 0] = PHANDLE_CPU_INTC(h); irqs[4 * h + 1] = 3;
+        irqs[4 * h + 2] = PHANDLE_CPU_INTC(h); irqs[4 * h + 3] = 7;
+    }
+    prop_cells(&f, "interrupts-extended", irqs, 4 * nharts);
     end_node(&f);
 
-    /* PLIC: external interrupts, machine (irq 11) and supervisor (irq 9). */
+    /* PLIC: external interrupts, machine (irq 11) and supervisor (irq 9) per hart. */
     snprintf(unit, sizeof unit, "plic@%x", cfg->plic_base);
     begin_node(&f, unit);
     prop_str(&f, "compatible", "riscv,plic0");
     prop_reg(&f, cfg->plic_base, cfg->plic_size);
     prop_u32(&f, "#interrupt-cells", 1);
     prop_empty(&f, "interrupt-controller");
-    uint32_t plic_irqs[4] = { PHANDLE_CPU_INTC, 11, PHANDLE_CPU_INTC, 9 };
-    prop_cells(&f, "interrupts-extended", plic_irqs, 4);
+    for (uint32_t h = 0; h < nharts; h++) {
+        irqs[4 * h + 0] = PHANDLE_CPU_INTC(h); irqs[4 * h + 1] = 11;
+        irqs[4 * h + 2] = PHANDLE_CPU_INTC(h); irqs[4 * h + 3] = 9;
+    }
+    prop_cells(&f, "interrupts-extended", irqs, 4 * nharts);
     prop_u32(&f, "riscv,ndev", cfg->plic_ndev);
     prop_u32(&f, "phandle", PHANDLE_PLIC);
     end_node(&f);
