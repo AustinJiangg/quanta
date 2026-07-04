@@ -42,6 +42,7 @@ typedef struct {
     uint32_t timebase_freq;   /* /cpus timebase-frequency (informational)        */
     const char *isa;          /* cpu@0 riscv,isa string, e.g. "rv32ima_zicsr"    */
     const char *mmu_type;     /* cpu@0 mmu-type, e.g. "riscv,sv32" / "riscv,none" */
+    const char *bootargs;     /* /chosen bootargs (kernel command line); "" if none */
 } DtbConfig;
 
 /* A comfortable upper bound on the blob this builder emits; the fixed tree is

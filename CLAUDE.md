@@ -842,8 +842,38 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   S-mode OS calls — Quanta just has to be a correct M-mode machine, which it
   already was (no CSR/instruction gaps surfaced). `tests/opensbi_payload.S` +
   `make check-opensbi` pin the round trip (S-mode → SBI console → SBI SRST →
-  clean exit). Next: a Linux `Image` in place of the payload (Stage C), which
-  needs a richer DTB (`bootargs`/`chosen`, and possibly F/D `sstatus.FS` handling).
+  clean exit).
+- Booting Linux (M18, the mainstream-distro trophy): a mainline **Linux 6.6**
+  `Image` boots on Quanta through OpenSBI to userspace launch (PID 1), panicking
+  only for lack of a rootfs — `Machine model: quanta,virt`, SBI up, `earlycon` on
+  the UART, Sv39 paging, memory zones all printed. Build it rv64imac (Quanta has
+  no F/D/V): from a defconfig kernel, `scripts/config -d FPU -d RISCV_ISA_V
+  -d RISCV_ISA_ZICBOM -d RISCV_ISA_ZICBOZ` then `olddefconfig` (our DTB advertises
+  only `rv64imac_zicsr`, so the kernel's runtime probes stay off those). Build
+  with a **linux-gnu** toolchain (`CROSS_COMPILE=riscv64-linux-gnu-`), not the
+  bare-metal newlib one — the newlib linker cannot `-shared` the kernel's VDSO.
+  Run `quanta --bios=<opensbi-fw_dynamic> --kernel=Image --memory=256M
+  --max-steps=0 --append="earlycon=uart8250,mmio,0x10000000 console=ttyS0"`. The
+  `--append` flag sets the kernel command line via the DTB `/chosen` bootargs
+  (see dtb.c's `bootargs`). No `make` target boots it (external kernel, long run),
+  like xv6. The single Quanta change it needed beyond the OpenSBI path was the
+  **JALR far-call fix** below — everything else (Sv39, SBI-via-OpenSBI, the
+  devices) already worked. Next: an initramfs (a hand-written static init making
+  raw Linux syscalls, no libc, since only a bare-metal userspace toolchain is to
+  hand) for a real userspace shell.
+- The JALR base/link ordering (the Linux-boot fix, and a real correctness bug):
+  `exec`'s `OP_JALR` must compute the target from `rs1` **before** writing the
+  link register `rd = pc + ilen`, because `rd` can alias `rs1`. The `call`
+  pseudo-op a linker emits for a target beyond a single `jal`'s reach is
+  `auipc ra,hi; jalr ra,lo(ra)` — `rd == rs1 == ra` — so writing the link first
+  clobbers the base and jumps to `pc + ilen + imm` (garbage). It is invisible to
+  small binaries: the linker relaxes every in-range `call` to a bare `jal`, so a
+  `rd==rs1` JALR only appears for calls spanning more than ~2 MiB. That is why the
+  conformance suite, OpenSBI (322 KiB), and xv6 all passed while a 22 MiB Linux
+  kernel's cross-section calls (e.g. `_start_kernel` → `setup_vm`) jumped to
+  garbage — so `setup_vm`/`set_satp_mode` silently never ran, paging stayed off,
+  and the kernel parked before printing a byte. Pinned by an `rd==rs1` case in
+  `tests/test_jumps.S` (fails on the old code; qemu-checked under `check-diff`).
 - SiFive test finisher device (M18, the clean-shutdown enabler): OpenSBI's SRST
   and Linux's poweroff/reboot need a hardware reset device. `device.c` models the
   qemu `virt` one at **0x100000** (`TEST_BASE`): a 32-bit write of `0x5555`

@@ -24,12 +24,13 @@
  * Usage:
  *   quanta [--version] [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]]
  *          [--pipeline] [--memory=SIZE] [--max-steps=N] [--gdb[=PORT]] [--signature=FILE]
- *          [--disk=FILE] [--bios=FILE --kernel=FILE] [program.elf]
+ *          [--disk=FILE] [--bios=FILE --kernel=FILE [--append=STRING]] [program.elf]
  *
  * --bios (an M-mode firmware ELF, e.g. OpenSBI) with --kernel (a raw S-mode OS
  * image, e.g. a Linux Image) boots the way a real machine does: the firmware runs
- * first and hands off to the OS in S-mode. Without --bios, a program.elf is run
- * directly in M-mode (Quanta acting as the SEE/SBI).
+ * first and hands off to the OS in S-mode. --append sets the kernel command line
+ * (the device tree's /chosen bootargs), e.g. "earlycon=sbi console=ttyS0". Without
+ * --bios, a program.elf is run directly in M-mode (Quanta acting as the SEE/SBI).
  *
  * A running guest can take console input: host stdin is pumped into the UART's
  * receive path during the run, so a full-system guest has a keyboard. When stdin
@@ -353,6 +354,7 @@ int main(int argc, char **argv) {
     const char *diskpath = NULL; /* --disk=FILE: raw block-device backing image */
     const char *bios = NULL;    /* --bios=FILE: M-mode firmware ELF (OpenSBI) */
     const char *kernel = NULL;  /* --kernel=FILE: raw S-mode OS image (Linux Image) */
+    const char *append = NULL;  /* --append=STRING: kernel command line (DTB bootargs) */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
             printf("quanta %s\n", quanta_version());
@@ -421,12 +423,14 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--kernel needs an OS image path\n");
                 return 2;
             }
+        } else if (strncmp(argv[i], "--append=", 9) == 0) {
+            append = argv[i] + 9;   /* kernel command line (may be empty) */
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--max-steps=N] "
                     "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] "
-                    "[--bios=FILE --kernel=FILE] [program.elf]\n",
+                    "[--bios=FILE --kernel=FILE [--append=STRING]] [program.elf]\n",
                     argv[0]);
             return 2;
         } else if (path == NULL) {
@@ -435,7 +439,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--max-steps=N] "
                     "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] "
-                    "[--bios=FILE --kernel=FILE] [program.elf]\n",
+                    "[--bios=FILE --kernel=FILE [--append=STRING]] [program.elf]\n",
                     argv[0]);
             return 2;
         }
@@ -465,7 +469,7 @@ int main(int argc, char **argv) {
      * image, and the loader prints its own diagnostics on failure. */
     int demo = (path == NULL && bios == NULL);
     QuantaStatus st = bios
-        ? quanta_load_firmware(q, bios, kernel, mem_req)
+        ? quanta_load_firmware(q, bios, kernel, append, mem_req)
         : demo
         ? quanta_load_image(q, MEM_BASE, MEM_SIZE,
                             demo_program, sizeof demo_program, MEM_BASE)

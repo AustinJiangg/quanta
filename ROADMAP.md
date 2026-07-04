@@ -896,9 +896,18 @@ SBI SRST — which needed a **SiFive test finisher** device (0x100000) for clean
 shutdown. Quanta's own `sbi.c` is bypassed on this path: OpenSBI is the SBI, so
 Quanta only has to be a correct M-mode machine, which it already was (no CSR or
 instruction gaps surfaced). `tests/opensbi_payload.S` + `make check-opensbi` pin
-it. **Next:** swap the payload for a Linux `Image` — needing a richer DTB
-(`chosen`/`bootargs`, `earlycon`) and whatever S-mode/FPU (`sstatus.FS`) gaps a
-distro kernel surfaces, then an initramfs for a userspace shell.
+it. **And it works:** a mainline **Linux 6.6** `Image` (built rv64imac, no
+float/vector) boots on Quanta through OpenSBI all the way to userspace launch —
+SBI brought up (TIME/IPI/RFENCE/SRST/HSM), console via `earlycon`, Sv39 paging,
+memory zones, `Machine model: quanta,virt`, PID 1 — panicking only at "unable to
+mount root fs" with no rootfs. Reaching it took the new `--append` kernel-cmdline
+flag and, decisively, **one genuine CPU bug fix**: JALR wrote its link register
+before computing the target from the base, so a `jalr rd,off(rd)` (`rd == rs1`,
+the far-`call` thunk a linker emits beyond ~2 MiB) jumped to garbage — invisible
+to xv6/OpenSBI/the suite (all small enough to relax every call to `jal`), fatal to
+a 22 MiB kernel whose cross-section calls broke, so paging silently never came up.
+**Next:** an initramfs (a hand-written static init making raw Linux syscalls, no
+libc) for a userspace shell.
 
 - [x] **Build (paging):** the three-level Sv39 page-table scheme (a
   descriptor-parameterised generalisation of the Sv32 walk).
@@ -906,10 +915,11 @@ distro kernel surfaces, then an initramfs for a userspace shell.
   `--disk` backend, the virtio-mmio block device, the PLIC S-mode context/SEIP,
   the UART THRE one-shot, `--max-steps`, and the full-XLEN branch fix — xv6 boots
   to its shell.
-- [ ] **Build (Linux):** boot Linux under OpenSBI. *Done:* the `--bios`/`--kernel`
-  firmware-boot path, the fw_dynamic handoff, the DTB-headroom placement, and the
-  SiFive test device — OpenSBI v1.3 boots and hands off to an S-mode payload.
-  *Next:* a real Linux `Image` (richer DTB + initramfs).
+- [x] **Build (Linux):** boot Linux under OpenSBI. *Done:* the `--bios`/`--kernel`
+  firmware-boot path, the fw_dynamic handoff, the DTB-headroom placement, the
+  SiFive test device, the `--append` kernel cmdline, and the JALR far-call fix —
+  **Linux 6.6 boots to userspace launch** (panics only for lack of a rootfs).
+  *Next:* an initramfs for a userspace shell.
 - [x] **ISA:** Sv39 address translation; Sstc (`stimecmp`/`menvcfg.STCE`).
 - [x] **Concept:** deeper page-table hierarchies; a real distro's boot
   requirements.

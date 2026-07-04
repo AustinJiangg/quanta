@@ -91,8 +91,8 @@ static void start_at(Quanta *q, uint64_t entry, int xlen) {
 
 /* Describe this machine for the device-tree builder. Shared by both boot
  * handoffs (Quanta-as-firmware in setup_boot, and an M-mode firmware payload in
- * setup_firmware_boot). */
-static void dtb_config(const Quanta *q, DtbConfig *cfg) {
+ * setup_firmware_boot). `bootargs` is the kernel command line (NULL for none). */
+static void dtb_config(const Quanta *q, DtbConfig *cfg, const char *bootargs) {
     int rv64 = (q->cpu.xlen == 64);
     cfg->mem_base   = (uint32_t)q->mem.base; cfg->mem_size = (uint32_t)q->mem.size;
     cfg->test_base  = TEST_BASE;     cfg->test_size  = TEST_SIZE;
@@ -101,6 +101,7 @@ static void dtb_config(const Quanta *q, DtbConfig *cfg) {
     cfg->uart_base  = UART_BASE;     cfg->uart_size  = UART_SIZE;
     cfg->uart_irq   = UART_IRQ;      cfg->plic_ndev  = PLIC_NSOURCES - 1;
     cfg->boot_hart  = 0;             cfg->timebase_freq = 10000000;
+    cfg->bootargs   = bootargs;
     /* RV64 now walks Sv39 (M18); RV32 uses Sv32. */
     cfg->isa      = rv64 ? "rv64imac_zicsr" : "rv32ima_zicsr_zifencei";
     cfg->mmu_type = rv64 ? "riscv,sv39"     : "riscv,sv32";
@@ -115,7 +116,7 @@ static void dtb_config(const Quanta *q, DtbConfig *cfg) {
  * fit, we leave start_at's plain entry state untouched (a0/a1 = 0). */
 static void setup_boot(Quanta *q) {
     DtbConfig cfg;
-    dtb_config(q, &cfg);
+    dtb_config(q, &cfg, NULL);
 
     uint8_t blob[DTB_MAX_SIZE];
     size_t n = dtb_build(blob, sizeof blob, &cfg);
@@ -152,9 +153,9 @@ static void setup_boot(Quanta *q) {
 #define FW_PRV_S           1ull           /* next_mode = Supervisor     */
 #define FW_DTB_HEADROOM    0x200000ull    /* 2 MiB above the DTB to grow */
 
-static int setup_firmware_boot(Quanta *q, uint64_t next_addr) {
+static int setup_firmware_boot(Quanta *q, uint64_t next_addr, const char *bootargs) {
     DtbConfig cfg;
-    dtb_config(q, &cfg);
+    dtb_config(q, &cfg, bootargs);
 
     uint8_t blob[DTB_MAX_SIZE];
     size_t n = dtb_build(blob, sizeof blob, &cfg);
@@ -206,7 +207,8 @@ static QuantaStatus load_raw_file(Quanta *q, const char *path, uint64_t addr) {
 #define KERNEL_LOAD_OFFSET 0x200000ull
 
 QuantaStatus quanta_load_firmware(Quanta *q, const char *bios_path,
-                                  const char *kernel_path, uint32_t min_mem) {
+                                  const char *kernel_path, const char *bootargs,
+                                  uint32_t min_mem) {
     if (!q || !bios_path || !kernel_path) return QUANTA_ERR_INVAL;
 
     uint64_t entry;
@@ -218,7 +220,7 @@ QuantaStatus quanta_load_firmware(Quanta *q, const char *bios_path,
     QuantaStatus st = load_raw_file(q, kernel_path, kaddr);
     if (st != QUANTA_OK) return st;
 
-    if (setup_firmware_boot(q, kaddr) != 0) return QUANTA_ERR_LOAD;
+    if (setup_firmware_boot(q, kaddr, bootargs) != 0) return QUANTA_ERR_LOAD;
     return QUANTA_OK;
 }
 

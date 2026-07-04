@@ -9,6 +9,18 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **Boot Linux under OpenSBI** — a mainline **Linux 6.6** kernel (built rv64imac,
+  no float/vector) boots on Quanta all the way to userspace launch: OpenSBI hands
+  off to the kernel, which brings up SBI (TIME/IPI/RFENCE/SRST/HSM), the console,
+  Sv39 paging, memory zones, and reaches PID 1 — panicking only at "unable to
+  mount root fs" with no rootfs attached. `Machine model: quanta,virt`. Run it
+  with `quanta --bios=<opensbi-fw_dynamic> --kernel=Image --memory=256M
+  --max-steps=0 --append="earlycon=uart8250,mmio,0x10000000 console=ttyS0"`. The
+  new **`--append=STRING`** flag sets the kernel command line (the device tree's
+  `/chosen` bootargs). Getting here surfaced one genuine CPU bug — the JALR
+  base/link ordering (see Fixed) — that only a binary large enough to need far
+  `call` thunks exercises. Like xv6, it is a manual milestone (external kernel,
+  long runs); no `make` target boots it. (M18)
 - **OpenSBI firmware boot (`--bios` / `--kernel`)** — Quanta can now boot the way
   a real RISC-V machine does: a real M-mode firmware runs first and hands off to
   an S-mode OS. `quanta --bios=FILE --kernel=FILE` (via the new
@@ -168,6 +180,18 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
   `quanta_gdb_serve()` in a new `gdbstub.h`. Verified end to end by `make
   check-gdb` with a self-contained RSP client (no riscv `gdb` required), and run
   under the sanitizer and coverage builds. (E9)
+
+### Fixed
+
+- **JALR clobbered its base when the link register aliased it** — `OP_JALR` wrote
+  the link (`rd = pc + ilen`) before computing the target from `rs1`, so a
+  `jalr rd, off(rd)` with `rd == rs1` jumped to `pc + ilen + off` instead of the
+  intended address. That is exactly the `call` far-thunk a linker emits
+  (`auipc ra,hi; jalr ra,lo(ra)`) when a call is too far for a single `jal`, so it
+  only bites binaries larger than a couple of MiB — which is why the conformance
+  suite, OpenSBI, and xv6 were unaffected but a 22 MiB Linux kernel jumped to
+  garbage on its cross-section calls. The target is now read before the link is
+  written; pinned by an `rd == rs1` case in `test_jumps.S`.
 
 ## [0.1.0] - 2026-06-28
 

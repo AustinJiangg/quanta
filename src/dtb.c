@@ -171,7 +171,7 @@ size_t dtb_build(uint8_t *buf, size_t cap, const DtbConfig *cfg) {
     /* /chosen — where the kernel finds its console and command line. */
     begin_node(&f, "chosen");
     prop_str(&f, "stdout-path", "/soc/uart@10000000");
-    prop_str(&f, "bootargs", "");
+    prop_str(&f, "bootargs", cfg->bootargs ? cfg->bootargs : "");
     end_node(&f);
 
     /* /cpus — one hart, with its local interrupt controller. */
