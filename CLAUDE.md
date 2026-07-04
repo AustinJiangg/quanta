@@ -78,6 +78,7 @@ make check-disasm  # cross-check the disassembler against objdump (needs cross-t
 make check-cache   # check the cache model on a locality workload (needs cross-toolchain)
 make check-pipeline # check the pipeline model on a hazard workload (needs cross-toolchain)
 make check-gdb     # drive the gdb remote stub with a self-contained client (needs python3)
+make check-console # exercise the raw-mode interactive console over a pty (needs python3 + cross-toolchain)
 make check-devices # check the MMIO devices and interrupt delivery (needs cross-toolchain)
 make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-toolchain)
 make check-uart-rx # check UART receive (piped stdin) and the --disk backend (M18)
@@ -119,8 +120,10 @@ architectural-test signature region (the words between the
 what makes Quanta a drop-in `make check-arch` target. While a guest runs, host
 stdin is pumped into the UART's receive path (checked by a zero-timeout `select`,
 so the shared stdin flags are never mutated), giving a full-system guest a
-keyboard; the terminal is left in its normal (cooked, echoing) mode for now —
-proper raw mode is deferred to the interactive-console work.
+keyboard; when stdin is a terminal the run puts it in raw mode (mirroring qemu's
+`-nographic` console: character-at-a-time, no host echo, signal/flow-control keys
+delivered to the guest, `Ctrl-A x` to quit) and restores it on any exit path,
+while a pipe or file is read verbatim.
 
 Debugging the emulator: `make debug && gdb ./quanta`. Note the two-level
 structure — gdb debugs the emulator (x86), which internally "runs" a RISC-V
@@ -271,10 +274,11 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   the `--trace` narration, the `--pipeline`/`--cache` overlays, the `--gdb` stub
   hand-off, the `--signature` arch-test dump, `--disk` attachment, the
   `--max-steps` runaway cap (0 = uncapped, for a booting OS), and the console
-  input pump (host stdin → the UART, via a zero-timeout `select`) — all driving
-  the machine through the public API (no engine internals). Its own POSIX
-  feature macro is local to the file, mirroring `gdbstub.c`. Loads an ELF named
-  on the command line, or runs the built-in demo when none is given.
+  input pump (host stdin → the UART, via a zero-timeout `select`, with a tty put
+  in raw mode for the run and restored on every exit path — see the console-input
+  gotcha) — all driving the machine through the public API (no engine internals).
+  Its own POSIX feature macro is local to the file, mirroring `gdbstub.c`. Loads
+  an ELF named on the command line, or runs the built-in demo when none is given.
 - `examples/embed.c` — minimal embedding example: ~30 lines that load and run a
   guest through `libquanta` (`make embed`).
 - `tests/hello.S` — sample RV32I assembly, mirrors the built-in demo.
@@ -403,6 +407,14 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   UART receive path; plus a `--disk` smoke (an image attaches; a missing file
   errors). The guest needs host input to terminate, so it is out of `make check`
   and the objdump/qemu suites. Also run under `make sanitize`/`make coverage`.
+- `tests/console_pty.py` + `tests/check_console.sh` — the raw-mode interactive
+  console test (`make check-console`): drives the same `uart_echo` guest over a
+  real pseudo-terminal (so `isatty` is true and `console_raw_enable` engages — the
+  path the piped `check-uart-rx` cannot reach), asserting the raw-mode banner,
+  character-at-a-time echo, the `Ctrl-A x` quit and `Ctrl-A Ctrl-A` literal
+  escapes, and the safety property that a `SIGTERM` restores the terminal it
+  saved. Self-contained (no riscv `gdb`, like `gdb_client.py`); skips cleanly
+  without python3. Also run under `make sanitize`/`make coverage`.
 - `tests/rv64/test_rv64_virtio.S` + `tests/check_virtio.sh` — the M18 virtio-mmio
   block-device test (`make check-virtio`): a bare-metal RV64 machine-mode driver
   probes the device identity, runs the status/feature handshake, sets up a split
@@ -707,9 +719,20 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   as `quanta_uart_input`, and `main.c`'s `console_pump` feeds host stdin through
   it every ~1024 steps during the run. Readiness is a zero-timeout `select` — the
   code never sets `O_NONBLOCK` on stdin, because that flag is *shared with the
-  parent shell* and a crash would leave the shell broken; and it does not touch
-  termios (interactive input is cooked/echoed for now — raw mode is deferred to
-  the full interactive-console work). `--disk=FILE` reads a raw image wholly into
+  parent shell* and a crash would leave the shell broken. When stdin is a tty,
+  `console_raw_enable` puts it in raw mode for the run — the qemu `-nographic`
+  recipe: clear `ICANON`/`ECHO`/`ISIG`/`ICRNL`/`IXON` so keystrokes reach the
+  guest one at a time, unechoed by the host, with Ctrl-C and flow-control keys
+  delivered as bytes, but **leave `c_oflag` alone** so the guest's bare `\n` still
+  displays as CR-LF (ONLCR). A `Ctrl-A` prefix is the escape (`Ctrl-A x` quits,
+  `Ctrl-A Ctrl-A` sends one literal `Ctrl-A`). The terminal is *always* restored —
+  `console_restore` (idempotent) runs after the loop, via `atexit`, and from
+  `SIGINT`/`SIGTERM`/`SIGQUIT`/`SIGHUP` handlers that restore then re-raise
+  (tcsetattr/signal/raise are async-signal-safe) — so however the process dies the
+  user's shell is handed back intact. A pipe or file is not a tty (`isatty` gates
+  it), so it is read verbatim with no escape processing — which is what
+  `check-uart-rx`'s piped stdin relies on, keeping the change inert for every test.
+  `--disk=FILE` reads a raw image wholly into
   a malloc'd buffer held in `Platform.disk` (engine-owned, freed in
   `quanta_destroy`); the virtio-mmio block device below serves it. `tests/uart_echo.S`
   (a plain-rv32i echo guest) is driven by

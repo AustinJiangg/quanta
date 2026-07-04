@@ -14,6 +14,7 @@
 #   make check-cache   check the cache model on a locality workload
 #   make check-pipeline  check the pipeline model on a hazard workload
 #   make check-gdb    drive the gdb remote stub with a self-contained client
+#   make check-console  exercise the raw-mode interactive console over a pty
 #   make check-devices  check the MMIO devices and interrupt delivery (M13)
 #   make check-diff   differential-test against a reference sim (qemu-riscv32)
 #   make check-arch   run the official riscv-arch-test conformance suite
@@ -54,7 +55,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-uart-rx check-virtio check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-devices check-sbi check-uart-rx check-virtio check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -207,6 +208,13 @@ check-pipeline: $(BIN) tests/hazard_slow.elf tests/hazard_fast.elf
 check-gdb: $(BIN) tests/hello.elf
 	@sh tests/check_gdb.sh
 
+# Exercise the raw-mode interactive console over a real pseudo-terminal (so
+# isatty() is true and raw mode engages, unlike check-uart-rx's pipe): assert the
+# banner, character-at-a-time echo, the Ctrl-A escapes, and that a terminating
+# signal restores the terminal. Skips cleanly without python3.
+check-console: $(BIN) tests/uart_echo.elf
+	@sh tests/check_console.sh
+
 # Exercise the M13 platform: the device/interrupt test must exit clean (CLINT
 # timer, software IPI, and a PLIC-routed external interrupt all fire) and its
 # UART console output must reach stdout.
@@ -282,7 +290,7 @@ sanitize:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
-		check-devices check-sbi check-uart-rx check-virtio check-os \
+		check-console check-devices check-sbi check-uart-rx check-virtio check-os \
 		check-rv64 check-diff
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
@@ -314,7 +322,7 @@ COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
 
 coverage:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-uart-rx check-virtio check-os
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-devices check-sbi check-uart-rx check-virtio check-os
 	@sh tests/coverage.sh
 
 # Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),

@@ -9,6 +9,18 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **Raw-mode interactive console** — when stdin is a terminal, a run now puts it
+  in raw mode (mirroring qemu's `-nographic` console: character-at-a-time input,
+  no host echo, and Ctrl-C plus flow-control keys delivered to the guest as
+  bytes), so an interactive full-system guest (xv6 at its shell) reads and echoes
+  each keystroke exactly once with no line buffering. A `Ctrl-A` prefix is the
+  escape — `Ctrl-A x` quits the emulator, `Ctrl-A Ctrl-A` sends a literal
+  `Ctrl-A`. Output processing is left untouched so a bare `\n` still displays as
+  CR-LF, and the terminal is restored on every exit path (after the run, via
+  `atexit`, and from `SIGINT`/`SIGTERM`/`SIGQUIT`/`SIGHUP` handlers that restore
+  then re-raise), so a killed emulator never leaves the user's shell broken. A
+  pipe or file is not a tty, so it is read verbatim and every existing test is
+  unaffected. Pinned by `make check-console`, a pty-based test. (M18)
 - **RV64 transition (RV64IMAC)** — the core is now width-parameterised and runs
   RV64 as well as RV32, selected per program from the ELF class rather than by a
   separate build. XLEN is a runtime property (`cpu->xlen`): all state is stored in

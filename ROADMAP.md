@@ -875,7 +875,11 @@ interrupts on; **(d)** a `--max-steps=N` flag (0 = uncapped) lets an interactive
 guest run past the runaway guard. The boot DTB's `mmu-type` for RV64 is now
 `riscv,sv39`. `tests/rv64/test_rv64_plic.S` pins the S-mode external-interrupt
 path and the branch fix is pinned by `tests/rv64/test_rv64.S` (qemu-verified).
-Still to polish: raw-mode terminal handling for a fully clean interactive console.
+The interactive console is now clean: when stdin is a tty the run puts it in raw
+mode (the qemu `-nographic` recipe — character-at-a-time, no host echo, Ctrl-C
+and flow-control keys delivered to the guest, `Ctrl-A x` to quit) and restores it
+on every exit path (after the loop, via `atexit`, and from signal handlers), so a
+guest's shell reads and echoes exactly once with no line buffering. Next up:
 Linux + OpenSBI (needing a fuller SBI and far longer runs) follows xv6.
 
 - [x] **Build (paging):** the three-level Sv39 page-table scheme (a

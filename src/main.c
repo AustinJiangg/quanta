@@ -15,6 +15,8 @@
 
 #include <unistd.h>
 #include <sys/select.h>
+#include <termios.h>
+#include <signal.h>
 
 /*
  * Quanta driver — a thin client over libquanta.
@@ -25,8 +27,10 @@
  *          [--disk=FILE] [program.elf]
  *
  * A running guest can take console input: host stdin is pumped into the UART's
- * receive path during the run, so a full-system guest has a keyboard. --disk
- * attaches a raw block-device image for a (future) virtio-mmio device to serve.
+ * receive path during the run, so a full-system guest has a keyboard. When stdin
+ * is a terminal the run puts it in raw mode (character-at-a-time, no host echo,
+ * Ctrl-A x to quit), mirroring qemu's -nographic console; a pipe or file is read
+ * verbatim. --disk attaches a raw block-device image the virtio-mmio device serves.
  *
  * With a path, Quanta loads that RV32I ELF executable and runs it from its
  * entry point. With no argument, it runs a tiny built-in demo program — a
@@ -152,10 +156,10 @@ static void trace_step(Quanta *q) {
  * booting kernel) has a keyboard. Readiness is checked with a zero-timeout
  * select() rather than by making stdin non-blocking: stdin's flags are shared
  * with the parent shell, so mutating them is a footgun a crash would leave
- * behind. The terminal is otherwise left untouched — on a real tty input is
- * line-buffered and host-echoed (interactive typing works, if doubly echoed);
- * proper raw mode is deferred to the full interactive-console work. A pipe or
- * file is read as-is, which is what the piped-input test relies on. */
+ * behind. When stdin is a tty the terminal is put in raw mode for the run (see
+ * console_raw_enable) so keystrokes reach the guest one at a time, unechoed, and
+ * signal/flow-control keys are delivered as bytes; a pipe or file is read as-is,
+ * which is what the piped-input test relies on. */
 static int stdin_has_byte(void) {
     fd_set r;
     FD_ZERO(&r);
@@ -164,15 +168,95 @@ static int stdin_has_byte(void) {
     return select(STDIN_FILENO + 1, &r, NULL, NULL, &tv) > 0;
 }
 
+/* Raw-mode terminal handling. The saved settings and the "raw is active" flag
+ * are file-scope so the atexit/signal restore path reaches them without an
+ * argument: once raw mode is on, a signal (or normal exit) can fire at any point
+ * and MUST put the terminal back, or it would leave the user's shell unusable
+ * (no echo, no line editing). tcsetattr/signal/raise are all async-signal-safe,
+ * so calling them from the handler is defined. */
+static struct termios g_console_saved;
+static volatile sig_atomic_t g_console_raw  = 0; /* terminal currently in raw mode */
+static volatile sig_atomic_t g_console_quit = 0; /* Ctrl-A x: stop the run */
+
+/* Restore the terminal to how we found it. Idempotent, so atexit and a signal
+ * handler can both call it. */
+static void console_restore(void) {
+    if (g_console_raw) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_console_saved);
+        g_console_raw = 0;
+    }
+}
+
+/* On a terminating signal, put the terminal back and re-raise with the default
+ * disposition so the process dies as it normally would (right exit status to the
+ * parent). Reached only for signals that can arrive from outside while raw mode
+ * is on — with ISIG cleared, Ctrl-C/\ do not generate SIGINT/SIGQUIT here. */
+static void console_on_signal(int sig) {
+    console_restore();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* Put a tty into raw mode for the duration of the run, mirroring qemu's
+ * -nographic terminal setup: character-at-a-time input, no host echo (the guest
+ * echoes), and signal/flow-control keys delivered to the guest as bytes rather
+ * than acted on by the host — but OUTPUT processing (c_oflag) is left alone so
+ * the guest's bare '\n' still displays as a proper new line (ONLCR maps it to
+ * CR-LF). A pipe or file is not a tty, so this is a no-op there and input flows
+ * through verbatim. On success, arms an atexit and signal handlers to guarantee
+ * the terminal is restored however the process ends. */
+static void console_raw_enable(void) {
+    if (!isatty(STDIN_FILENO)) return;               /* a pipe/file: leave verbatim */
+    if (tcgetattr(STDIN_FILENO, &g_console_saved) != 0) return;
+
+    struct termios raw = g_console_saved;
+    raw.c_iflag &= ~(tcflag_t)(IGNBRK | BRKINT | PARMRK | ISTRIP |
+                               INLCR | IGNCR | ICRNL | IXON);
+    raw.c_lflag &= ~(tcflag_t)(ECHO | ECHONL | ICANON | IEXTEN | ISIG);
+    raw.c_cflag &= ~(tcflag_t)(CSIZE | PARENB);
+    raw.c_cflag |=  (tcflag_t)CS8;
+    raw.c_cc[VMIN]  = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return;
+    g_console_raw = 1;
+
+    atexit(console_restore);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = console_on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGQUIT, &sa, NULL);
+    sigaction(SIGHUP,  &sa, NULL);
+}
+
 /* Move at most one byte from host stdin into the guest UART. A one-byte holding
  * slot keeps a byte read from stdin from being dropped when the UART's receive
  * buffer is momentarily full: read a fresh byte only when nothing is pending, and
- * clear the pending byte once the UART accepts it. */
+ * clear the pending byte once the UART accepts it. In raw (tty) mode a Ctrl-A
+ * prefix is the escape (qemu convention): Ctrl-A x quits the emulator, Ctrl-A
+ * Ctrl-A sends one literal Ctrl-A, so the guest can still receive every other
+ * key — including a bare Ctrl-C, which ISIG-off delivers as a byte. The escape
+ * is skipped for a pipe/file so byte streams pass through unaltered. */
 static void console_pump(Quanta *q) {
     static int pending = -1;
+    static int escape = 0;             /* saw the Ctrl-A prefix, awaiting its command */
     if (pending < 0 && stdin_has_byte()) {
         unsigned char c;
-        if (read(STDIN_FILENO, &c, 1) == 1) pending = (int)c;
+        if (read(STDIN_FILENO, &c, 1) == 1) {
+            /* The Ctrl-A escape applies only in raw (tty) mode; a pipe/file
+             * (g_console_raw == 0) always falls to the verbatim branch below. */
+            if (g_console_raw && escape) {
+                escape = 0;
+                if (c == 'x' || c == 'X') g_console_quit = 1; /* Ctrl-A x: quit */
+                else pending = (int)c;               /* Ctrl-A Ctrl-A -> one Ctrl-A */
+            } else if (g_console_raw && c == 0x01) {
+                escape = 1;                           /* Ctrl-A: await command byte */
+            } else {
+                pending = (int)c;                    /* ordinary byte, or piped verbatim */
+            }
+        }
     }
     if (pending >= 0 && quanta_uart_input(q, (uint8_t)pending)) pending = -1;
 }
@@ -185,7 +269,8 @@ static void console_pump(Quanta *q) {
 static uint64_t run_until_halt(Quanta *q, int trace, Pipeline *pipe,
                                uint64_t max_steps) {
     uint64_t steps = 0;
-    while (quanta_halt_reason(q) == QUANTA_RUN && (max_steps == 0 || steps < max_steps)) {
+    while (quanta_halt_reason(q) == QUANTA_RUN && !g_console_quit &&
+           (max_steps == 0 || steps < max_steps)) {
         /* Feed any waiting console input to the UART, occasionally — often enough
          * to feel responsive, rarely enough that the select() is not a per-
          * instruction tax. Harmless when no input is waiting. */
@@ -421,9 +506,18 @@ int main(int argc, char **argv) {
     Pipeline pipe;
     if (pipe_on) pipeline_init(&pipe);
 
+    /* If stdin is a terminal, run with it in raw mode so an interactive guest
+     * (a booting OS at its shell) gets clean character-at-a-time input; a pipe or
+     * file is untouched. Restored right after the run (and, as a backstop, via
+     * atexit/signal handlers) so the user's shell is always handed back intact. */
+    console_raw_enable();
+    if (g_console_raw && !quiet)
+        printf("Console: raw mode — Ctrl-A x to quit, Ctrl-A Ctrl-A for a literal Ctrl-A.\n\n");
+
     /* Any output the program writes via syscalls appears here, mid-run. */
     uint64_t steps = run_until_halt(q, trace, pipe_on ? &pipe : NULL, max_steps);
 
+    console_restore();
     QuantaHalt halt = quanta_halt_reason(q);
 
     /* Optional architectural-test signature dump. It runs whatever the halt
@@ -450,6 +544,9 @@ int main(int argc, char **argv) {
             if (halt == QUANTA_HALT_MEM_FAULT)
                 printf(" at 0x%0*llx", w, (unsigned long long)quanta_fault_addr(q));
             printf(" after %llu instruction(s).\n\n", (unsigned long long)steps);
+        } else if (g_console_quit) {
+            printf("Console quit after %llu instruction(s).\n\n",
+                   (unsigned long long)steps);
         } else {
             printf("Stopped at the %llu-instruction safety limit.\n\n",
                    (unsigned long long)steps);
@@ -482,8 +579,9 @@ int main(int argc, char **argv) {
      * qemu-user or spike): a clean exit returns its code, an abnormal stop
      * (ebreak/trap/limit) returns 1. `make check` relies on this to tell a
      * passing conformance test (exit 0) from a failing one. */
-    int status = (halt == QUANTA_HALT_EXIT)
-        ? (int)(quanta_exit_code(q) & 0xffu) : 1;
+    int status = (halt == QUANTA_HALT_EXIT) ? (int)(quanta_exit_code(q) & 0xffu)
+               : g_console_quit ? 0    /* the user asked to quit — a clean stop */
+               : 1;
     if (sig_failed && status == 0) status = 1; /* surface a dump failure */
     quanta_destroy(q);
     return status;
