@@ -12,6 +12,7 @@ quanta \- from-scratch RISC-V (RV32) instruction-set emulator
 .RB [ \-\-memory=\fISIZE\fR ]
 .RB [ \-\-gdb [ =\fIPORT\fR ]]
 .RB [ \-\-signature=\fIFILE\fR ]
+.RB [ \-\-disk=\fIFILE\fR ]
 .RI [ program.elf ]
 .SH DESCRIPTION
 .B quanta
@@ -20,7 +21,10 @@ little-endian memory driven by a fetch/decode/execute loop. It implements the
 RV32I base integer ISA plus the M (multiply/divide), A (atomics), and
 Zicsr/Zifencei extensions, the M/S/U privileged architecture with trap handling,
 and Sv32 virtual memory. It also models a small platform reached through
-memory-mapped I/O \(em a CLINT timer, a PLIC, and a 16550 UART \(em and delivers
+memory-mapped I/O \(em a CLINT timer, a PLIC, a 16550 UART, and a virtio-mmio
+block device serving the
+.B \-\-disk
+image \(em and delivers
 timer, software, and external interrupts. At boot it hands the guest a flattened
 device tree (\fBa0\fR = hart id, \fBa1\fR = DTB pointer) describing that hardware,
 and it services an S-mode guest's environment calls as M-mode SBI firmware
@@ -107,6 +111,16 @@ ELF symbols, lowest address first, one eight-digit hex word per line) to
 or to standard output for
 .BR \- .
 This makes quanta a drop-in target for the RISC-V architectural tests.
+.TP
+.BI \-\-disk= FILE
+Attach
+.I FILE
+as a raw block-device image, read wholly into memory. The emulated virtio-mmio
+block device (qemu
+.B virt
+layout, PLIC source 1) serves it as a disk, so a full-system guest can mount it
+as a root filesystem. Writes hit the in-memory image and do not persist to
+.IR FILE .
 .SH EXIT STATUS
 .TP
 .B 0

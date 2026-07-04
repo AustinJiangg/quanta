@@ -34,9 +34,11 @@ and the **RV64 transition** — a runtime-XLEN core that also runs RV64IMAC,
 selected per program from the ELF class (M17, `tests/rv64/`, `make check-rv64`,
 differential-tested against `qemu-riscv64`; RV32F/D stay deferred), and the start
 of **M18** — **Sv39 virtual memory** on RV64 (the three-level page-table walk,
-sharing the walker with Sv32, `tests/rv64/test_rv64_vm.S`) and the **Sstc**
+sharing the walker with Sv32, `tests/rv64/test_rv64_vm.S`), the **Sstc**
 supervisor-timer extension (`stimecmp`/`menvcfg.STCE`, `tests/rv64/test_rv64_sstc.S`),
-both steps toward booting a mainstream OS — are implemented
+and a **virtio-mmio block device** (modern/v2, one split virtqueue, serving the
+`--disk` image by DMA, `tests/rv64/test_rv64_virtio.S`, `make check-virtio`) —
+all steps toward booting a mainstream OS (xv6-riscv next) — are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
@@ -76,6 +78,7 @@ make check-gdb     # drive the gdb remote stub with a self-contained client (nee
 make check-devices # check the MMIO devices and interrupt delivery (needs cross-toolchain)
 make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-toolchain)
 make check-uart-rx # check UART receive (piped stdin) and the --disk backend (M18)
+make check-virtio  # check the virtio-mmio block device on a --disk image (M18)
 make check-os      # boot the M16 teaching kernel to userspace (needs cross-toolchain)
 make check-rv64    # RV64IMAC conformance (tests/rv64/), diff vs qemu-riscv64 (M17)
 make check-diff    # differential-test against qemu-riscv32 (needs qemu-user-static)
@@ -102,8 +105,8 @@ not combine with `--trace`/`--pipeline`. Add `--memory=SIZE` (bytes, with an
 optional `K`/`M`/`G` suffix, e.g. `--memory=8M`) to grow the guest RAM region
 beyond its ELF image — spare RAM lands above the image for an OS-style guest to
 manage, and the boot DTB advertises the real size (`tests/os/` needs it). Add
-`--disk=FILE` to attach a raw block-device image (read wholly into memory, for a
-future virtio-mmio block device to serve — an OS's root filesystem). Add
+`--disk=FILE` to attach a raw block-device image (read wholly into memory) that
+the virtio-mmio block device serves as an OS's root filesystem (M18). Add
 `--signature=FILE` to dump the
 architectural-test signature region (the words between the
 `begin_signature`/`end_signature` ELF symbols, in the suite's reference format) —
@@ -140,12 +143,19 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   timer + `msip` IPI), a PLIC (priority/enable/threshold + claim/complete), and a
   16550 UART (transmit prints to stdout; receive via `plat_uart_rx`, which buffers
   a host byte and — with RX interrupts enabled — raises the UART's PLIC source,
-  the input half of the console the CLI pumps stdin into, M18). Self-contained
-  register files on the qemu `virt` address map, with no CPU/memory dependency —
-  the memory layer dispatches accesses here, and the CPU pulls `plat_mip_bits()`
-  (MTIP/MSIP/MEIP) each step. `plat_tick` advances `mtime` one tick per CPU step
-  (deterministic). The `Platform` also holds a `Disk` — a raw block-device image
-  (`--disk`, owned by the engine) a future virtio-mmio device will DMA against.
+  the input half of the console the CLI pumps stdin into, M18). M18 adds a
+  **virtio-mmio block device** (`virtio_*`, modern/v2, one split virtqueue,
+  PLIC source 1): the driver programs it through the mmio register file and kicks
+  it with `QUEUE_NOTIFY`, on which `virtio_notify` walks the available ring and
+  services each descriptor chain synchronously — DMAing sectors between the guest
+  buffers and the `--disk` image, writing the used ring, and asserting its PLIC
+  interrupt. The register files sit on the qemu `virt` address map with no CPU
+  dependency — the memory layer dispatches accesses here, and the CPU pulls
+  `plat_mip_bits()` (MTIP/MSIP/MEIP) each step. `plat_tick` advances `mtime` one
+  tick per CPU step (deterministic). The `Platform` also holds a `Disk` — the raw
+  block-device image (`--disk`, owned by the engine) the virtio device serves —
+  and, unlike the other (register-only) devices, a pointer to guest RAM
+  (`plat_attach_ram`) so the virtio block device can DMA (it is a bus master).
 - `src/dtb.{h,c}` — the flattened device-tree (FDT) generator (M14): `dtb_build`
   serialises a standard `.dtb` blob (big-endian header, memory-reservation block,
   structure block, deduplicated strings) from a `DtbConfig` describing the RAM
@@ -382,6 +392,16 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   UART receive path; plus a `--disk` smoke (an image attaches; a missing file
   errors). The guest needs host input to terminate, so it is out of `make check`
   and the objdump/qemu suites. Also run under `make sanitize`/`make coverage`.
+- `tests/rv64/test_rv64_virtio.S` + `tests/check_virtio.sh` — the M18 virtio-mmio
+  block-device test (`make check-virtio`): a bare-metal RV64 machine-mode driver
+  probes the device identity, runs the status/feature handshake, sets up a split
+  virtqueue, then reads sector 0 (checking a magic the harness wrote into the
+  `--disk` image) and writes/reads-back another sector (DMA both ways), and
+  confirms the device raised its PLIC interrupt. Machine-mode + MMIO + virtio and
+  needing a `--disk`, so it is quanta-only (out of the qemu-riscv64 differential)
+  and excluded from `check-rv64`'s generic runner (`RV64_RUN`); it is built
+  `-mno-relax` so `la` on its in-RAM queue stays PC-relative (see gotchas). Also
+  run under `make sanitize`/`make coverage`.
 - `tests/coverage.sh` — collects gcov line coverage after an instrumented build
   (`make coverage`): prefers lcov (HTML under `build/coverage`) and falls back to
   plain gcov. Observability only, like the cache/pipeline overlays.
@@ -658,12 +678,38 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   termios (interactive input is cooked/echoed for now — raw mode is deferred to
   the full interactive-console work). `--disk=FILE` reads a raw image wholly into
   a malloc'd buffer held in `Platform.disk` (engine-owned, freed in
-  `quanta_destroy`), staged for the virtio-mmio block device; nothing consumes it
-  yet. `tests/uart_echo.S` (a plain-rv32i echo guest) is driven by
+  `quanta_destroy`); the virtio-mmio block device below serves it. `tests/uart_echo.S`
+  (a plain-rv32i echo guest) is driven by
   `check-uart-rx` with piped stdin — it is deliberately *not* named `test_*` and
   is `filter-out`'d of `TEST_SRC`, because it needs host input to terminate and
   would otherwise loop forever under `make check`/`check-disasm` and mismatch
   user-mode qemu (no UART) under `check-diff`.
+- virtio-mmio block device (M18, the xv6 root-fs enabler): a modern (version 2)
+  block device in `device.c` with one split virtqueue, on the qemu `virt` first
+  slot (`VIRTIO_BASE` 0x10001000, PLIC source 1) — the addresses xv6 hardcodes, so
+  no DTB node is needed for it (a `virtio` DTB node is deferred to the Linux work).
+  It is the project's first **bus-master** device: unlike the register-only
+  CLINT/PLIC/UART, it DMAs against guest RAM, so `Platform` carries a RAM pointer
+  set by `plat_attach_ram` (from `start_at`) and `dma_ptr` does the bounds-checked
+  guest-physical → host access (a malformed descriptor is ignored, never faulting
+  the CPU — DMA stays off the `mem_*` fault path). The driver brings the device up
+  through the mmio register file (status/feature handshake, queue addresses,
+  `QUEUE_READY`) and kicks it with `QUEUE_NOTIFY`; `virtio_notify` then walks the
+  available ring and services each chain **synchronously** — header (type+sector) →
+  data descriptor(s) copied to/from the `--disk` image → a status byte → a used-ring
+  completion → the PLIC interrupt raised (which the guest ACKs via `INT_ACK`,
+  deasserting the line). Synchronous completion means the used index has already
+  advanced when the notify store returns; it is safe for xv6, which holds
+  `vdisk_lock` with interrupts off until it sleeps. We negotiate no features (bar
+  advertising `VIRTIO_F_VERSION_1`) and never fail `FEATURES_OK`, so a driver that
+  skips the VERSION_1 ack (xv6 does) still comes up. Only queue 0 exists; the ring
+  size is capped at `V_QUEUE_MAX` (8, xv6's `NUM`). Inert until a guest programs it
+  (`interrupt_status` 0 keeps it out of `plic_lines`), so every pre-M18 test is
+  unaffected. `test_rv64_virtio.S` is built `-mno-relax`: it takes the address of
+  its in-RAM queue with `la`, and linker relaxation would rewrite that into a
+  gp-relative `addi rd, gp, off` — but the test framework uses `gp` (x3) as its
+  check-id register, not `__global_pointer$`, so a relaxed address would be
+  garbage (the same class of gotcha as the fixed-`+4` mepc handlers avoiding C).
 - Booting an OS (M16, `tests/os/`): the teaching kernel is *entered in M-mode*
   (Quanta's loader enters every ELF in M-mode), and its `boot.S` does the
   drop-to-S itself — the same pattern `test_sbi`/`test_stimer` use — rather than

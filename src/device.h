@@ -15,24 +15,32 @@
  *     threshold, and a claim/complete handshake.
  *   - UART   — a 16550 serial port; writes to its transmit register print to the
  *     host stdout, and it can raise an external interrupt through the PLIC.
+ *   - VIRTIO — a virtio-mmio block device (modern / v2) serving the --disk image
+ *     over a single split virtqueue; the OS's root filesystem lives on it. Unlike
+ *     the others it is a bus master — it DMAs against guest RAM — so the platform
+ *     carries a pointer to memory for it (plat_attach_ram).
  *
- * The models are self-contained (no CPU or memory dependency): the memory layer
+ * The register models are self-contained (no CPU dependency): the memory layer
  * dispatches MMIO accesses here, and the CPU pulls the resulting interrupt-
  * pending bits each step through plat_mip_bits(). The addresses follow the
  * de-facto qemu 'virt' layout so guest software and device trees line up.
  */
 
-#define CLINT_BASE 0x02000000u
-#define CLINT_SIZE 0x00010000u
-#define PLIC_BASE  0x0c000000u
-#define PLIC_SIZE  0x04000000u
-#define UART_BASE  0x10000000u
-#define UART_SIZE  0x00000100u
+#define CLINT_BASE  0x02000000u
+#define CLINT_SIZE  0x00010000u
+#define PLIC_BASE   0x0c000000u
+#define PLIC_SIZE   0x04000000u
+#define UART_BASE   0x10000000u
+#define UART_SIZE   0x00000100u
+#define VIRTIO_BASE 0x10001000u   /* qemu virt's first virtio-mmio slot (xv6's VIRTIO0) */
+#define VIRTIO_SIZE 0x00001000u
 
-/* A handful of PLIC sources is plenty; the UART is wired to source 10, as on
- * qemu virt. One hart, one interrupt context (hart 0, M-mode). */
+/* A handful of PLIC sources is plenty; the UART is wired to source 10 and the
+ * virtio block device to source 1, as on qemu virt. One hart, one interrupt
+ * context (hart 0, M-mode). */
 #define PLIC_NSOURCES 32u
 #define UART_IRQ      10u
+#define VIRTIO_IRQ    1u
 
 /* mip/mie bit positions the platform drives — read-only reflections of device
  * state from software's point of view (machine software/timer/external). */
@@ -64,6 +72,24 @@ typedef struct {
     uint32_t claimed;                 /* source currently in service (0 = none) */
 } Plic;
 
+/* A virtio-mmio block device (modern / version 2) with one split virtqueue. The
+ * driver builds the descriptor table, available (driver) ring, and used (device)
+ * ring in guest RAM and kicks the device by writing QUEUE_NOTIFY; the device
+ * processes each request synchronously, DMAing sectors between the guest buffers
+ * and the attached disk image, posts completions to the used ring, and raises
+ * PLIC source 1. Only queue 0 exists, and no features are negotiated. */
+typedef struct {
+    uint32_t status;           /* device status (ACKNOWLEDGE/DRIVER/FEATURES_OK/DRIVER_OK) */
+    uint32_t features_sel;     /* DEVICE_FEATURES_SEL: which 32-bit half to read back */
+    uint32_t queue_num;        /* negotiated ring size (entries) */
+    uint32_t queue_ready;      /* queue 0 live */
+    uint64_t desc_addr;        /* guest-physical descriptor table */
+    uint64_t avail_addr;       /* guest-physical available (driver) ring */
+    uint64_t used_addr;        /* guest-physical used (device) ring */
+    uint16_t last_avail;       /* next available index the device will consume */
+    uint32_t interrupt_status; /* pending interrupt bits (bit 0 = used ring advanced) */
+} Virtio;
+
 /* A raw block-device backing image (attached via --disk). Held here so a future
  * virtio-mmio block device can DMA against it; loaded into RAM so reads and
  * writes hit the buffer (writes do not persist to the file). data == NULL when
@@ -74,15 +100,26 @@ typedef struct {
 } Disk;
 
 typedef struct Platform {
-    Clint clint;
-    Uart  uart;
-    Plic  plic;
-    Disk  disk;
+    Clint   clint;
+    Uart    uart;
+    Plic    plic;
+    Virtio  virtio;
+    Disk    disk;
+    /* Guest RAM, for virtio DMA (the block device is a bus master). Set by
+     * plat_attach_ram after the loader initialises memory; NULL disables DMA. */
+    uint8_t *ram;
+    uint64_t ram_base;
+    uint64_t ram_size;
 } Platform;
 
 /* Reset all devices: zeroed register files, mtimecmp parked at all-ones so the
- * timer stays quiet until the guest programs it. */
+ * timer stays quiet until the guest programs it. Clears the RAM pointer too, so
+ * call plat_attach_ram afterwards to (re)enable virtio DMA. */
 void plat_init(Platform *p);
+
+/* Point the platform at the guest RAM array so the virtio block device can DMA
+ * against it: `ram[0]` maps to physical address `base`, spanning `size` bytes. */
+void plat_attach_ram(Platform *p, uint8_t *ram, uint64_t base, uint64_t size);
 
 /* Does `addr` fall in any device's MMIO window? The memory layer checks this
  * before its RAM range so device accesses are routed here. */

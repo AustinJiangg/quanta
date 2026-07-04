@@ -83,6 +83,7 @@ static void start_at(Quanta *q, uint64_t entry, int xlen) {
     if (q->cache_on) q->cpu.cache = &q->cache;
     plat_init(&q->plat);      /* reset the MMIO devices */
     q->mem.plat = &q->plat;   /* attach them so MMIO is dispatched and timers tick */
+    plat_attach_ram(&q->plat, q->mem.data, q->mem.base, q->mem.size); /* virtio DMA */
     q->dtb_addr = 0;          /* set only by the boot handoff below (ELF path) */
     reg_write(&q->cpu, 2, (q->mem.base + q->mem.size) & ~(uint64_t)0xf);
     q->loaded = 1;

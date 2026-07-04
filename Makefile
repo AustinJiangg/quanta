@@ -54,7 +54,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-uart-rx check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-uart-rx check-virtio check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -148,6 +148,9 @@ $(KOS_ELF): $(KOS_SRC) tests/os/kernel.ld
 # against qemu-riscv64.
 RV64_SRC := $(wildcard tests/rv64/*.S)
 RV64_ELF := $(RV64_SRC:.S=.elf)
+# The virtio test needs a --disk image, so it runs under check-virtio rather than
+# the generic exit-0/differential runner; build it, but keep it out of that list.
+RV64_RUN := $(filter-out tests/rv64/test_rv64_virtio.elf,$(RV64_ELF))
 RV64FLAGS := -march=rv64imac_zicsr -mabi=lp64 -nostdlib -nostartfiles \
              -Ttext=0x80000000 -Itests
 
@@ -160,6 +163,13 @@ tests/rv64/%.elf: tests/rv64/%.S
 # otherwise assemble ebreak as a 2-byte c.ebreak and over-advance the return
 # (the same reason the RV32 test_trap.S is built -march=rv32i_zicsr, no C).
 tests/rv64/test_rv64_priv.elf: RV64FLAGS := $(subst rv64imac_zicsr,rv64ima_zicsr,$(RV64FLAGS))
+
+# The virtio test takes the address of its in-RAM virtqueue with `la`. Linker
+# relaxation would rewrite those into gp-relative loads (addi rd, gp, off), but
+# the test framework uses gp (x3) as its check-id register, not __global_pointer$
+# — so relaxed addresses would be garbage. Disable relaxation to keep `la`
+# PC-relative (auipc+addi) and gp-independent.
+tests/rv64/test_rv64_virtio.elf: RV64FLAGS += -mno-relax
 
 # Run the RV32I conformance suite (tests/test_*.S) through the emulator. Each
 # test exits 0 on success or the number of its first failed check, which quanta
@@ -227,7 +237,14 @@ check-os: $(BIN) $(KOS_ELF)
 # when", RV64IMAC running and agreeing with a golden model. Skips the differential
 # cleanly if qemu-riscv64 is absent.
 check-rv64: $(BIN) $(RV64_ELF)
-	@sh tests/check_rv64.sh $(RV64_ELF)
+	@sh tests/check_rv64.sh $(RV64_RUN)
+
+# Exercise the M18 virtio-mmio block device: a bare-metal driver brings the
+# device up, sets up a virtqueue, and reads/writes sectors of a --disk image
+# by DMA, confirming the interrupt fires. Quanta-only (machine-mode + MMIO +
+# virtio), so it runs here with its own disk image, not the qemu differential.
+check-virtio: $(BIN) tests/rv64/test_rv64_virtio.elf
+	@sh tests/check_virtio.sh
 
 # Differential test: compare quanta against a reference simulator (qemu-riscv32
 # by default; override with REF=...) on the sample programs. Skips cleanly if
@@ -265,7 +282,8 @@ sanitize:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
-		check-devices check-sbi check-uart-rx check-os check-rv64 check-diff
+		check-devices check-sbi check-uart-rx check-virtio check-os \
+		check-rv64 check-diff
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
 # the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`
@@ -296,7 +314,7 @@ COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
 
 coverage:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-uart-rx check-os
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-devices check-sbi check-uart-rx check-virtio check-os
 	@sh tests/coverage.sh
 
 # Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),

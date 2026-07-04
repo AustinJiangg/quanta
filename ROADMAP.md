@@ -851,10 +851,14 @@ backend; **DONE** (`plat_uart_rx`/`quanta_uart_input` + `main.c`'s stdin pump, a
 `quanta_attach_disk` staging a raw image in `Platform.disk`; `make check-uart-rx`).
 **(3)** the crux — a **virtio-mmio (modern, v2) block device** with one split
 virtqueue, since xv6's root filesystem (and thus `/init` and the shell) lives on
-a virtio disk; the driver is deterministic-friendly (process the descriptor chain
-synchronously on `QUEUE_NOTIFY`, then assert PLIC IRQ 1 — safe because xv6 holds
-`vdisk_lock` with interrupts off until it sleeps). Then: build xv6 integer-only
-(`rv64imac`, no F/D), `CPUS=1`, boot to the shell — and there set the boot DTB's
+a virtio disk; **DONE** (`src/device.c`'s virtio model, serving the `--disk`
+image; `tests/rv64/test_rv64_virtio.S`, `make check-virtio`). The driver is
+deterministic-friendly, exactly as planned: it processes the descriptor chain
+synchronously on `QUEUE_NOTIFY`, then asserts PLIC IRQ 1 — safe because xv6 holds
+`vdisk_lock` with interrupts off until it sleeps. The device is a bus master, so
+the platform now carries a pointer to guest RAM (`plat_attach_ram`) for DMA.
+**Then, remaining for xv6:** build it integer-only (`rv64imac`, no F/D),
+`CPUS=1`, and boot to the shell — and there set the boot DTB's
 `mmu-type = "riscv,sv39"` (still `riscv,none` from the M17 Bare era) and add
 raw-mode terminal handling for a clean interactive console.
 Linux + OpenSBI (needing a fuller SBI, a `mmu-type = "riscv,sv39"` DTB, and far
@@ -863,15 +867,16 @@ longer runs) follows xv6.
 - [x] **Build (paging):** the three-level Sv39 page-table scheme (a
   descriptor-parameterised generalisation of the Sv32 walk).
 - [ ] **Build (OS boot):** boot xv6-riscv, then Linux + OpenSBI. *In progress:*
-  Sstc timer, UART receive, and the `--disk` backend done; the virtio-mmio block
-  device is next, then xv6 integration.
+  Sstc timer, UART receive, the `--disk` backend, and the virtio-mmio block
+  device are all done; the xv6 integration (build + boot to shell + DTB
+  `mmu-type` + raw console) is next.
 - [x] **ISA:** Sv39 address translation; Sstc (`stimecmp`/`menvcfg.STCE`).
 - [ ] **Concept:** deeper page-table hierarchies; a real distro's boot
   requirements.
 - [ ] **Done when:** xv6-riscv reaches its shell; Linux boots to userspace.
-- [x] **Commits:** `feat: add sv39 paging`, `feat: add sstc supervisor timer`.
-  Still to come: `feat: add virtio-mmio block device`, `test: boot xv6-riscv`,
-  `test: boot linux`.
+- [x] **Commits:** `feat: add sv39 paging`, `feat: add sstc supervisor timer`,
+  `feat: add virtio-mmio block device`.
+  Still to come: `test: boot xv6-riscv`, `test: boot linux`.
 
 ## M19 — SMP multi-hart (stretch)
 
