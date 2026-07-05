@@ -57,7 +57,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-smp check-os check-rv64 check-diff check-arch check-snapshot embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-smp check-os check-rv64 check-diff check-arch check-snapshot check-replay embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -331,6 +331,13 @@ check-snapshot: tests/snapshot_test $(SNAP_ELF)
 tests/snapshot_test: tests/snapshot_test.c $(LIB) $(wildcard src/*.h)
 	$(CC) $(CFLAGS) -o $@ tests/snapshot_test.c $(LIB) $(LDFLAGS)
 
+# Exercise the snapshot *file* serialisation (--snapshot / --restore, E10): split
+# a run with a mid-run snapshot and confirm the resumed half reproduces the whole
+# run's output and exit, that a halted-machine snapshot round-trips, and that a
+# corrupt file is rejected cleanly. Drives the CLI; needs the cross-toolchain.
+check-replay: $(BIN) tests/hello_world.elf tests/test_stack.elf
+	@sh tests/check_replay.sh
+
 # Official RISC-V architectural conformance. Build each riscv-arch-test program
 # with the Quanta target (tests/arch/), run it under --signature, and diff the
 # result against the suite's committed reference signatures — the recognised bar
@@ -353,7 +360,7 @@ sanitize:
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
 		check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio \
-		check-smp check-os check-rv64 check-diff check-snapshot
+		check-smp check-os check-rv64 check-diff check-snapshot check-replay
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
 # the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`
@@ -384,7 +391,7 @@ COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
 
 coverage:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-smp check-os check-snapshot
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-smp check-os check-snapshot check-replay
 	@sh tests/coverage.sh
 
 # Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),

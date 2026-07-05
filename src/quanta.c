@@ -566,6 +566,176 @@ void quanta_snapshot_free(QuantaSnapshot *s) {
     free(s);
 }
 
+/*
+ * Snapshot file serialisation (E10, --snapshot / --restore). The format is a
+ * fixed 72-byte little-endian header, then the raw bytes of the fixed-size inline
+ * state (the harts array and the Platform), then guest RAM and the disk image.
+ *
+ * The inline state is written as raw structs rather than field-by-field: the CSR
+ * file alone is 4096 entries per hart, so an explicit serialiser would be enormous
+ * and no more correct on the same build. The trade-off is that a snapshot file is
+ * host-ABI specific — the header therefore records sizeof(CPU), sizeof(Platform),
+ * and QUANTA_MAX_HARTS, and a load rejects any file whose signature does not match
+ * the running binary, so a mismatched build fails cleanly instead of mis-reading.
+ * The pointer members inside those structs are meaningless on disk; quanta_restore
+ * re-wires them to the live objects, exactly as for an in-memory snapshot.
+ */
+static const uint8_t SNAP_MAGIC[8] = { 'Q','U','A','N','T','A','S','N' };
+#define SNAP_FORMAT_VERSION 1u
+#define SNAP_HDR_SIZE       72u   /* 8 magic + 10*u32 + 3*u64 */
+
+static size_t put_u32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+    return 4;
+}
+static size_t put_u64(uint8_t *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+    return 8;
+}
+static uint32_t get_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
+           (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+static uint64_t get_u64(const uint8_t *p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
+
+static QuantaStatus snapshot_write(const QuantaSnapshot *s, FILE *f) {
+    uint8_t hdr[SNAP_HDR_SIZE];
+    size_t o = 0;
+    memcpy(hdr + o, SNAP_MAGIC, 8);                          o += 8;
+    o += put_u32(hdr + o, SNAP_FORMAT_VERSION);
+    o += put_u32(hdr + o, (uint32_t)sizeof(CPU));
+    o += put_u32(hdr + o, (uint32_t)sizeof(Platform));
+    o += put_u32(hdr + o, (uint32_t)QUANTA_MAX_HARTS);
+    o += put_u32(hdr + o, (uint32_t)s->nharts);
+    o += put_u32(hdr + o, (uint32_t)s->sched);
+    o += put_u32(hdr + o, (uint32_t)s->m_halted);
+    o += put_u32(hdr + o, (uint32_t)s->m_reason);
+    o += put_u32(hdr + o, s->m_exit);
+    o += put_u32(hdr + o, s->dtb_addr);
+    o += put_u64(hdr + o, s->mem_base);
+    o += put_u64(hdr + o, s->mem_size);
+    o += put_u64(hdr + o, s->disk_size);
+
+    if (fwrite(hdr, 1, o, f) != o) return QUANTA_ERR_LOAD;
+    if (fwrite(s->harts, sizeof s->harts, 1, f) != 1) return QUANTA_ERR_LOAD;
+    if (fwrite(&s->plat, sizeof s->plat, 1, f) != 1) return QUANTA_ERR_LOAD;
+    if (s->mem_size &&
+        fwrite(s->mem_data, 1, s->mem_size, f) != s->mem_size) return QUANTA_ERR_LOAD;
+    if (s->disk_size &&
+        fwrite(s->disk_data, 1, s->disk_size, f) != s->disk_size) return QUANTA_ERR_LOAD;
+    return QUANTA_OK;
+}
+
+/* Read a snapshot file into a fresh QuantaSnapshot (RAM/disk buffers allocated and
+ * filled). Returns NULL on any I/O error, a bad magic/version, or a layout
+ * signature that does not match this binary. */
+static QuantaSnapshot *snapshot_read(FILE *f) {
+    uint8_t hdr[SNAP_HDR_SIZE];
+    if (fread(hdr, 1, SNAP_HDR_SIZE, f) != SNAP_HDR_SIZE) return NULL;
+    if (memcmp(hdr, SNAP_MAGIC, 8) != 0) return NULL;
+    size_t o = 8;
+    uint32_t ver   = get_u32(hdr + o); o += 4;
+    uint32_t szcpu = get_u32(hdr + o); o += 4;
+    uint32_t szpl  = get_u32(hdr + o); o += 4;
+    uint32_t maxh  = get_u32(hdr + o); o += 4;
+    if (ver != SNAP_FORMAT_VERSION || szcpu != sizeof(CPU) ||
+        szpl != sizeof(Platform) || maxh != QUANTA_MAX_HARTS)
+        return NULL;   /* written by an incompatible build */
+
+    QuantaSnapshot *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+    s->nharts   = (int)get_u32(hdr + o); o += 4;
+    s->sched    = (int)get_u32(hdr + o); o += 4;
+    s->m_halted = (int)get_u32(hdr + o); o += 4;
+    s->m_reason = (HaltReason)get_u32(hdr + o); o += 4;
+    s->m_exit   = get_u32(hdr + o); o += 4;
+    s->dtb_addr = get_u32(hdr + o); o += 4;
+    s->mem_base = get_u64(hdr + o); o += 8;
+    s->mem_size = get_u64(hdr + o); o += 8;
+    s->disk_size = get_u64(hdr + o);
+    s->cache_on = 0;     /* the cache is observability-only; never persisted */
+    s->loaded   = 1;
+
+    if (s->nharts < 1 || s->nharts > (int)QUANTA_MAX_HARTS) { free(s); return NULL; }
+    if (fread(s->harts, sizeof s->harts, 1, f) != 1) { free(s); return NULL; }
+    if (fread(&s->plat, sizeof s->plat, 1, f) != 1) { free(s); return NULL; }
+
+    s->mem_data = malloc(s->mem_size ? s->mem_size : 1);
+    if (!s->mem_data) { free(s); return NULL; }
+    if (s->mem_size && fread(s->mem_data, 1, s->mem_size, f) != s->mem_size) {
+        free(s->mem_data); free(s); return NULL;
+    }
+    if (s->disk_size) {
+        s->disk_data = malloc(s->disk_size);
+        if (!s->disk_data) { free(s->mem_data); free(s); return NULL; }
+        if (fread(s->disk_data, 1, s->disk_size, f) != s->disk_size) {
+            free(s->disk_data); free(s->mem_data); free(s); return NULL;
+        }
+    }
+    return s;
+}
+
+QuantaStatus quanta_save_snapshot(const Quanta *q, const char *path) {
+    if (!q || !path) return QUANTA_ERR_INVAL;
+    if (!q->loaded) return QUANTA_ERR_INVAL;
+
+    QuantaSnapshot *s = quanta_snapshot(q);
+    if (!s) return QUANTA_ERR_NOMEM;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { quanta_snapshot_free(s); return QUANTA_ERR_LOAD; }
+    QuantaStatus st = snapshot_write(s, f);
+    if (fclose(f) != 0 && st == QUANTA_OK) st = QUANTA_ERR_LOAD; /* catch flush errors */
+    quanta_snapshot_free(s);
+    return st;
+}
+
+QuantaStatus quanta_load_snapshot(Quanta *q, const char *path) {
+    if (!q || !path) return QUANTA_ERR_INVAL;
+    if (q->loaded) return QUANTA_ERR_INVAL;   /* load into a fresh handle */
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return QUANTA_ERR_LOAD;
+    QuantaSnapshot *s = snapshot_read(f);
+    fclose(f);
+    if (!s) return QUANTA_ERR_LOAD;
+
+    /* Build a live machine matching the snapshot's sizes, then restore into it —
+     * reusing quanta_restore's pointer re-wiring. mem_init/the disk alloc give the
+     * live buffers quanta_restore fills in place. */
+    if (mem_init(&q->mem, s->mem_base, s->mem_size) != 0) {
+        quanta_snapshot_free(s);
+        return QUANTA_ERR_NOMEM;
+    }
+    if (s->disk_size) {
+        q->plat.disk.data = malloc(s->disk_size);
+        if (!q->plat.disk.data) {
+            mem_free(&q->mem);
+            quanta_snapshot_free(s);
+            return QUANTA_ERR_NOMEM;
+        }
+        q->plat.disk.size = s->disk_size;
+    }
+    q->nharts = s->nharts;
+    q->loaded = 1;   /* so quanta_restore's guard passes */
+
+    QuantaStatus st = quanta_restore(q, s);
+    quanta_snapshot_free(s);
+    if (st != QUANTA_OK) {   /* shouldn't happen — sizes match by construction */
+        mem_free(&q->mem);
+        free(q->plat.disk.data);
+        q->plat.disk.data = NULL;
+        q->plat.disk.size = 0;
+        q->loaded = 0;
+    }
+    return st;
+}
+
 /* The architectural value of an XLEN-wide quantity for API consumers. RV32
  * registers and PC are stored sign-extended into 64 bits internally, so mask to
  * 32 bits to hand back the real 32-bit value (zero-extended); RV64 is unchanged.

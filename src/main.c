@@ -24,8 +24,14 @@
  * Usage:
  *   quanta [--version] [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]]
  *          [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] [--gdb[=PORT]] [--signature=FILE]
- *          [--disk=FILE] [--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]]
+ *          [--disk=FILE] [--snapshot=FILE] [--restore=FILE]
+ *          [--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]]
  *          [program.elf]
+ *
+ * --snapshot=FILE writes the whole machine state to FILE when the run ends;
+ * --restore=FILE rebuilds a machine from such a file and resumes it (no program
+ * needed). Together they checkpoint and resume a long run, e.g.
+ * `quanta --max-steps=N --snapshot=cp ... ` then `quanta --restore=cp`.
  *
  * --bios (an M-mode firmware ELF, e.g. OpenSBI) with --kernel (a raw S-mode OS
  * image, e.g. a Linux Image) boots the way a real machine does: the firmware runs
@@ -358,6 +364,8 @@ int main(int argc, char **argv) {
     const char *kernel = NULL;  /* --kernel=FILE: raw S-mode OS image (Linux Image) */
     const char *append = NULL;  /* --append=STRING: kernel command line (DTB bootargs) */
     const char *initrd = NULL;  /* --initrd=FILE: cpio initramfs (the kernel's rootfs) */
+    const char *snappath = NULL;   /* --snapshot=FILE: save machine state on exit (E10) */
+    const char *restorepath = NULL;/* --restore=FILE: resume from a saved snapshot (E10) */
     int nharts = 1;             /* --harts=N: number of harts for SMP (M19) */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
@@ -435,6 +443,18 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--initrd needs a file path\n");
                 return 2;
             }
+        } else if (strncmp(argv[i], "--snapshot=", 11) == 0) {
+            snappath = argv[i] + 11;
+            if (snappath[0] == '\0') {
+                fprintf(stderr, "--snapshot needs a file path\n");
+                return 2;
+            }
+        } else if (strncmp(argv[i], "--restore=", 10) == 0) {
+            restorepath = argv[i] + 10;
+            if (restorepath[0] == '\0') {
+                fprintf(stderr, "--restore needs a file path\n");
+                return 2;
+            }
         } else if (strncmp(argv[i], "--harts=", 8) == 0) {
             if (sscanf(argv[i] + 8, "%d", &nharts) != 1 ||
                 nharts < 1 || nharts > (int)QUANTA_MAX_HARTS) {
@@ -447,6 +467,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] "
                     "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] "
+                    "[--snapshot=FILE] [--restore=FILE] "
                     "[--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]] "
                     "[program.elf]\n",
                     argv[0]);
@@ -457,6 +478,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] "
                     "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] "
+                    "[--snapshot=FILE] [--restore=FILE] "
                     "[--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]] "
                     "[program.elf]\n",
                     argv[0]);
@@ -495,20 +517,33 @@ int main(int argc, char **argv) {
         quanta_destroy(q);
         return 2;
     }
+    /* --restore reconstructs the whole machine from a snapshot file, so it is
+     * standalone — no program, firmware, or kernel is loaded alongside it. */
+    if (restorepath && (path || bios || kernel)) {
+        fprintf(stderr, "--restore is standalone: it cannot be combined with a "
+                "program, --bios, or --kernel\n");
+        quanta_destroy(q);
+        return 2;
+    }
 
-    /* Load the program first, since it can fail. The demo maps a fixed region
-     * and copies the hardcoded image; an ELF gets a region sized to its load
-     * image, and the loader prints its own diagnostics on failure. */
-    int demo = (path == NULL && bios == NULL);
-    QuantaStatus st = bios
+    /* Load the program first, since it can fail. --restore rebuilds the machine
+     * from a snapshot; otherwise the demo maps a fixed region and copies the
+     * hardcoded image, an ELF gets a region sized to its load image, and the
+     * loader prints its own diagnostics on failure. */
+    int demo = (path == NULL && bios == NULL && restorepath == NULL);
+    QuantaStatus st = restorepath
+        ? quanta_load_snapshot(q, restorepath)
+        : bios
         ? quanta_load_firmware(q, bios, kernel, append, initrd, mem_req)
         : demo
         ? quanta_load_image(q, MEM_BASE, MEM_SIZE,
                             demo_program, sizeof demo_program, MEM_BASE)
         : quanta_load_elf_ex(q, path, mem_req);
     if (st != QUANTA_OK) {
-        if (demo)      fprintf(stderr, "failed to load demo program\n");
-        else if (bios) fprintf(stderr, "failed to load firmware/kernel\n");
+        if (demo)              fprintf(stderr, "failed to load demo program\n");
+        else if (restorepath)  fprintf(stderr, "failed to restore snapshot %s\n",
+                                       restorepath);
+        else if (bios)         fprintf(stderr, "failed to load firmware/kernel\n");
         quanta_destroy(q);
         return 1;
     }
@@ -539,6 +574,10 @@ int main(int argc, char **argv) {
             printf("Kernel:  %s\n", kernel);
             if (diskpath) printf("Disk:    %s\n", diskpath);
             printf("\n");
+        } else if (restorepath) {
+            printf("Restored from snapshot %s (pc = 0x%0*llx, dtb = 0x%0*llx)\n\n",
+                   restorepath, w, (unsigned long long)entry,
+                   w, (unsigned long long)quanta_dtb_addr(q));
         } else {
             /* The loader hands the guest a device tree per the RISC-V boot
              * contract: a0 = hartid, a1 = dtb (reported here for visibility). */
@@ -609,11 +648,26 @@ int main(int argc, char **argv) {
      * ELF, hence no signature symbols to locate. */
     int sig_failed = 0;
     if (sigfile) {
-        if (demo) {
-            fprintf(stderr, "--signature needs an ELF program, not the demo\n");
+        if (demo || restorepath) {
+            fprintf(stderr, "--signature needs an ELF program\n");
             sig_failed = 1;
         } else {
             sig_failed = dump_signature(path, q, sigfile) != 0;
+        }
+    }
+
+    /* Optionally persist the final machine state so a later --restore resumes it
+     * (E10). It runs whatever the halt reason — checkpointing a capped run is the
+     * point: `quanta --max-steps=N --snapshot=FILE ...` then `quanta --restore=FILE`
+     * continues from exactly there. */
+    int snap_failed = 0;
+    if (snappath) {
+        if (quanta_save_snapshot(q, snappath) != QUANTA_OK) {
+            fprintf(stderr, "failed to write snapshot to %s\n", snappath);
+            snap_failed = 1;
+        } else if (!quiet) {
+            printf("Snapshot written to %s after %llu instruction(s).\n\n",
+                   snappath, (unsigned long long)steps);
         }
     }
 
@@ -664,7 +718,8 @@ int main(int argc, char **argv) {
     int status = (halt == QUANTA_HALT_EXIT) ? (int)(quanta_exit_code(q) & 0xffu)
                : g_console_quit ? 0    /* the user asked to quit — a clean stop */
                : 1;
-    if (sig_failed && status == 0) status = 1; /* surface a dump failure */
+    if (sig_failed && status == 0) status = 1;  /* surface a dump failure */
+    if (snap_failed && status == 0) status = 1; /* surface a snapshot-write failure */
     quanta_destroy(q);
     return status;
 }

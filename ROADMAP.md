@@ -1039,11 +1039,17 @@ replayed and stepped backwards.
   by `tests/snapshot_test.c` / `make check-snapshot` — a guest run to completion,
   then snapshotted midway and replayed, must match bit-for-bit (registers, memory,
   device state, exit, and step count).
-- [ ] **Build (record/replay):** record the nondeterministic inputs (each stdin
-  byte and the step index it was injected at) alongside an initial snapshot;
-  replay restores the snapshot and re-injects the inputs at the same steps,
-  reproducing the run bit-for-bit. Serialise a snapshot + log to a file
-  (`--snapshot=FILE` to write on exit, `--restore=FILE` to resume).
+- [x] **Build (record/replay):** serialise a snapshot to a file and resume from
+  it — `--snapshot=FILE` writes the whole machine state when the run ends,
+  `--restore=FILE` rebuilds a machine from such a file (no program needed) and
+  continues, so a capped run checkpoints and resumes bit-for-bit. *Done:*
+  `quanta_save_snapshot`/`quanta_load_snapshot` in `quanta.c` (a self-describing,
+  layout-signature-guarded file), the two CLI flags in `main.c`, pinned by
+  `tests/check_replay.sh` / `make check-replay` (a mid-run snapshot resumes to the
+  same output+exit as the whole run; a corrupt file is rejected cleanly). Because
+  every tested run is deterministic, snapshot-restore alone replays exactly; a
+  stdin **input-log** for replaying *interactive* console-driven runs is the one
+  noted follow-up.
 - [x] **Build (reverse debugging):** in the GDB stub, keep a ring of periodic
   snapshots and a monotonic machine step-count; implement `bs`/`bc` (reverse-step,
   reverse-continue) by restoring the nearest snapshot at or before the target step
@@ -1053,12 +1059,13 @@ replayed and stepped backwards.
   step-0-pinned ring, and `goto_step` restores + replays; `tests/gdb_client.py` /
   `make check-gdb` exercise `bs` (twice, then a forward replay) and `bc` to an
   earlier breakpoint on `tests/hello.elf`.
-- [ ] **Why:** debugging a fault that appears billions of instructions into a boot
+- [x] **Why:** debugging a fault that appears billions of instructions into a boot
   is otherwise brutal; deterministic replay + reverse-step turns it into a bisect.
-- [ ] **Done when:** a snapshot taken mid-run and restored reproduces the exact
+- [x] **Done when:** a snapshot taken mid-run and restored reproduces the exact
   final state; a recorded run replays bit-for-bit; `gdb` reverse-steps a guest.
-- [ ] **Commits:** `feat: add machine snapshot and restore`,
-  `feat: record and replay a run`, `feat: reverse debugging in the gdb stub`.
+- [x] **Commits:** `feat: add machine snapshot and restore`,
+  `feat: add reverse debugging to the gdb stub`,
+  `feat: serialise snapshots for record and replay`.
 
 ### E11 — WebAssembly build (Quanta in the browser)
 

@@ -90,6 +90,7 @@ make check-uart-rx # check UART receive (piped stdin) and the --disk backend (M1
 make check-virtio  # check the virtio-mmio block device on a --disk image (M18)
 make check-smp     # check SMP: 4 harts, contended LR/SC, a CLINT IPI (M19)
 make check-snapshot # check machine snapshot/restore replays a run bit-for-bit (E10)
+make check-replay  # check --snapshot/--restore file round-trip and resume (E10)
 make check-os      # boot the M16 teaching kernel to userspace (needs cross-toolchain)
 make linux-initramfs # build the Linux initramfs (tests/linux/) for the OpenSBI->Linux boot (M18)
 make check-rv64    # RV64IMAC conformance (tests/rv64/), diff vs qemu-riscv64 (M17)
@@ -127,7 +128,12 @@ to raise or remove the 100M-instruction runaway guard — an interactive
 full-system guest (a booting OS) legitimately runs billions of instructions. Add
 `--harts=N` (1..8) to model an SMP machine: N harts share the memory and devices,
 interleaved by a deterministic round-robin scheduler (M19); the direct ELF/image
-boot brings them all up, and xv6 boots on `--harts=3`. Add
+boot brings them all up, and xv6 boots on `--harts=3`. Add `--snapshot=FILE` to
+write the whole machine state to a file when the run ends, and `--restore=FILE`
+to rebuild a machine from such a file and resume it (standalone — no program
+needed); together they checkpoint and resume a long run
+(`--max-steps=N --snapshot=FILE …` then `--restore=FILE`), the deterministic
+scheduler making the resumed tail bit-identical (E10). Add
 `--signature=FILE` to dump the
 architectural-test signature region (the words between the
 `begin_signature`/`end_signature` ELF symbols, in the suite's reference format) —
@@ -278,9 +284,10 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   `quanta_dtb_addr` reports where it landed. The **snapshot/restore** primitive
   (E10) lives here too: `quanta_snapshot` deep-copies the whole mutable machine
   into an opaque `QuantaSnapshot`, `quanta_restore` puts it back and re-wires the
-  borrowed pointers — the foundation for record/replay and reverse debugging (see
-  the snapshot gotcha). Built as `libquanta.a`; the CLI and `examples/embed.c` are
-  clients of it.
+  borrowed pointers, and `quanta_save_snapshot`/`quanta_load_snapshot` serialise
+  that to/from a self-describing file (the `--snapshot`/`--restore` flags) — the
+  foundation for record/replay and reverse debugging (see the snapshot gotchas).
+  Built as `libquanta.a`; the CLI and `examples/embed.c` are clients of it.
 - `src/gdbstub.{h,c}` — a GDB remote-serial-protocol server over TCP (E9):
   `quanta_gdb_serve(q, port)` listens on localhost, accepts one debugger, and
   drives the machine through the public `quanta.h` API alone — registers, memory,
@@ -296,6 +303,7 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
 - `src/main.c` — the CLI driver, a thin client over `quanta.h`: argument parsing,
   the `--trace` narration, the `--pipeline`/`--cache` overlays, the `--gdb` stub
   hand-off, the `--signature` arch-test dump, `--disk` attachment, the
+  `--snapshot`/`--restore` machine state save/resume (E10), the
   `--bios`/`--kernel` firmware-boot path (loads an M-mode firmware that hands off
   to an S-mode OS via `quanta_load_firmware`), the
   `--max-steps` runaway cap (0 = uncapped, for a booting OS), and the console
@@ -415,9 +423,22 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
 - `tests/check_gdb.sh` + `tests/gdb_client.py` — exercise the GDB stub (`--gdb`)
   end to end with a self-contained RSP client (no riscv `gdb` needed): it
   attaches, reads/writes registers and memory, single-steps, sets a breakpoint
-  and continues to exit on `tests/hello.elf`, asserting the known outcomes
-  (`make check-gdb`). Skips cleanly without python3; also run under `make
-  sanitize` and `make coverage`.
+  and continues to exit on `tests/hello.elf`, and — for E10 — reverse-steps (`bs`)
+  and reverse-continues (`bc`) over the known instruction sequence, asserting the
+  known outcomes (`make check-gdb`). Skips cleanly without python3; also run under
+  `make sanitize` and `make coverage`.
+- `tests/snapshot_test.c` — the E10 snapshot/restore conformance harness
+  (`make check-snapshot`): links `libquanta` directly and, for each guest, runs to
+  completion as a control, then reruns taking a snapshot at the midpoint and
+  replaying the tail — asserting the final registers, memory, exit, and step count
+  match bit-for-bit. Guests span the state (stack/array, muldiv, atomics, and the
+  device/interrupt test for device-state capture). Also run under `make sanitize`/
+  `make coverage`.
+- `tests/check_replay.sh` — the E10 snapshot *file* round-trip (`make check-replay`,
+  `--snapshot`/`--restore`): splits a run with a mid-run snapshot and asserts the
+  resumed half reproduces the whole run's output and exit, that a halted-machine
+  snapshot round-trips, and that a corrupt file is rejected cleanly. Drives the CLI;
+  needs the cross-toolchain. Also run under `make sanitize`/`make coverage`.
 - `tests/check_devices.sh` — runs `test_irq` and asserts both halves of M13's
   "done when": a clean exit (timer, IPI, and PLIC external interrupts all fired)
   and the UART's "uart ok" reaching stdout (`make check-devices`). Also run under
@@ -973,8 +994,24 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   no host-thread/wall-clock nondeterminism, so a machine restored to a point
   re-executes the identical instruction stream (given the same later console
   input). `tests/snapshot_test.c` pins it by replaying a guest's tail from a
-  mid-run snapshot; the GDB reverse-step below builds on it, and the record/replay
-  file serialisation is the remaining E10 piece (not yet done).
+  mid-run snapshot; the GDB reverse-step below builds on it.
+- Snapshot *file* serialisation (E10, `--snapshot`/`--restore`, `quanta_save_
+  snapshot`/`quanta_load_snapshot` in `quanta.c`): a snapshot writes to a
+  self-describing file — a 72-byte little-endian header, then the **raw bytes** of
+  the inline state (the harts array and the `Platform`), then guest RAM and the
+  disk. Field-by-field serialisation would be enormous (the CSR file alone is 4096
+  entries per hart) and no more correct on the same build, so the raw-struct dump
+  is the pragmatic choice; the cost is that a file is **host-ABI specific**, so the
+  header records `sizeof(CPU)`/`sizeof(Platform)`/`QUANTA_MAX_HARTS` and a load
+  **rejects** any file whose signature does not match the running binary (clean
+  fail, never a mis-read). The pointer members on disk are meaningless and
+  `quanta_restore` re-wires them. `--restore` is **self-contained** — it sizes and
+  fills RAM and the disk from the file (via `mem_init` + a disk `malloc`, then
+  `quanta_restore`), so no ELF/kernel is given alongside it, and it is standalone
+  (`main.c` rejects combining it with a program/`--bios`). `--snapshot` runs at the
+  end of a run whatever the halt reason, so `--max-steps=N --snapshot=FILE` is the
+  checkpoint idiom. The cache is not serialised (observability only). Pinned by
+  `tests/check_replay.sh` / `make check-replay`.
 - Reverse debugging in the GDB stub (E10, `gdbstub.c`): a stock `gdb` reverse-steps
   (`bs`) and reverse-continues (`bc`) a guest, advertised via `ReverseStep+`/
   `ReverseContinue+` in `qSupported`. The mechanism is a **monotonic step count**

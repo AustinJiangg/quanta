@@ -194,6 +194,25 @@ QuantaStatus quanta_restore(Quanta *q, const QuantaSnapshot *s);
 /* Free a snapshot. A NULL handle is ignored. */
 void quanta_snapshot_free(QuantaSnapshot *s);
 
+/* Serialise the current machine state to `path` — a self-describing snapshot file
+ * (the guest RAM, the device state, the disk, and every hart) that quanta_load_
+ * snapshot can resume from in a fresh process. A checkpoint of a long-running boot
+ * you can return to. Returns QUANTA_ERR_INVAL if nothing is loaded, QUANTA_ERR_LOAD
+ * if the file cannot be written, QUANTA_ERR_NOMEM on allocation failure. The file
+ * is host-ABI specific (it embeds the raw machine structs) and carries a layout
+ * signature quanta_load_snapshot checks, so a mismatched build is rejected, not
+ * mis-read. The observability-only cache is not saved. */
+QuantaStatus quanta_save_snapshot(const Quanta *q, const char *path);
+
+/* Reconstruct a machine from a snapshot file written by quanta_save_snapshot,
+ * into a fresh handle (one with no program loaded) — it sizes and fills guest RAM
+ * and the disk from the file and restores all state, so no ELF/kernel need be
+ * given. Returns QUANTA_ERR_INVAL if `q` already has a program loaded, QUANTA_ERR_
+ * LOAD if the file is missing/corrupt or was written by an incompatible build,
+ * QUANTA_ERR_NOMEM on allocation failure. On success the machine is exactly where
+ * it was saved and quanta_run/quanta_step resume it. */
+QuantaStatus quanta_load_snapshot(Quanta *q, const char *path);
+
 /* --- introspection --- */
 
 uint64_t quanta_reg(const Quanta *q, int i);        /* x0..x31; 0 for x0/oob */
