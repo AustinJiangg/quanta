@@ -450,6 +450,122 @@ int quanta_uart_input(Quanta *q, uint8_t byte) {
     return plat_uart_rx(&q->plat, byte);
 }
 
+/*
+ * Snapshot / restore (E10). The whole mutable machine is a fixed-size struct plus
+ * two heap buffers (guest RAM and the optional in-memory disk); everything else —
+ * the harts (registers/CSRs/TLB), the device register files, and the scheduler
+ * bookkeeping — lives inline in the handle. So a snapshot is a value copy of the
+ * inline state plus a deep copy of the two buffers, and a restore reverses it and
+ * re-points the borrowed pointers (each hart's memory/cache, the memory's platform
+ * back-pointer, and the platform's RAM/hart/disk pointers) at the live objects.
+ *
+ * The cache is left out on purpose: it is a pure observability layer whose state
+ * never changes results, so a restored run stays bit-identical without it, and
+ * copying its internal LRU arrays would only add cost. The determinism of the
+ * round-robin scheduler is what makes this exact — a restored machine re-executes
+ * the same instruction stream given the same subsequent console input.
+ */
+struct QuantaSnapshot {
+    CPU        harts[QUANTA_MAX_HARTS]; /* value copy; borrowed pointers rewired on restore */
+    int        nharts;
+    int        sched;
+    int        m_halted;
+    HaltReason m_reason;
+    uint32_t   m_exit;
+    uint32_t   dtb_addr;
+    int        cache_on;
+    int        loaded;
+
+    uint64_t   mem_base;
+    uint64_t   mem_size;
+    int        mem_fault;
+    uint64_t   mem_fault_addr;
+    uint8_t   *mem_data;   /* deep copy of mem_size bytes */
+
+    Platform   plat;       /* value copy of the device register files; pointers rewired */
+    uint8_t   *disk_data;  /* deep copy of disk_size bytes, or NULL when no disk */
+    uint64_t   disk_size;
+};
+
+QuantaSnapshot *quanta_snapshot(const Quanta *q) {
+    if (!q || !q->loaded) return NULL;
+
+    QuantaSnapshot *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+
+    memcpy(s->harts, q->harts, sizeof s->harts);
+    s->nharts   = q->nharts;   s->sched    = q->sched;
+    s->m_halted = q->m_halted; s->m_reason = q->m_reason; s->m_exit = q->m_exit;
+    s->dtb_addr = q->dtb_addr; s->cache_on = q->cache_on; s->loaded = q->loaded;
+
+    s->mem_base  = q->mem.base;  s->mem_size = q->mem.size;
+    s->mem_fault = q->mem.fault; s->mem_fault_addr = q->mem.fault_addr;
+    s->mem_data  = malloc(q->mem.size ? q->mem.size : 1);
+    if (!s->mem_data) { free(s); return NULL; }
+    memcpy(s->mem_data, q->mem.data, q->mem.size);
+
+    s->plat      = q->plat;   /* register files + pointer *values* (rewired on restore) */
+    s->disk_size = q->plat.disk.size;
+    if (q->plat.disk.data && q->plat.disk.size) {
+        s->disk_data = malloc(q->plat.disk.size);
+        if (!s->disk_data) { free(s->mem_data); free(s); return NULL; }
+        memcpy(s->disk_data, q->plat.disk.data, q->plat.disk.size);
+    }
+    return s;
+}
+
+QuantaStatus quanta_restore(Quanta *q, const QuantaSnapshot *s) {
+    if (!q || !s || !q->loaded || !s->loaded) return QUANTA_ERR_INVAL;
+    /* Same-machine only: the live heap buffers must match the snapshot's sizes,
+     * since we restore into them in place rather than reallocating. */
+    if (s->mem_size != q->mem.size || s->disk_size != q->plat.disk.size)
+        return QUANTA_ERR_INVAL;
+
+    uint8_t *live_ram  = q->mem.data;        /* engine-owned buffers to keep */
+    uint8_t *live_disk = q->plat.disk.data;
+
+    /* Harts: value copy, then re-point each hart's borrowed pointers at the live
+     * memory and (if enabled) cache. */
+    memcpy(q->harts, s->harts, sizeof q->harts);
+    for (unsigned i = 0; i < QUANTA_MAX_HARTS; i++) {
+        q->harts[i].mem   = &q->mem;
+        q->harts[i].cache = s->cache_on ? &q->cache : NULL;
+    }
+
+    q->nharts   = s->nharts;   q->sched    = s->sched;
+    q->m_halted = s->m_halted; q->m_reason = s->m_reason; q->m_exit = s->m_exit;
+    q->dtb_addr = s->dtb_addr; q->cache_on = s->cache_on; q->loaded = s->loaded;
+
+    /* Memory: restore contents into the live buffer, keep the live pointer, and
+     * re-attach the platform back-pointer. */
+    memcpy(live_ram, s->mem_data, s->mem_size);
+    q->mem.base = s->mem_base; q->mem.size = s->mem_size;
+    q->mem.fault = s->mem_fault; q->mem.fault_addr = s->mem_fault_addr;
+    q->mem.data = live_ram;
+    q->mem.plat = &q->plat;
+
+    /* Platform: value copy of the device register files, then re-wire every
+     * pointer to a live object and restore the disk contents in place. */
+    q->plat = s->plat;
+    q->plat.harts    = q->harts;
+    q->plat.nharts   = s->nharts;
+    q->plat.ram      = live_ram;
+    q->plat.ram_base = q->mem.base;
+    q->plat.ram_size = q->mem.size;
+    q->plat.disk.data = live_disk;
+    q->plat.disk.size = s->disk_size;
+    if (live_disk && s->disk_data) memcpy(live_disk, s->disk_data, s->disk_size);
+
+    return QUANTA_OK;
+}
+
+void quanta_snapshot_free(QuantaSnapshot *s) {
+    if (!s) return;
+    free(s->mem_data);
+    free(s->disk_data);
+    free(s);
+}
+
 /* The architectural value of an XLEN-wide quantity for API consumers. RV32
  * registers and PC are stored sign-extended into 64 bits internally, so mask to
  * 32 bits to hand back the real 32-bit value (zero-extended); RV64 is unchanged.

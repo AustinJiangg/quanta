@@ -1,6 +1,7 @@
 # Build output
 /quanta
 /examples/embed
+/tests/snapshot_test
 /fuzz/fuzz_elf
 /fuzz/fuzz_decode
 /fuzz/*.replay

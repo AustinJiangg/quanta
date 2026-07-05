@@ -57,7 +57,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-smp check-os check-rv64 check-diff check-arch embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-smp check-os check-rv64 check-diff check-arch check-snapshot embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -313,6 +313,24 @@ DIFF_ELF := $(filter-out tests/test_csr.elf tests/test_trap.elf tests/test_priv.
 check-diff: $(BIN) $(TEST_ELF)
 	@sh tests/check_diff.sh $(DIFF_ELF)
 
+# Exercise the E10 snapshot/restore primitive: run a guest to completion once as
+# a control, then run it again taking a snapshot midway and assert the tail
+# replays bit-for-bit from the snapshot (same final registers, memory, exit, and
+# step count). Links libquanta directly, like the embed example; needs the
+# cross-toolchain for the guest ELFs. The guests span varied state — a stack/array
+# workload, muldiv, atomics (the LR/SC reservation fields), and the device/
+# interrupt test (so a regression in device-state capture — the CLINT timer, PLIC,
+# and UART register files — diverges the interrupt timing and fails the replay;
+# its "uart ok" prints once per run, hence three times).
+SNAP_ELF := tests/test_stack.elf tests/test_muldiv.elf tests/test_atomic.elf \
+            tests/test_irq.elf
+
+check-snapshot: tests/snapshot_test $(SNAP_ELF)
+	./tests/snapshot_test $(SNAP_ELF)
+
+tests/snapshot_test: tests/snapshot_test.c $(LIB) $(wildcard src/*.h)
+	$(CC) $(CFLAGS) -o $@ tests/snapshot_test.c $(LIB) $(LDFLAGS)
+
 # Official RISC-V architectural conformance. Build each riscv-arch-test program
 # with the Quanta target (tests/arch/), run it under --signature, and diff the
 # result against the suite's committed reference signatures — the recognised bar
@@ -335,7 +353,7 @@ sanitize:
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
 		check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio \
-		check-smp check-os check-rv64 check-diff
+		check-smp check-os check-rv64 check-diff check-snapshot
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
 # the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`
@@ -366,7 +384,7 @@ COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
 
 coverage:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-smp check-os
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-smp check-os check-snapshot
 	@sh tests/coverage.sh
 
 # Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),
@@ -394,7 +412,7 @@ uninstall:
 		$(DESTDIR)$(PREFIX)/share/man/man1/quanta.1
 
 clean:
-	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/*.elf tests/os/*.elf \
-		tests/rv64/*.elf $(FUZZ_TARGETS) fuzz/*.replay \
+	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/snapshot_test tests/*.elf \
+		tests/os/*.elf tests/rv64/*.elf $(FUZZ_TARGETS) fuzz/*.replay \
 		src/*.gcno src/*.gcda examples/*.gcno examples/*.gcda
 	rm -rf build/arch-work build/coverage

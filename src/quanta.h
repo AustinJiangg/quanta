@@ -167,6 +167,33 @@ QuantaHalt quanta_step(Quanta *q);
  * when it is non-NULL. */
 QuantaHalt quanta_run(Quanta *q, uint64_t max_steps, uint64_t *steps_out);
 
+/* --- snapshot / restore (E10) --- */
+
+/* An opaque, self-contained copy of the whole machine state at a point in time:
+ * every hart's registers, CSRs, TLB, and PC; all of guest RAM; the device
+ * register files (CLINT/PLIC/UART/virtio) and power-off state; the in-memory
+ * disk; and the scheduler cursor and machine-halt state. The observability-only
+ * cache is deliberately not captured — it never affects results. Because the
+ * round-robin scheduler is fully deterministic, a run is a pure function of a
+ * snapshot plus its later console input, so this is the primitive under
+ * record/replay and reverse debugging. */
+typedef struct QuantaSnapshot QuantaSnapshot;
+
+/* Capture the current machine state as a deep, independent copy. Returns NULL if
+ * `q` has no program loaded or on out-of-memory. `q` may run on afterwards and
+ * still be restored to this point later. Free with quanta_snapshot_free. */
+QuantaSnapshot *quanta_snapshot(const Quanta *q);
+
+/* Restore a snapshot into `q`, replacing its entire state and re-wiring the
+ * borrowed pointers to the live objects. `q` must be the same machine the
+ * snapshot came from — same guest-RAM and disk sizes — or QUANTA_ERR_INVAL is
+ * returned and `q` is left untouched. The cache's hit/miss counters are left as
+ * they are (results are unaffected). Returns QUANTA_OK on success. */
+QuantaStatus quanta_restore(Quanta *q, const QuantaSnapshot *s);
+
+/* Free a snapshot. A NULL handle is ignored. */
+void quanta_snapshot_free(QuantaSnapshot *s);
+
 /* --- introspection --- */
 
 uint64_t quanta_reg(const Quanta *q, int i);        /* x0..x31; 0 for x0/oob */

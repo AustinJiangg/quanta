@@ -89,6 +89,7 @@ make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-t
 make check-uart-rx # check UART receive (piped stdin) and the --disk backend (M18)
 make check-virtio  # check the virtio-mmio block device on a --disk image (M18)
 make check-smp     # check SMP: 4 harts, contended LR/SC, a CLINT IPI (M19)
+make check-snapshot # check machine snapshot/restore replays a run bit-for-bit (E10)
 make check-os      # boot the M16 teaching kernel to userspace (needs cross-toolchain)
 make linux-initramfs # build the Linux initramfs (tests/linux/) for the OpenSBI->Linux boot (M18)
 make check-rv64    # RV64IMAC conformance (tests/rv64/), diff vs qemu-riscv64 (M17)
@@ -274,8 +275,12 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   `QuantaStatus`/`QuantaHalt` enums. The M14 boot handoff lives here too:
   `setup_boot` (run only on the ELF path) builds the device tree via `dtb.c`,
   places it atop guest memory, and sets `a0`=hartid/`a1`=DTB/`sp`-below-DTB;
-  `quanta_dtb_addr` reports where it landed. Built as `libquanta.a`; the CLI and
-  `examples/embed.c` are clients of it.
+  `quanta_dtb_addr` reports where it landed. The **snapshot/restore** primitive
+  (E10) lives here too: `quanta_snapshot` deep-copies the whole mutable machine
+  into an opaque `QuantaSnapshot`, `quanta_restore` puts it back and re-wires the
+  borrowed pointers — the foundation for record/replay and reverse debugging (see
+  the snapshot gotcha). Built as `libquanta.a`; the CLI and `examples/embed.c` are
+  clients of it.
 - `src/gdbstub.{h,c}` — a GDB remote-serial-protocol server over TCP (E9):
   `quanta_gdb_serve(q, port)` listens on localhost, accepts one debugger, and
   drives the machine through the public `quanta.h` API alone — registers, memory,
@@ -948,6 +953,25 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   `test_rv64_smp.S`/`make check-smp`, and xv6 boots `--harts=3` (a manual trophy,
   like the single-hart xv6/Linux boots — the same `kernel/kernel` binary, since
   xv6's `CPUS` is only a runtime qemu `-smp` flag and `NCPU`=8).
+- Snapshot/restore (E10, `quanta_snapshot`/`quanta_restore` in `quanta.c`): the
+  whole mutable machine is a fixed-size struct (the `harts` array — registers,
+  CSRs, TLB, PC — plus the inline `Platform` device register files and the
+  scheduler bookkeeping) and two heap buffers (guest RAM and the optional
+  in-memory `--disk`). So a snapshot is a value copy of the inline state plus a
+  deep copy of the two buffers; a restore reverses that and **re-wires the borrowed
+  pointers** — each hart's `mem`/`cache`, the memory's `plat` back-pointer, and the
+  platform's `ram`/`harts`/`disk.data` — to the live objects rather than the stale
+  pointer values the value copy carried. Restore is **same-machine only** (it
+  restores into the live RAM/disk buffers in place, so their sizes must match — it
+  returns `QUANTA_ERR_INVAL` otherwise); it does not reallocate. The
+  observability-only **cache is deliberately not captured** — it never changes
+  results, so a restored run stays bit-identical without it. What makes the replay
+  exact is the M19 determinism: `mtime` ticks once per scheduler round and there is
+  no host-thread/wall-clock nondeterminism, so a machine restored to a point
+  re-executes the identical instruction stream (given the same later console
+  input). `tests/snapshot_test.c` pins it by replaying a guest's tail from a
+  mid-run snapshot; the record/replay serialisation and the GDB reverse-step that
+  build on this primitive are the rest of E10 (not yet done).
 - The JALR base/link ordering (the Linux-boot fix, and a real correctness bug):
   `exec`'s `OP_JALR` must compute the target from `rs1` **before** writing the
   link register `rd = pc + ilen`, because `rd` can alias `rs1`. The `call`

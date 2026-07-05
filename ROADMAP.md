@@ -1029,12 +1029,16 @@ and it is the highest-leverage tool to build *first*, because every later
 milestone (softfloat, the JIT) is far easier to debug when a failing run can be
 replayed and stepped backwards.
 
-- [ ] **Build (foundation):** a full-machine **snapshot/restore** primitive in the
+- [x] **Build (foundation):** a full-machine **snapshot/restore** primitive in the
   engine — capture every mutable byte (all harts' registers/CSRs/TLB/PC, the whole
   RAM image, the device register files, the in-memory disk, the scheduler cursor
   and machine-halt state) into an opaque `QuantaSnapshot`, and restore it into the
   same instance, re-wiring the borrowed pointers to the live objects. The
-  observability-only cache is excluded (it never changes results).
+  observability-only cache is excluded (it never changes results). *Done:*
+  `quanta_snapshot`/`quanta_restore`/`quanta_snapshot_free` in `quanta.c`, pinned
+  by `tests/snapshot_test.c` / `make check-snapshot` — a guest run to completion,
+  then snapshotted midway and replayed, must match bit-for-bit (registers, memory,
+  device state, exit, and step count).
 - [ ] **Build (record/replay):** record the nondeterministic inputs (each stdin
   byte and the step index it was injected at) alongside an initial snapshot;
   replay restores the snapshot and re-injects the inputs at the same steps,
