@@ -1044,10 +1044,15 @@ replayed and stepped backwards.
   replay restores the snapshot and re-injects the inputs at the same steps,
   reproducing the run bit-for-bit. Serialise a snapshot + log to a file
   (`--snapshot=FILE` to write on exit, `--restore=FILE` to resume).
-- [ ] **Build (reverse debugging):** in the GDB stub, keep a ring of periodic
+- [x] **Build (reverse debugging):** in the GDB stub, keep a ring of periodic
   snapshots and a monotonic machine step-count; implement `bs`/`bc` (reverse-step,
   reverse-continue) by restoring the nearest snapshot at or before the target step
-  and replaying forward, so a stock `gdb` steps a booting kernel backwards.
+  and replaying forward, so a stock `gdb` steps a booting kernel backwards. *Done:*
+  `gdbstub.c` advertises `ReverseStep+`/`ReverseContinue+`, checkpoints lazily
+  (only once a reverse op is used, so forward-only sessions pay nothing) with a
+  step-0-pinned ring, and `goto_step` restores + replays; `tests/gdb_client.py` /
+  `make check-gdb` exercise `bs` (twice, then a forward replay) and `bc` to an
+  earlier breakpoint on `tests/hello.elf`.
 - [ ] **Why:** debugging a fault that appears billions of instructions into a boot
   is otherwise brutal; deterministic replay + reverse-step turns it into a bisect.
 - [ ] **Done when:** a snapshot taken mid-run and restored reproduces the exact

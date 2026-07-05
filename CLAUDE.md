@@ -287,7 +287,10 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   single-step, halt reason — answering the `g`/`G`/`m`/`M`/`p`/`P`/`c`/`s`/`vCont`/
   `Z`/`z`/`qXfer` packets and serving an RV32 target description. Breakpoints are
   tracked here and enforced in the continue loop, so guest memory is never
-  patched. Reached via `--gdb` from `main.c`, and embeddable. Its POSIX-sockets
+  patched. **Reverse execution** (E10) rides on the snapshot primitive: the stub
+  keeps a monotonic step count and a ring of machine snapshots, and answers `bs`/
+  `bc` (reverse-step/-continue) by restoring the nearest checkpoint and replaying
+  forward (see the reverse-debugging gotcha). Reached via `--gdb` from `main.c`, and embeddable. Its POSIX-sockets
   feature macro is local to the `.c` — one of the project's two OS-specific
   corners (the other is `main.c`'s console input).
 - `src/main.c` — the CLI driver, a thin client over `quanta.h`: argument parsing,
@@ -970,8 +973,24 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   no host-thread/wall-clock nondeterminism, so a machine restored to a point
   re-executes the identical instruction stream (given the same later console
   input). `tests/snapshot_test.c` pins it by replaying a guest's tail from a
-  mid-run snapshot; the record/replay serialisation and the GDB reverse-step that
-  build on this primitive are the rest of E10 (not yet done).
+  mid-run snapshot; the GDB reverse-step below builds on it, and the record/replay
+  file serialisation is the remaining E10 piece (not yet done).
+- Reverse debugging in the GDB stub (E10, `gdbstub.c`): a stock `gdb` reverse-steps
+  (`bs`) and reverse-continues (`bc`) a guest, advertised via `ReverseStep+`/
+  `ReverseContinue+` in `qSupported`. The mechanism is a **monotonic step count**
+  (`nsteps`, a stable time coordinate because the run is deterministic and a gdb
+  session feeds no external input) plus a **ring of machine snapshots**: to reach an
+  earlier step, `goto_step` restores the nearest checkpoint at or before it and
+  replays forward (`raw_step`); `bs` targets `nsteps-1`, `bc` replays from the start
+  tracking the last step whose PC is a breakpoint. Checkpointing is **lazy** — it
+  only kicks in after the first reverse op (`reverse_used`), so plain forward-only
+  sessions (and the pre-E10 behaviour) pay nothing; `cp[0]` is pinned to the attach
+  point (step 0) and the rest roll, evicting the oldest so replays stay short near
+  the current position. Two caveats: (1) reverse debugging replays the deterministic
+  instruction stream, so manual `P`/`M`/`G` pokes are *not* part of history and are
+  undone by a rewind; (2) each checkpoint is a full-machine copy, so the memory/
+  latency cost scales with guest RAM (fine for the tests; heavy but inherent for a
+  128 MiB Linux). Pinned by `tests/gdb_client.py` / `make check-gdb`.
 - The JALR base/link ordering (the Linux-boot fix, and a real correctness bug):
   `exec`'s `OP_JALR` must compute the target from `rs1` **before** writing the
   link register `rd = pc + ilen`, because `rd` can alias `rs1`. The `call`

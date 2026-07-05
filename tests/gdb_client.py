@@ -154,7 +154,44 @@ def main():
         check(reg(regs, A2) == 42, "a2 == 42 at the breakpoint")
         check(reg(regs, A3) == 32, "a3 == 32 at the breakpoint")
 
-        # Remove it and run to the exit syscall.
+        # --- reverse execution (E10): the snapshot/replay time machine ---
+        check("ReverseStep" in sup and "ReverseContinue" in sup,
+              "qSupported advertises reverse execution")
+
+        # bs: step back over the `sub a3,a1,a0` — a3 is un-written again, a2 stays.
+        st = g.cmd("bs")
+        check(st.startswith(("S05", "T05")), f"bs -> SIGTRAP ({st})")
+        regs = g.cmd("g")
+        check(reg(regs, PC) == 0x8000000c, "bs steps pc back to the sub")
+        check(reg(regs, A3) == 0, "a3 un-written after reverse-step")
+        check(reg(regs, A2) == 42, "a2 still 42 after reverse-step")
+
+        # A second bs backs over `add a2,a0,a1` — now a2 is un-written too.
+        g.cmd("bs")
+        regs = g.cmd("g")
+        check(reg(regs, PC) == 0x80000008, "second bs steps back to the add")
+        check(reg(regs, A2) == 0, "a2 un-written two steps back")
+
+        # Stepping forward again deterministically replays the add.
+        g.cmd("s")
+        regs = g.cmd("g")
+        check(reg(regs, PC) == 0x8000000c, "forward step replays past the add")
+        check(reg(regs, A2) == 42, "a2 == 42 again after replay")
+
+        # bc: reverse-continue to an earlier breakpoint (the second instruction),
+        # rewinding across several instructions at once.
+        check(g.cmd("Z0,80000004,4") == "OK", "Z0 sets an earlier breakpoint")
+        st = g.cmd("bc")
+        check(st.startswith(("S05", "T05")), f"bc -> SIGTRAP ({st})")
+        regs = g.cmd("g")
+        check(reg(regs, PC) == 0x80000004, "bc rewound to the earlier breakpoint")
+        check(reg(regs, A0) == 5, "a0 == 5 at the rewound breakpoint")
+        # a1 holds the boot DTB pointer here, not 0 — the point is it is not yet
+        # the 37 that `addi a1,zero,37` writes one instruction later.
+        check(reg(regs, A1) != 37, "a1 not yet written to 37 at the rewound breakpoint")
+        check(g.cmd("z0,80000004,4") == "OK", "z0 clears the earlier breakpoint")
+
+        # Remove the first breakpoint and run forward to the exit syscall.
         check(g.cmd("z0,80000010,4") == "OK", "z0 clears the breakpoint")
         st = g.cmd("c")
         check(st == "W00", f"c -> clean exit, code 0 ({st})")

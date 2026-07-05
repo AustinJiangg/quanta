@@ -35,6 +35,8 @@
 #define GDB_BUFSZ        8192
 #define GDB_MAX_PAYLOAD  ((GDB_BUFSZ - 16) / 2)  /* bytes per m/M packet */
 #define GDB_MAX_BP       128
+#define GDB_MAX_CP       33      /* reverse-exec checkpoints: step-0 + up to 32 recent */
+#define GDB_CP_INTERVAL  4096    /* steps between checkpoints once reverse exec is used */
 
 /* GDB signal numbers used in stop replies. */
 #define SIG_INT   2   /* SIGINT  — Ctrl-C from the debugger          */
@@ -47,6 +49,13 @@
  * loaded program's width (RV32 vs RV64). The register order matches the g/G
  * packet layout. */
 
+/* A reverse-execution checkpoint: a full machine snapshot tagged with the step it
+ * was taken at (E10). */
+typedef struct {
+    uint64_t        step;
+    QuantaSnapshot *snap;
+} GdbCheckpoint;
+
 typedef struct {
     int      fd;                  /* the connected debugger socket */
     Quanta  *q;                   /* the machine being debugged */
@@ -55,6 +64,14 @@ typedef struct {
     int      want_quit;          /* debugger detached/killed — end the session */
     uint64_t bp[GDB_MAX_BP];     /* software-breakpoint addresses */
     int      bp_used[GDB_MAX_BP];
+    /* Reverse execution (E10): a running step count as a stable time coordinate,
+     * plus a ring of machine snapshots so any earlier step can be reached by
+     * restoring the nearest checkpoint and replaying forward. */
+    uint64_t      nsteps;             /* instructions executed since attach */
+    int           reverse_used;       /* a reverse op was issued (enables checkpointing) */
+    uint64_t      last_cp_step;       /* step of the most recent checkpoint */
+    GdbCheckpoint cp[GDB_MAX_CP];     /* cp[0] pinned to step 0; the rest roll */
+    int           ncp;
 } GdbStub;
 
 /* do_continue() outcomes. */
@@ -232,6 +249,70 @@ static void bp_remove(GdbStub *s, uint64_t addr) {
         if (s->bp_used[i] && s->bp[i] == addr) s->bp_used[i] = 0;
 }
 
+/* --- reverse execution: checkpoints + deterministic replay (E10) --- */
+
+/* Step one instruction, tracking the running step count. Because the scheduler is
+ * deterministic and a gdb session feeds no external input, this count is a stable
+ * coordinate: any step can be revisited by restoring a checkpoint at or before it
+ * and replaying forward. A no-op once the machine has halted. */
+static QuantaHalt raw_step(GdbStub *s) {
+    QuantaHalt h = quanta_halt_reason(s->q);
+    if (h != QUANTA_RUN) return h;
+    h = quanta_step(s->q);
+    s->nsteps++;
+    return h;
+}
+
+/* Checkpoint the current machine at step `step`. cp[0] is pinned to the attach
+ * point (step 0); when the ring is full a new checkpoint evicts the oldest recent
+ * one, so the retained set is step 0 plus the most recent GDB_MAX_CP-1
+ * checkpoints — keeping replays short near the current position. Silently skips on
+ * out-of-memory (fewer checkpoints only means longer replays, never wrong ones). */
+static void cp_add(GdbStub *s, uint64_t step) {
+    QuantaSnapshot *snap = quanta_snapshot(s->q);
+    if (snap == NULL) return;
+    int slot;
+    if (s->ncp < GDB_MAX_CP) {
+        slot = s->ncp++;
+    } else {
+        slot = 1;                        /* never evict cp[0] (step 0) */
+        for (int i = 2; i < s->ncp; i++)
+            if (s->cp[i].step < s->cp[slot].step) slot = i;
+        quanta_snapshot_free(s->cp[slot].snap);
+    }
+    s->cp[slot].step = step;
+    s->cp[slot].snap = snap;
+    s->last_cp_step = step;
+}
+
+/* Step forward one instruction and, once reverse execution has been used at least
+ * once, take a periodic checkpoint so later reverse operations replay from nearby.
+ * Plain (forward-only) sessions never checkpoint, so they pay nothing. */
+static QuantaHalt stub_step(GdbStub *s) {
+    QuantaHalt h = raw_step(s);
+    if (s->reverse_used && h == QUANTA_RUN &&
+        s->nsteps - s->last_cp_step >= GDB_CP_INTERVAL)
+        cp_add(s, s->nsteps);
+    return h;
+}
+
+/* Move the machine to exactly step `target` (<= a previously reached step):
+ * restore the nearest checkpoint at or before it, then replay forward. Exact,
+ * since execution is deterministic. Does nothing if no checkpoint exists (the
+ * attach snapshot failed), leaving the machine where it was. */
+static void goto_step(GdbStub *s, uint64_t target) {
+    int best = -1;
+    for (int i = 0; i < s->ncp; i++)
+        if (s->cp[i].step <= target &&
+            (best < 0 || s->cp[i].step > s->cp[best].step))
+            best = i;
+    if (best < 0 || quanta_restore(s->q, s->cp[best].snap) != QUANTA_OK)
+        return;
+    s->nsteps = s->cp[best].step;
+    while (s->nsteps < target)
+        if (raw_step(s) != QUANTA_RUN) break; /* deterministic: won't halt early */
+}
+
 /* --- stop replies and execution --- */
 
 /* Build the stop-reply for the current machine state. When the machine is still
@@ -273,7 +354,7 @@ static int send_stop(GdbStub *s, int sig, int swbreak_hit) {
  * a Ctrl-C. One instruction is always executed first, so "continue" off a
  * breakpoint makes progress instead of re-triggering it immediately. */
 static int do_continue(GdbStub *s) {
-    QuantaHalt h = quanta_step(s->q);
+    QuantaHalt h = stub_step(s);
     unsigned long guard = 0;
     while (h == QUANTA_RUN) {
         if (bp_match(s, quanta_pc(s->q))) return CONT_BREAK;
@@ -282,7 +363,7 @@ static int do_continue(GdbStub *s) {
             if (ip < 0) return CONT_DEAD;
             if (ip > 0) return CONT_INTR;
         }
-        h = quanta_step(s->q);
+        h = stub_step(s);
     }
     return CONT_HALTED;
 }
@@ -294,6 +375,32 @@ static int continue_and_reply(GdbStub *s) {
         case CONT_DEAD:  s->dead = 1; return -1;
         default:         return send_stop(s, SIG_TRAP, 0); /* CONT_HALTED */
     }
+}
+
+/* bs — reverse single-step: go back one instruction by restoring the nearest
+ * earlier checkpoint and replaying to just before the current step. */
+static int handle_reverse_step(GdbStub *s) {
+    s->reverse_used = 1;
+    if (s->nsteps > 0) goto_step(s, s->nsteps - 1);
+    return send_stop(s, SIG_TRAP, 0);
+}
+
+/* bc — reverse continue: stop at the most recent breakpoint strictly before the
+ * current position, or rewind to the start of history if there is none. Replays
+ * from the earliest checkpoint to find the last step whose PC is a breakpoint. */
+static int handle_reverse_continue(GdbStub *s) {
+    s->reverse_used = 1;
+    uint64_t cur = s->nsteps;
+    if (cur == 0) return send_stop(s, SIG_TRAP, 0);
+    goto_step(s, 0);
+    uint64_t hit = 0;
+    int found = 0;
+    while (s->nsteps < cur) {
+        if (bp_match(s, quanta_pc(s->q))) { hit = s->nsteps; found = 1; }
+        if (raw_step(s) != QUANTA_RUN) break;
+    }
+    goto_step(s, found ? hit : 0);
+    return send_stop(s, SIG_TRAP, 0);
 }
 
 /* --- packet handlers --- */
@@ -469,7 +576,8 @@ static int handle_query(GdbStub *s, const char *args) {
         char rep[160];
         snprintf(rep, sizeof rep,
                  "PacketSize=%lx;qXfer:features:read+;swbreak+;hwbreak+;"
-                 "vContSupported+", (unsigned long)(GDB_BUFSZ - 16));
+                 "vContSupported+;ReverseStep+;ReverseContinue+",
+                 (unsigned long)(GDB_BUFSZ - 16));
         return send_packet(s, rep);
     }
     if (strncmp(args, "Xfer:features:read:", 19) == 0)
@@ -498,7 +606,7 @@ static int handle_step(GdbStub *s, const char *args, char cmd) {
         unsigned long addr = strtoul(args, &p, 16);
         if (p != args) quanta_set_pc(s->q, (uint32_t)addr);
     }
-    quanta_step(s->q);
+    stub_step(s);
     return send_stop(s, SIG_TRAP, 0);
 }
 
@@ -509,7 +617,7 @@ static int handle_v(GdbStub *s, const char *args) {
         /* A step action (s/S) anywhere wins on our single-thread machine;
          * otherwise continue (c/C). */
         if (strstr(args, ";s") != NULL || strstr(args, ";S") != NULL) {
-            quanta_step(s->q);
+            stub_step(s);
             return send_stop(s, SIG_TRAP, 0);
         }
         return continue_and_reply(s);
@@ -565,6 +673,7 @@ int quanta_gdb_serve(Quanta *q, int port) {
     stub.fd = cfd;
     stub.q = q;
     stub.feat_swbreak = 1;
+    cp_add(&stub, 0);  /* step-0 checkpoint, so reverse execution can rewind to the start */
 
     /* Zero-filled so any read past a matched packet prefix is a defined 0, not
      * uninitialised memory (also keeps the static analyzer happy). */
@@ -597,6 +706,11 @@ int quanta_gdb_serve(Quanta *q, int port) {
             case 'S': (void)handle_step(&stub, args, cmd); break;
             case 'Z': (void)handle_bp(&stub, args, 1); break;
             case 'z': (void)handle_bp(&stub, args, 0); break;
+            case 'b':  /* reverse execution: bs (reverse-step), bc (reverse-continue) */
+                if (args[0] == 's')      (void)handle_reverse_step(&stub);
+                else if (args[0] == 'c') (void)handle_reverse_continue(&stub);
+                else                     (void)send_packet(&stub, "");
+                break;
             case 'H': (void)send_packet(&stub, "OK"); break;  /* set thread: ok */
             case 'q': (void)handle_query(&stub, args); break;
             case 'Q': (void)send_packet(&stub, ""); break;    /* no Q* settings */
@@ -608,6 +722,8 @@ int quanta_gdb_serve(Quanta *q, int port) {
         }
     }
 
+    for (int i = 0; i < stub.ncp; i++)
+        quanta_snapshot_free(stub.cp[i].snap);
     free(buf);
     close(cfd);
     return 0;
