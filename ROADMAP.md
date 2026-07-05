@@ -985,6 +985,303 @@ harts, spinlocks (its atomics) correct under the interleaving.
   conformance test passes and xv6-riscv boots to its shell on 3 harts.
 - [x] **Commits:** `feat: add smp multi-hart support`.
 
+---
+
+# Part III — a complete, real, fast machine
+
+Parts I and II took Quanta from a bare fetch loop to a machine that boots Linux
+6.6 and SMP xv6. Every roadmap box through M19 / E9 is ticked. Part III keeps the
+same two axes — **capability** and **engineering maturity** — but changes the
+goal one more time: make Quanta a machine that is genuinely **complete** (runs
+real software, not just IMAC), **real** (networks, boots a stock distribution),
+and **fast** (leaves the naive interpreter behind), all without breaking the
+project's contract — **C11 + standard library only, no third-party dependencies,
+the interpreter stays the golden reference, and every ISA change is gated by the
+qemu differential and the arch-tests.**
+
+Three pillars carry the M-line:
+
+- **Completeness** — finish the ISA: F/D floating point (the missing "G"), then
+  bit-manipulation, then the vector extension.
+- **Platform realism** — networking, SMP under real firmware, and a writable disk,
+  so a stock distribution boots and runs.
+- **Performance** — move from a switch-dispatched interpreter to threaded dispatch
+  and then dynamic binary translation, with the interpreter as the reference.
+
+The engineering track (E10+) continues in parallel, and it opens with the one
+capability the deterministic M19 scheduler makes nearly free: **record/replay and
+reverse debugging.**
+
+Legend is unchanged (**Build / ISA / Concept / Done when / Commits**). Nothing
+here is started yet; the boxes are the tracker.
+
+---
+
+## Engineering track (E-line, continued)
+
+### E10 — Record/replay, snapshots, and reverse debugging
+
+The round-robin scheduler is already fully deterministic — one host thread, no
+wall-clock, `mtime` stepped per scheduler round — so a run is a pure function of
+its initial state plus its external inputs (only console/UART stdin bytes; the
+disk is fixed at load). That determinism makes time-travel debugging almost free,
+and it is the highest-leverage tool to build *first*, because every later
+milestone (softfloat, the JIT) is far easier to debug when a failing run can be
+replayed and stepped backwards.
+
+- [ ] **Build (foundation):** a full-machine **snapshot/restore** primitive in the
+  engine — capture every mutable byte (all harts' registers/CSRs/TLB/PC, the whole
+  RAM image, the device register files, the in-memory disk, the scheduler cursor
+  and machine-halt state) into an opaque `QuantaSnapshot`, and restore it into the
+  same instance, re-wiring the borrowed pointers to the live objects. The
+  observability-only cache is excluded (it never changes results).
+- [ ] **Build (record/replay):** record the nondeterministic inputs (each stdin
+  byte and the step index it was injected at) alongside an initial snapshot;
+  replay restores the snapshot and re-injects the inputs at the same steps,
+  reproducing the run bit-for-bit. Serialise a snapshot + log to a file
+  (`--snapshot=FILE` to write on exit, `--restore=FILE` to resume).
+- [ ] **Build (reverse debugging):** in the GDB stub, keep a ring of periodic
+  snapshots and a monotonic machine step-count; implement `bs`/`bc` (reverse-step,
+  reverse-continue) by restoring the nearest snapshot at or before the target step
+  and replaying forward, so a stock `gdb` steps a booting kernel backwards.
+- [ ] **Why:** debugging a fault that appears billions of instructions into a boot
+  is otherwise brutal; deterministic replay + reverse-step turns it into a bisect.
+- [ ] **Done when:** a snapshot taken mid-run and restored reproduces the exact
+  final state; a recorded run replays bit-for-bit; `gdb` reverse-steps a guest.
+- [ ] **Commits:** `feat: add machine snapshot and restore`,
+  `feat: record and replay a run`, `feat: reverse debugging in the gdb stub`.
+
+### E11 — WebAssembly build (Quanta in the browser)
+
+- [ ] **Build:** compile `libquanta` to WebAssembly and wrap it in a minimal
+  browser console UI, so a RISC-V Linux boots in a tab. The engine is already
+  clean C with an opaque handle and no fatal `exit()`, so this is mostly build
+  plumbing (a WASM target) plus a small JS console and a virtual disk.
+- [ ] **Why:** a zero-install demo and a portfolio-grade showcase of the library
+  split; also stress-tests the "no hidden host assumptions" property of the core.
+- [ ] **Done when:** a hosted page boots a guest to a prompt with keyboard input.
+- [ ] **Commits:** `feat: add a wasm build target`, `feat: browser console front-end`.
+
+### E12 — Language bindings (Python, Rust)
+
+- [ ] **Build:** thin FFI bindings over `libquanta.a` — a Python module (cffi/
+  ctypes) and a Rust crate — exposing lifecycle, load, step/run, and register/
+  memory access, so the engine can be scripted for analysis and unit-tested from a
+  higher-level language.
+- [ ] **Why:** scripting unlocks quick experiments, teaching notebooks, and
+  property tests that are painful to write in C.
+- [ ] **Done when:** a Python script loads and single-steps a guest; a Rust test
+  drives one.
+- [ ] **Commits:** `feat: add python bindings`, `feat: add rust bindings`.
+
+### E13 — Multi-hart-aware GDB stub + watchpoints
+
+- [ ] **Build:** extend the stub to be SMP-aware — per-hart threads (`Hg`/`Hc`,
+  `qfThreadInfo`/`qsThreadInfo`, `T` stop replies naming the hart) and per-hart
+  register access — and add hardware watchpoints (`Z2`/`Z3`/`Z4`) enforced in the
+  step loop, so a data-change or a specific hart can be broken on.
+- [ ] **Why:** debugging an SMP kernel needs to see and select harts; watchpoints
+  catch memory corruption the current PC breakpoints cannot.
+- [ ] **Done when:** `gdb` lists harts, switches between them, and breaks on a
+  memory write.
+- [ ] **Commits:** `feat: make the gdb stub smp-aware`, `feat: add watchpoints`.
+
+### E14 — Interactive monitor console
+
+- [ ] **Build:** a qemu-HMP-style monitor reached from the console escape
+  (`Ctrl-A c`): pause/continue, `info registers`, dump memory, walk and print the
+  page tables / TLB, inspect device state, and drive a snapshot save/restore
+  (E10) — a machine-level console distinct from the guest's serial line.
+- [ ] **Why:** inspecting a live machine without an external debugger; the natural
+  home for the E10 snapshot controls.
+- [ ] **Done when:** the monitor pauses a booting guest and prints its state.
+- [ ] **Commits:** `feat: add an interactive machine monitor`.
+
+### E15 — Guest profiling and richer performance models
+
+- [ ] **Build:** a sampling profiler over the guest PC (symbolised through the ELF
+  symbol table) reporting function-level hot spots, and richer `--pipeline`
+  variants — a branch-predictor model and an optional superscalar/out-of-order
+  timing overlay — extending the M6/M7 observability theme.
+- [ ] **Why:** closes the loop on the learning arc (what actually costs cycles),
+  and gives the JIT (M25) a baseline to beat.
+- [ ] **Done when:** a profile attributes time to guest functions; the new timing
+  models report defensible estimates on a hazard workload.
+- [ ] **Commits:** `feat: add a guest sampling profiler`,
+  `feat: add branch-predictor and superscalar models`.
+
+### E16 — Differential fuzzing and extended conformance
+
+- [ ] **Build:** a random-instruction-sequence generator run in per-instruction
+  register lockstep against qemu/spike (extending E5 from whole-program to
+  instruction granularity), and extend `make check-arch` to the F/D, C, B, and V
+  arch-test families as those extensions land.
+- [ ] **Why:** whole-program differential can hide a bug two instructions cancel;
+  lockstep and the official per-extension suites are the stronger nets.
+- [ ] **Done when:** the lockstep fuzzer runs in CI; the new arch-test families
+  pass for each implemented extension.
+- [ ] **Commits:** `test: add differential instruction fuzzing`,
+  `test: extend arch-test coverage`.
+
+---
+
+## Capability track — completeness, realism, speed
+
+### Stage 5 — Finish the ISA (M20–M21, M26)
+
+## M20 — RV32/64 F and D floating point (the missing "G")
+
+Quanta is IMAC; the gap to "GC" — and to running a standard distribution whose
+toolchain assumes hardware float — is the F and D extensions. This is the largest
+correctness undertaking left, because IEEE-754 is unforgiving and a
+host-independent result needs a **from-scratch softfloat** rather than the host
+FPU (keeping the no-dependency contract; Berkeley SoftFloat would be a dep).
+
+- [ ] **Build:** a float register file (`f0`–`f31`, 32×64-bit for D, single-
+  precision NaN-boxed into the low half), `fcsr` (the `frm` rounding mode and the
+  `fflags` accrued-exception bits), and a self-contained `src/softfloat.{h,c}`
+  implementing add/sub/mul/div/sqrt, fused multiply-add (single rounding), int↔
+  float conversions with correct saturation, sign-injection, NaN-aware min/max,
+  compares, and classify — honouring all five rounding modes, subnormals,
+  signalling-vs-quiet NaNs, the canonical NaN, and the five exception flags.
+- [ ] **ISA:** RV32F, RV32D, RV64F, RV64D — the load/store, arithmetic, FMA,
+  FCVT, FSGNJ, FMIN/MAX, FEQ/FLT/FLE, FCLASS, FMV families (plus RV64's
+  FCVT.L/LU). Advertise `fd` in `misa` and the DTB isa string; add the RV32C
+  float loads/stores.
+- [ ] **Concept:** IEEE-754 semantics; NaN-boxing; the hard-float ABI; why a
+  software float implementation is needed for a deterministic, host-independent
+  emulator.
+- [ ] **Done when:** the F/D arch-test families pass and the float programs agree
+  with qemu-riscv64 bit-for-bit; a `-march=rv64gc` guest runs.
+- [ ] **Commits:** `feat: add a softfloat library`, `feat: add rv32/64 f`,
+  `feat: add rv32/64 d`, `test: rv f/d conformance and differential`.
+
+## M21 — Bit manipulation (Zba/Zbb/Zbs/Zbc)
+
+The bit-manipulation extensions modern toolchains and the kernel increasingly
+emit — mostly self-contained ALU work, a cheap and high-value follow-on to the
+float milestone.
+
+- [ ] **Build:** Zba (`sh1add`/`sh2add`/`sh3add`, `add.uw`, `slli.uw`), Zbb
+  (`andn`/`orn`/`xnor`, `clz`/`ctz`/`cpop`, `min`/`max`(`u`), `sext.b`/`sext.h`/
+  `zext.h`, `rol`/`ror`(`i`), `orc.b`, `rev8`), Zbs (`bclr`/`bext`/`binv`/`bset`
+  and immediates), and Zbc (carry-less multiply `clmul`/`clmulh`/`clmulr`),
+  mirrored in the disassembler and advertised in the isa string.
+- [ ] **ISA:** Zba, Zbb, Zbs, Zbc (RV32 and RV64 widths).
+- [ ] **Concept:** why bit manipulation is a common extension — the crypto,
+  hashing, and bignum kernels it accelerates.
+- [ ] **Done when:** the B-family arch-tests (or a hand-written suite) pass and the
+  programs agree with qemu.
+- [ ] **Commits:** `feat: add zba/zbb/zbs`, `feat: add zbc carryless multiply`,
+  `test: add bitmanip conformance`.
+
+### Stage 6 — Platform realism, boot a distribution (M22–M24)
+
+## M22 — SMP under firmware (SBI HSM) → Linux multi-hart
+
+The `--bios` firmware path parks the secondary harts (M19); booting Linux SMP
+under OpenSBI needs the harts to come up through the SBI hart-start protocol.
+
+- [ ] **Build:** on the firmware path, bring every hart into the firmware at reset
+  and let OpenSBI's warm-boot path release them via the CLINT IPI (the hart-start
+  handshake), instead of parking the secondaries; and implement the SBI **HSM**
+  extension (`hart_start`/`hart_stop`/`hart_suspend`/`hart_get_status`) in Quanta's
+  own `sbi.c` so a from-scratch SMP kernel that uses Quanta-as-firmware also works.
+- [ ] **ISA:** none new — the hart bring-up / HSM protocol.
+- [ ] **Concept:** hart bring-up, the boot-hart lottery, and the HSM state machine.
+- [ ] **Done when:** Linux boots SMP under OpenSBI (`--harts=4`) and `/proc/cpuinfo`
+  shows every hart with the scheduler running across them.
+- [ ] **Commits:** `feat: add sbi hsm hart management`,
+  `feat: bring up all harts under firmware`.
+
+## M23 — virtio-net and a network path
+
+A network is the biggest missing capability. The device is a second virtio-mmio
+model; the hard part is the host backend, done in stages so a testable version
+lands first.
+
+- [ ] **Build:** a virtio-net device (modern, RX/TX virtqueues) in `device.c`, and
+  a host backend in tiers: first a Linux **TAP** backend behind a flag, then a
+  from-scratch **usermode NAT/SLIRP** stack (ARP/IP/ICMP/UDP/TCP + DHCP + a DNS
+  relay) so networking needs no privileges and no dependency — the from-scratch
+  answer that fits the project's ethos. A loopback/packet-capture backend backs
+  the deterministic test.
+- [ ] **ISA:** none new — a second bus-master virtio device.
+- [ ] **Concept:** virtio-net, packet DMA, the device/backend split, usermode
+  networking.
+- [ ] **Done when:** a guest Linux gets a link, DHCPs an address, and reaches the
+  host (ping / `wget` through the NAT).
+- [ ] **Commits:** `feat: add virtio-net device`, `feat: add a tap backend`,
+  `feat: add a usermode nat network stack`.
+
+## M24 — Boot a stock distribution with a persistent root filesystem
+
+The integration trophy beyond the initramfs: a real distribution booting from a
+writable disk with a real init and userland.
+
+- [ ] **Build:** a **writable** virtio-blk backend (write-back to the image file,
+  with flush semantics) replacing the read-into-memory disk, support for more than
+  one disk, and whatever device-tree/console glue a distribution's init expects.
+  With M20's float in place, its float-using binaries run.
+- [ ] **ISA:** none new — the integration milestone for Stages 5–6.
+- [ ] **Concept:** a real distribution's boot (its init system, userland, package
+  manager) and on-disk persistence.
+- [ ] **Done when:** buildroot or Alpine RV64 boots from a virtio disk to a login
+  shell, runs stock binaries, and persists across a reboot.
+- [ ] **Commits:** `feat: make the virtio disk writable`,
+  `feat: boot a stock riscv distribution`.
+
+### Stage 7 — Performance (M25)
+
+## M25 — From interpreter to dynamic binary translation
+
+Quanta is a switch-dispatched interpreter; this stage makes it fast while keeping
+the interpreter as the bit-exact reference. It splits into a cheap win and an
+ambitious capstone.
+
+- [ ] **Build (M25a — decode cache + threaded dispatch):** pre-decode each
+  instruction into an internal micro-op the first time its PC is executed, cache
+  it per address, and dispatch through computed-goto / function-pointer threading
+  instead of the central `switch`. A large speedup at modest complexity, still
+  portable.
+- [ ] **Build (M25b — basic-block JIT):** a from-scratch dynamic binary translator
+  that compiles hot basic blocks to host x86-64 (no LLVM/libjit — a small
+  hand-written code generator, in keeping with the no-dependency contract), with
+  hot-path detection and a fallback to the interpreter for cold or unsupported
+  paths.
+- [ ] **ISA:** none new — an execution-engine rewrite behind the same semantics.
+- [ ] **Concept:** interpreter dispatch overhead; dynamic binary translation; hot-
+  path detection; register allocation for a JIT.
+- [ ] **Done when:** a measurable speedup (e.g. Linux boot time cut several-fold)
+  with results **bit-identical** to the interpreter, differential-tested against it.
+- [ ] **Commits:** `perf: add a decoded-instruction cache`,
+  `perf: thread the interpreter dispatch`, `feat: add a basic-block jit`.
+
+### Stage 8 — Vector (M26, long-horizon capstone)
+
+## M26 — RVV vector extension
+
+The ambitious ISA capstone — the vector-length-agnostic programming model, layered
+on the M20 float support. Scoped to grow from a subset.
+
+- [ ] **Build:** the vector register file, `vtype`/`vl`/`vstart`/`vlenb` CSRs, the
+  `vset{i}vl{i}` configuration instructions, vector loads/stores (unit-stride,
+  strided, indexed), integer/fixed-point/floating vector arithmetic, reductions,
+  masking, and permutes — starting from an embedded subset (e.g. Zve32x) and
+  widening.
+- [ ] **ISA:** RVV (a chosen, growing subset).
+- [ ] **Concept:** vector-length-agnostic (VLA) programming; SIMD vs. vector;
+  masked execution.
+- [ ] **Done when:** the targeted RVV arch-test subset passes and agrees with qemu;
+  a vector-compiled kernel runs.
+- [ ] **Commits:** `feat: add rvv configuration and load/store`,
+  `feat: add rvv arithmetic and reductions`, `test: rvv conformance subset`.
+
+*(Optional side-quest M27 — the Hypervisor "H" extension: two-stage translation and
+the VS/VU modes, to run a nested guest. Large; deferred unless a use case appears.)*
+
+---
+
 ## How to use this roadmap
 
 - Do one milestone at a time; keep `main` runnable at every step.
