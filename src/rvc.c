@@ -24,7 +24,8 @@ enum {
     OPC_LOAD = 0x03, OPC_IMM = 0x13, OPC_STORE = 0x23, OPC_OP = 0x33,
     OPC_LUI = 0x37, OPC_BRANCH = 0x63, OPC_JALR = 0x67, OPC_JAL = 0x6f,
     OPC_SYSTEM = 0x73,
-    OPC_IMM_32 = 0x1b, OPC_OP_32 = 0x3b /* RV64 *W targets (C.ADDIW/C.ADDW/...) */
+    OPC_IMM_32 = 0x1b, OPC_OP_32 = 0x3b, /* RV64 *W targets (C.ADDIW/C.ADDW/...) */
+    OPC_LOAD_FP = 0x07, OPC_STORE_FP = 0x27 /* RV-F/D compressed loads/stores (M20) */
 };
 
 /* 32-bit instruction-format builders (standard RV32I field/immediate layout). */
@@ -70,25 +71,35 @@ static uint32_t expand_q0(uint16_t c, int rv64) {
         if (imm == 0) return RVC_ILLEGAL; /* the all-zero word lands here too */
         return i_type(imm, 2, 0x0, rdp(c), OPC_IMM);
     }
+    case 1: { /* C.FLD (RV32/RV64, M20): fld rd', uimm(rs1') */
+        uint32_t imm = (BITS(c, 12, 10) << 3) | (BITS(c, 6, 5) << 6);
+        return i_type(imm, rs1p(c), 0x3, rdp(c), OPC_LOAD_FP);
+    }
     case 2: { /* C.LW: lw rd', uimm(rs1') */
         uint32_t imm = (BITS(c, 12, 10) << 3) | (BIT(c, 6) << 2) | (BIT(c, 5) << 6);
         return i_type(imm, rs1p(c), 0x2, rdp(c), OPC_LOAD);
     }
-    case 3: { /* C.LD (RV64): ld rd', uimm(rs1') */
-        if (!rv64) return RVC_ILLEGAL; /* C.FLW on RV32 (no F) */
+    case 3: { /* C.LD (RV64) or C.FLW (RV32, M20) */
+        if (rv64) { uint32_t imm = (BITS(c, 12, 10) << 3) | (BITS(c, 6, 5) << 6);
+                    return i_type(imm, rs1p(c), 0x3, rdp(c), OPC_LOAD); }
+        uint32_t imm = (BITS(c, 12, 10) << 3) | (BIT(c, 6) << 2) | (BIT(c, 5) << 6);
+        return i_type(imm, rs1p(c), 0x2, rdp(c), OPC_LOAD_FP);
+    }
+    case 5: { /* C.FSD (RV32/RV64, M20): fsd rs2', uimm(rs1') */
         uint32_t imm = (BITS(c, 12, 10) << 3) | (BITS(c, 6, 5) << 6);
-        return i_type(imm, rs1p(c), 0x3, rdp(c), OPC_LOAD);
+        return s_type(imm, rdp(c), rs1p(c), 0x3, OPC_STORE_FP);
     }
     case 6: { /* C.SW: sw rs2', uimm(rs1') */
         uint32_t imm = (BITS(c, 12, 10) << 3) | (BIT(c, 6) << 2) | (BIT(c, 5) << 6);
         return s_type(imm, rdp(c), rs1p(c), 0x2, OPC_STORE);
     }
-    case 7: { /* C.SD (RV64): sd rs2', uimm(rs1') */
-        if (!rv64) return RVC_ILLEGAL; /* C.FSW on RV32 (no F) */
-        uint32_t imm = (BITS(c, 12, 10) << 3) | (BITS(c, 6, 5) << 6);
-        return s_type(imm, rdp(c), rs1p(c), 0x3, OPC_STORE);
+    case 7: { /* C.SD (RV64) or C.FSW (RV32, M20) */
+        if (rv64) { uint32_t imm = (BITS(c, 12, 10) << 3) | (BITS(c, 6, 5) << 6);
+                    return s_type(imm, rdp(c), rs1p(c), 0x3, OPC_STORE); }
+        uint32_t imm = (BITS(c, 12, 10) << 3) | (BIT(c, 6) << 2) | (BIT(c, 5) << 6);
+        return s_type(imm, rdp(c), rs1p(c), 0x2, OPC_STORE_FP);
     }
-    default: /* 1/5 are C.FLD/C.FSD, 4 is reserved */
+    default: /* case 4 is reserved */
         return RVC_ILLEGAL;
     }
 }
@@ -195,16 +206,21 @@ static uint32_t expand_q2(uint16_t c, int rv64) {
         uint32_t shamt = (BIT(c, 12) << 5) | rs2;     /* 6-bit on RV64 */
         return i_type(shamt, rd, 0x1, rd, OPC_IMM);
     }
+    case 1: { /* C.FLDSP (RV32/RV64, M20): fld rd, uimm(x2) */
+        uint32_t imm = (BIT(c, 12) << 5) | (BITS(c, 6, 5) << 3) | (BITS(c, 4, 2) << 6);
+        return i_type(imm, 2, 0x3, rd, OPC_LOAD_FP);
+    }
     case 2: { /* C.LWSP: lw rd, uimm(x2) */
         if (rd == 0) return RVC_ILLEGAL;
         uint32_t imm = (BIT(c, 12) << 5) | (BITS(c, 6, 4) << 2) | (BITS(c, 3, 2) << 6);
         return i_type(imm, 2, 0x2, rd, OPC_LOAD);
     }
-    case 3: { /* C.LDSP (RV64): ld rd, uimm(x2), rd != 0 */
-        if (!rv64) return RVC_ILLEGAL; /* C.FLWSP on RV32 */
-        if (rd == 0) return RVC_ILLEGAL;
-        uint32_t imm = (BIT(c, 12) << 5) | (BITS(c, 6, 5) << 3) | (BITS(c, 4, 2) << 6);
-        return i_type(imm, 2, 0x3, rd, OPC_LOAD);
+    case 3: { /* C.LDSP (RV64, rd != 0) or C.FLWSP (RV32, M20) */
+        if (rv64) { if (rd == 0) return RVC_ILLEGAL;
+            uint32_t imm = (BIT(c, 12) << 5) | (BITS(c, 6, 5) << 3) | (BITS(c, 4, 2) << 6);
+            return i_type(imm, 2, 0x3, rd, OPC_LOAD); }
+        uint32_t imm = (BIT(c, 12) << 5) | (BITS(c, 6, 4) << 2) | (BITS(c, 3, 2) << 6);
+        return i_type(imm, 2, 0x2, rd, OPC_LOAD_FP);
     }
     case 4:
         if (BIT(c, 12) == 0) {
@@ -220,16 +236,21 @@ static uint32_t expand_q2(uint16_t c, int rv64) {
                 return i_type(0, rd, 0x0, 1, OPC_JALR);
             return r_type(0x00, rs2, rd, 0x0, rd, OPC_OP); /* C.ADD: add rd, rd, rs2 */
         }
+    case 5: { /* C.FSDSP (RV32/RV64, M20): fsd rs2, uimm(x2) */
+        uint32_t imm = (BITS(c, 12, 10) << 3) | (BITS(c, 9, 7) << 6);
+        return s_type(imm, rs2, 2, 0x3, OPC_STORE_FP);
+    }
     case 6: { /* C.SWSP: sw rs2, uimm(x2) */
         uint32_t imm = (BITS(c, 12, 9) << 2) | (BITS(c, 8, 7) << 6);
         return s_type(imm, rs2, 2, 0x2, OPC_STORE);
     }
-    case 7: { /* C.SDSP (RV64): sd rs2, uimm(x2) */
-        if (!rv64) return RVC_ILLEGAL; /* C.FSWSP on RV32 */
-        uint32_t imm = (BITS(c, 12, 10) << 3) | (BITS(c, 9, 7) << 6);
-        return s_type(imm, rs2, 2, 0x3, OPC_STORE);
+    case 7: { /* C.SDSP (RV64) or C.FSWSP (RV32, M20) */
+        if (rv64) { uint32_t imm = (BITS(c, 12, 10) << 3) | (BITS(c, 9, 7) << 6);
+                    return s_type(imm, rs2, 2, 0x3, OPC_STORE); }
+        uint32_t imm = (BITS(c, 12, 9) << 2) | (BITS(c, 8, 7) << 6);
+        return s_type(imm, rs2, 2, 0x2, OPC_STORE_FP);
     }
-    default: /* 1/5 are C.FLDSP/C.FSDSP */
+    default: /* case 4 unreachable here */
         return RVC_ILLEGAL;
     }
 }

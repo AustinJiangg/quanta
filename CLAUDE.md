@@ -45,7 +45,10 @@ Sv39), and — through real **OpenSBI** firmware (`--bios`/`--kernel`) plus a
 **cpio initramfs** (`--initrd`, `tests/linux/`) — **mainline Linux 6.6 now boots
 to an interactive userspace shell**, and **SMP multi-hart** (`--harts=N`, up to 8
 harts on a deterministic round-robin scheduler, M19) on which upstream **xv6 boots
-across 3 harts** — are implemented
+across 3 harts**, and the **RV32/64 F and D floating-point extensions** (M20) on a
+from-scratch, correctly-rounded IEEE-754 software float (`src/softfloat.{h,c}`, no
+dependency; validated bit-for-bit against qemu-riscv64, `tests/rv64/test_rv64_fpu.S`)
+— are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
@@ -202,10 +205,14 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   they can't disagree about an instruction's layout.
 - `src/rvc.{h,c}` — the RV32C compressed-instruction expander (M11):
   `rvc_expand(uint16_t)` widens a 16-bit instruction to the exact 32-bit
-  instruction it abbreviates (or `RVC_ILLEGAL` for a reserved/F-D encoding), so
+  instruction it abbreviates (or `RVC_ILLEGAL` for a reserved encoding), so
   the existing decode/execute and disassembly paths run it unchanged. The single
   source of truth for what a compressed instruction means, shared by `cpu.c`
   (fetch) and `disasm.c` (which prints the same expanded mnemonic objdump shows).
+  M20 added the compressed float loads/stores — `C.FLD`/`C.FSD` (both widths) and,
+  on RV32, `C.FLW`/`C.FSW` (the funct3 slots RV64 uses for `C.LD`/`C.SD`), plus
+  the stack-pointer forms `C.FLDSP`/`C.FSDSP`/`C.FLWSP`/`C.FSWSP` — expanding to
+  the `OP_LOAD_FP`/`OP_STORE_FP` opcodes.
 - `src/cpu.{h,c}` — CPU state and the instruction core. Each instruction group
   has its own `exec_*` function; decoding comes from `decode.h`. RV32M
   (multiply/divide) shares the OP opcode and lives in `exec_muldiv`, selected by
@@ -225,7 +232,21 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   which pulls the device-driven `mip` bits (`effective_mip`), applies the
   `mstatus`/`mideleg` gates, and vectors the highest-priority enabled interrupt
   through `enter_trap` (the trap-entry path now shared with `raise_trap`, with
-  vectored-`*tvec` support).
+  vectored-`*tvec` support). M20 adds the F/D float layer: the `fregs[32]`
+  register file, `exec_load_fp`/`exec_store_fp` (FLW/FLD/FSW/FSD), `exec_fp` (the
+  OP-FP arithmetic/convert/move/compare family, dispatched by `funct7`), and
+  `exec_fmadd` (the four fused ops); `fread_s`/`fwrite_s` do the single-precision
+  NaN-boxing, `resolve_rm` picks the rounding mode, and `fcsr`/`frm`/`fflags` are
+  CSR views — the IEEE arithmetic itself lives in `softfloat.c`.
+- `src/softfloat.{h,c}` — from-scratch, correctly-rounded IEEE-754 binary32/
+  binary64 (M20). One format-parameterised core serves both widths
+  (`unpack → operate → round`); results are host-independent (no host FPU, no
+  `__int128` — wide intermediates use two-word 128-bit and four-word 256-bit
+  helpers). Add/sub/mul/div/sqrt, fused multiply-add (single rounding), the
+  comparisons, min/max, classify, and all int↔float and f32↔f64 conversions with
+  RISC-V semantics (the canonical NaN for any NaN result, saturating float→int).
+  Every op takes a rounding mode and ORs the exceptions it raises into a flags
+  word. Pure and dependency-free; `cpu.c` is its only caller.
 - `src/mmu.{h,c}` — virtual memory: Sv32 (M12) and Sv39 (M18). One
   descriptor-parameterised page-table walker serves both — a two-level walk with
   4-byte PTEs for Sv32, a three-level walk with 8-byte PTEs for Sv39 — plus a
@@ -242,7 +263,10 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   branch/jump targets). Mirrors `cpu_step`'s opcode switch over `decode.h`. A
   compressed (RV32C) halfword is detected by its low two bits, expanded via
   `rvc_expand`, and disassembled as the 32-bit form — objdump prints the same
-  expanded mnemonic (with one compressed-only twist: `c.mv` shows as `mv`).
+  expanded mnemonic (with one compressed-only twist: `c.mv` shows as `mv`). M20
+  adds `disasm_fp` for the OP-FP / load-FP / store-FP / fused-op families
+  (best-effort for `--trace` readability; the float suite is RV64, out of the
+  RV32-only `check-disasm`).
 - `src/cache.{h,c}` — optional set-associative LRU cache model. A pure
   observability layer: `cpu_step`'s load/store paths feed it data addresses, it
   tallies hits/misses, but the bytes still come from `memory.c`, so results are
@@ -499,6 +523,17 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   source is the UART, the path a booting xv6's `virtio_disk_intr`/`uartintr`
   reach. Uses M-mode CSRs + MMIO, so it is quanta-only (excluded from the
   qemu-riscv64 differential like `*_priv`/`*_vm`/`*_sstc`).
+- `tests/rv64/test_rv64_fpu.S` — the M20 F/D conformance suite (run by
+  `make check-rv64`): 44 user-mode checks spanning single/double
+  add/sub/mul/div/sqrt, the fused ops, sign-injection, min/max (with signed zero
+  and NaN), the compares (NaN → 0, FLT/FLE signalling), classify, float↔int
+  conversions (including saturation of NaN/overflow and the negative-to-unsigned
+  case), the moves, the accrued exception flags, and a dynamic rounding mode. It
+  moves float results to integer registers with `fmv.x.w`/`fmv.x.d` and asserts
+  the exact IEEE bit patterns, so it is **differentially tested against
+  qemu-riscv64** — any quanta≠qemu divergence fails one side's CHECK. Built
+  `-march=rv64imafdc_zicsr` (a per-target Makefile override); plain user-mode, so
+  unlike the privileged RV64 tests it stays in the differential.
 - `tests/rv64/test_rv64_smp.S` + `tests/check_smp.sh` — the M19 SMP test
   (`make check-smp`, run with `--harts=4`): all four harts enter at the entry with
   `a0`=hartid; each checks `mhartid`, does 500 LR/SC increments of one shared
@@ -569,7 +604,43 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   and the RV64C forms via `rvc_expand(c, rv64)`) are **gated to raise illegal in
   RV32**, so every RV32 test is unaffected — the widening kept `make check`,
   `check-arch`, `check-diff`, and `check-os` bit-for-bit green (the refactor's
-  safety checkpoint). RV32F/D remain deferred (M11), so M17 is RV64IMAC.
+  safety checkpoint). M20 added F and D on top (RV64IMAFDC); the XLEN-dependent
+  float ops (`FCVT.L/LU`, `FMV.X.D`/`FMV.D.X`) are likewise gated to RV32-illegal.
+- Softfloat is host-independent by construction (M20): `softfloat.c` never touches
+  the host FPU — a host `double` might carry 80-bit x87 intermediates, contract
+  `a*b+c`, or round differently, so a from-scratch implementation is the only way
+  results stay bit-identical across hosts and match qemu. It also avoids
+  `__int128` (not standard C11): a double product is 106 bits, a fused-multiply-add
+  sum can span ~160 bits when the product and addend cancel, so the accumulator is
+  a four-word `u256` (the same reason `mulhu64` builds the high product from 32-bit
+  partials). Division and square root are exact integer long-division / bitwise
+  `isqrt` (no reciprocal tables — those would be committed third-party data). The
+  library was validated **before** wiring in, against the host FPU as an oracle
+  (90M random+edge cases, four rounding modes, bit-exact results + NV/DZ/OF/NX
+  flags — the oracle in `scratchpad` is not committed); RISC-V-specific behaviour
+  (canonical NaN, saturating float→int, RMM, NaN-boxing, UF) is pinned against
+  qemu-riscv64 by `test_rv64_fpu.S`. When changing the walker of any float op,
+  re-run an oracle-style sweep — a wrong `isqrt` trial or a lost sticky bit is a
+  1-ULP bug invisible to spot checks. **isqrt gotcha**: the digit-recurrence
+  trial is `4*root + 1` (the increment `(2r+1)² − (2r)²`), not `2*root + 1`.
+- Float `mstatus.FS` is tracked but **not gated** (M20): a float write marks FS
+  Dirty and sets SD, but Quanta never raises illegal-instruction when FS is Off.
+  This is deliberate — gating would force `test_rv64_fpu.S` to write `mstatus.FS`,
+  an M-mode CSR user-mode qemu rejects, which would drop the test out of the
+  qemu-riscv64 differential (the strongest net for IEEE edge cases). Permissive
+  execution keeps it user-mode and differentiable while a full-system guest still
+  sees the dirty state it needs for lazy FP context switching. Consequence: a
+  future `-march=rv64gc` OS boot that relies on an FS-Off trap would need gating
+  added. Relatedly, the boot **DTB isa string stays `rv64imac`** (only `misa`
+  advertises `fd`) so the imac-built xv6/Linux guests are not perturbed into
+  probing float; a gc guest supplies its own DTB.
+- Single-precision values are **NaN-boxed** in the 64-bit float registers: a
+  single write sets the upper 32 bits to all ones (`fwrite_s`), and a single read
+  of an improperly-boxed register returns the canonical NaN `0x7fc00000`
+  (`fread_s`) — matching qemu. `FMV.X.W`/`FSW` move the *raw* low 32 bits (no box
+  check); doubles use the full 64 bits. RV32F/D remain deferred (M11) as a target
+  in the sense that no RV32 guest is float-tested, but the softfloat and exec paths
+  are width-agnostic, so RV32 float works save the RV64-only moves gated above.
 - The RV64 conformance suite is `tests/rv64/` (own Makefile rule, built
   `-march=rv64imac_zicsr -mabi=lp64`, so the RV32 `tests/*.S` glob never touches
   it), run by `make check-rv64` — quanta exit-0 plus a `qemu-riscv64` differential

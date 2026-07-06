@@ -174,6 +174,11 @@ tests/rv64/%.elf: tests/rv64/%.S
 	$(RVCC) $(RV64FLAGS) -o $@ $<
 	@echo "Built $@ — run with: ./quanta $@"
 
+# The F/D floating-point test (M20) needs the F and D extensions enabled. It is
+# plain user-mode code (fcsr/frm/fflags are unprivileged CSRs), so qemu-riscv64
+# cross-checks it via check-rv64 like the other user-mode RV64 tests.
+tests/rv64/test_rv64_fpu.elf: RV64FLAGS := $(subst rv64imac_zicsr,rv64imafdc_zicsr,$(RV64FLAGS))
+
 # The privileged trap test's handler advances mepc by a fixed 4 bytes, so its
 # ebreak must stay 4-byte: build it without the compressed extension, which would
 # otherwise assemble ebreak as a 2-byte c.ebreak and over-advance the return

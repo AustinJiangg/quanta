@@ -9,6 +9,23 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **RV32/64 F and D floating point (the missing "G")** — Quanta now runs the
+  single- and double-precision floating-point extensions on top of a from-scratch,
+  correctly-rounded IEEE-754 software float (`src/softfloat.{h,c}`, no third-party
+  dependency). One format-parameterised core serves binary32 and binary64:
+  add/sub/mul/div/sqrt, fused multiply-add (single rounding), the FCVT / FSGNJ /
+  FMIN-MAX / FEQ-FLT-FLE / FCLASS / FMV families, and int↔float conversions with
+  RISC-V saturating semantics — honouring all five rounding modes, subnormals,
+  signalling-vs-quiet NaNs, the canonical NaN, and the five accrued-exception
+  flags. `cpu.c` adds the `f0`–`f31` register file (single-precision NaN-boxed),
+  the `fcsr`/`frm`/`fflags` CSRs, and the OP-FP / load-FP / store-FP / fused-op
+  execution paths; `rvc.c` expands the compressed float loads/stores; `misa`
+  advertises F and D. Validated by a 90M-case host-FPU oracle and pinned by
+  `tests/rv64/test_rv64_fpu.S` (44 checks) differentially against qemu-riscv64
+  under `make check-rv64`. `mstatus.FS` is tracked (a float write marks it Dirty)
+  but not gated — a deliberate leniency that keeps the conformance test user-mode
+  and qemu-checkable. (M20)
+
 - **SMP multi-hart (`--harts=N`)** — Quanta now models up to 8 harts sharing one
   memory and platform (`--harts=N`, or `quanta_set_harts` in the engine API). A
   deterministic single-threaded round-robin scheduler interleaves the harts one

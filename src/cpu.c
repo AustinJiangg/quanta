@@ -6,6 +6,7 @@
 #include "cache.h"
 #include "mmu.h"
 #include "device.h"
+#include "softfloat.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -25,7 +26,7 @@
  * cause codes they build on are shared with the MMU, so they live in cpu.h. */
 enum {
     SSTATUS_MASK = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP |
-                   MSTATUS_SUM | MSTATUS_MXR,
+                   MSTATUS_FS | MSTATUS_SUM | MSTATUS_MXR,
     S_INT_MASK = (1u << 1) | (1u << 5) | (1u << 9)
 };
 
@@ -60,6 +61,7 @@ static inline uint64_t cause_interrupt(const CPU *cpu) {
 void cpu_init(CPU *cpu, Memory *mem, uint64_t entry_pc, int xlen) {
     cpu->xlen      = xlen; /* 32 (RV32) or 64 (RV64), chosen by the loader */
     for (int i = 0; i < 32; i++) cpu->regs[i] = 0;
+    for (int i = 0; i < 32; i++) cpu->fregs[i] = 0; /* M20: float register file */
     cpu->pc        = entry_pc;
     cpu->hartid    = 0;    /* the engine overrides per hart before running (M19) */
     cpu->mem       = mem;
@@ -80,7 +82,8 @@ void cpu_init(CPU *cpu, Memory *mem, uint64_t entry_pc, int xlen) {
      * writes are accepted as WARL storage. */
     uint64_t mxl = (xlen == 64) ? 2u : 1u;
     cpu->csr[CSR_MISA] = (mxl << (xlen - 2)) |
-                         (1u << 2) | (1u << 8) | (1u << 12) | (1u << 18) | (1u << 20);
+                         (1u << 2) | (1u << 3) | (1u << 5) |  /* C, D, F */
+                         (1u << 8) | (1u << 12) | (1u << 18) | (1u << 20); /* I, M, S, U */
 }
 
 uint64_t reg_read(const CPU *cpu, uint32_t i) {
@@ -433,6 +436,9 @@ static void exec_store(CPU *cpu, uint32_t inst) {
  * sie, and sip return only the S-mode-visible bits of mstatus/mie/mip. */
 static uint64_t csr_read(const CPU *cpu, uint32_t addr) {
     switch (addr) {
+        /* fflags and frm are windows onto fcsr (bits [4:0] and [7:5]). */
+        case CSR_FFLAGS: return cpu->csr[CSR_FCSR] & 0x1f;
+        case CSR_FRM:    return (cpu->csr[CSR_FCSR] >> 5) & 0x7;
         case CSR_CYCLE:  case CSR_TIME:  case CSR_INSTRET:
             return cpu->instret; /* RV64: the full counter; RV32: low 32 on write-back */
         case CSR_CYCLEH: case CSR_TIMEH: case CSR_INSTRETH:
@@ -450,6 +456,11 @@ static uint64_t csr_read(const CPU *cpu, uint32_t addr) {
  * S-mode view CSRs back through the masked window onto mstatus/mie/mip. */
 static void csr_write(CPU *cpu, uint32_t addr, uint64_t val) {
     switch (addr) {
+        case CSR_FCSR:   cpu->csr[CSR_FCSR] = val & 0xff; return;   /* frm|fflags */
+        case CSR_FFLAGS: cpu->csr[CSR_FCSR] = (cpu->csr[CSR_FCSR] & ~0x1full)
+                                            | (val & 0x1f); return;
+        case CSR_FRM:    cpu->csr[CSR_FCSR] = (cpu->csr[CSR_FCSR] & ~0xe0ull)
+                                            | ((val & 0x7) << 5); return;
         case CSR_SSTATUS:
             cpu->csr[CSR_MSTATUS] = (cpu->csr[CSR_MSTATUS] & ~SSTATUS_MASK)
                                   | (val & SSTATUS_MASK);
@@ -839,6 +850,233 @@ static void exec_amo(CPU *cpu, uint32_t inst) {
  * entry: privilege returns to MPP, MIE is restored from MPIE, MPIE is set, and
  * MPP is reset to the least-privileged mode (U). Returns the PC to resume at —
  * the mepc the handler may have advanced past the trapping instruction. */
+/* ------------------------------------------------------------------------
+ * RV32/64 F and D floating point (M20).
+ *
+ * The IEEE-754 arithmetic lives in softfloat.c (host-independent, correctly
+ * rounded); this layer wires it to the register file, the fcsr, and the
+ * rounding-mode/exception plumbing. Single-precision values are NaN-boxed into
+ * the 64-bit float registers (upper 32 bits all ones); an improperly boxed
+ * single reads back as the canonical NaN.
+ *
+ * FS (mstatus[14:13]) is tracked — a float write marks it Dirty and sets SD —
+ * but Quanta does NOT trap when FS is Off: a deliberate leniency that keeps the
+ * float conformance test user-mode and thus differentially testable against
+ * qemu-riscv64 (which, in user mode, has no FS gate). A full-system guest still
+ * sees the dirty state it needs for lazy context switching.
+ * ------------------------------------------------------------------------ */
+
+static void mark_fs_dirty(CPU *cpu) {
+    cpu->csr[CSR_MSTATUS] |= MSTATUS_FS;                     /* FS = Dirty (3) */
+    cpu->csr[CSR_MSTATUS] |= (uint64_t)1 << (cpu->xlen - 1); /* SD summary bit  */
+}
+
+/* Single-precision access honours NaN-boxing: an unboxed register reads as the
+ * canonical NaN, and a write boxes the value into the high half. */
+static uint32_t fread_s(const CPU *cpu, uint32_t i) {
+    uint64_t v = cpu->fregs[i];
+    return ((v >> 32) == 0xffffffffu) ? (uint32_t)v : F32_QNAN;
+}
+static void fwrite_s(CPU *cpu, uint32_t i, uint32_t v) {
+    cpu->fregs[i] = 0xffffffff00000000ull | v;
+    mark_fs_dirty(cpu);
+}
+static uint64_t fread_d(const CPU *cpu, uint32_t i) { return cpu->fregs[i]; }
+static void fwrite_d(CPU *cpu, uint32_t i, uint64_t v) {
+    cpu->fregs[i] = v;
+    mark_fs_dirty(cpu);
+}
+static void faccrue(CPU *cpu, unsigned fl) { cpu->csr[CSR_FCSR] |= (fl & 0x1f); }
+
+/* Resolve the rounding mode: the instruction's rm field, or (rm==7 = DYN) the
+ * fcsr.frm. A reserved encoding (5/6, or a reserved dynamic frm) is illegal. */
+static int resolve_rm(const CPU *cpu, uint32_t inst, int *bad) {
+    int rm = (int)funct3(inst);
+    if (rm == 7) rm = (int)((cpu->csr[CSR_FCSR] >> 5) & 0x7);
+    *bad = (rm > 4);
+    return rm;
+}
+
+static void exec_load_fp(CPU *cpu, uint32_t inst) {
+    uint64_t va = reg_read(cpu, rs1(inst)) + (uint64_t)imm_i(inst);
+    uint64_t pa;
+    uint32_t fault = mmu_translate(cpu, va, ACC_LOAD, &pa);
+    if (fault) { raise_trap(cpu, fault, va); return; }
+    if (cpu->cache) cache_access(cpu->cache, pa, 0);
+    switch (funct3(inst)) {
+        case 0x2: fwrite_s(cpu, rd(inst), mem_read32(cpu->mem, pa)); break; /* FLW */
+        case 0x3: fwrite_d(cpu, rd(inst), mem_read64(cpu->mem, pa)); break; /* FLD */
+        default:  raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); break;
+    }
+}
+static void exec_store_fp(CPU *cpu, uint32_t inst) {
+    uint64_t va = reg_read(cpu, rs1(inst)) + (uint64_t)imm_s(inst);
+    uint64_t pa;
+    uint32_t fault = mmu_translate(cpu, va, ACC_STORE, &pa);
+    if (fault) { raise_trap(cpu, fault, va); return; }
+    break_reservation(cpu, pa);
+    if (cpu->cache) cache_access(cpu->cache, pa, 1);
+    switch (funct3(inst)) {
+        case 0x2: mem_write32(cpu->mem, pa, (uint32_t)cpu->fregs[rs2(inst)]); break; /* FSW */
+        case 0x3: mem_write64(cpu->mem, pa, cpu->fregs[rs2(inst)]); break;           /* FSD */
+        default:  raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); break;
+    }
+}
+
+/* Execute an OP-FP instruction. funct7 splits into the 5-bit operation (bits
+ * [31:27]) and the 2-bit format (bits [26:25]: 0 = single, 1 = double); funct3
+ * carries the rounding mode or a sub-op selector, and rs2 a conversion variant. */
+static void exec_fp(CPU *cpu, uint32_t inst) {
+    uint32_t op  = inst >> 27;
+    uint32_t fmt = (inst >> 25) & 0x3;
+    uint32_t rd_ = rd(inst), rs1_ = rs1(inst), rs2_ = rs2(inst), f3 = funct3(inst);
+    unsigned fl = 0;
+    int bad; int rm = resolve_rm(cpu, inst, &bad);
+
+    if (fmt > 1) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+
+    switch (op) {
+    case 0x00: case 0x01: case 0x02: case 0x03: { /* FADD / FSUB / FMUL / FDIV */
+        if (bad) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+        if (fmt == 0) {
+            uint32_t a = fread_s(cpu, rs1_), b = fread_s(cpu, rs2_), r = 0;
+            switch (op) { case 0: r = f32_add(a,b,rm,&fl); break; case 1: r = f32_sub(a,b,rm,&fl); break;
+                          case 2: r = f32_mul(a,b,rm,&fl); break; case 3: r = f32_div(a,b,rm,&fl); break; }
+            fwrite_s(cpu, rd_, r);
+        } else {
+            uint64_t a = fread_d(cpu, rs1_), b = fread_d(cpu, rs2_), r = 0;
+            switch (op) { case 0: r = f64_add(a,b,rm,&fl); break; case 1: r = f64_sub(a,b,rm,&fl); break;
+                          case 2: r = f64_mul(a,b,rm,&fl); break; case 3: r = f64_div(a,b,rm,&fl); break; }
+            fwrite_d(cpu, rd_, r);
+        }
+        faccrue(cpu, fl); break;
+    }
+    case 0x0b: /* FSQRT */
+        if (bad) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+        if (fmt == 0) fwrite_s(cpu, rd_, f32_sqrt(fread_s(cpu, rs1_), rm, &fl));
+        else          fwrite_d(cpu, rd_, f64_sqrt(fread_d(cpu, rs1_), rm, &fl));
+        faccrue(cpu, fl); break;
+    case 0x04: /* FSGNJ / FSGNJN / FSGNJX (bit manipulation, no flags) */
+        if (fmt == 0) {
+            uint32_t a = fread_s(cpu, rs1_), b = fread_s(cpu, rs2_), s;
+            s = (f3 == 0) ? (b >> 31) : (f3 == 1) ? (~(b >> 31) & 1) : ((a ^ b) >> 31);
+            fwrite_s(cpu, rd_, (a & 0x7fffffffu) | (s << 31));
+        } else {
+            uint64_t a = fread_d(cpu, rs1_), b = fread_d(cpu, rs2_), s;
+            s = (f3 == 0) ? (b >> 63) : (f3 == 1) ? (~(b >> 63) & 1) : ((a ^ b) >> 63);
+            fwrite_d(cpu, rd_, (a & 0x7fffffffffffffffull) | (s << 63));
+        }
+        break;
+    case 0x05: /* FMIN (f3=0) / FMAX (f3=1) */
+        if (fmt == 0)
+            fwrite_s(cpu, rd_, f3 ? f32_max(fread_s(cpu,rs1_), fread_s(cpu,rs2_), &fl)
+                                  : f32_min(fread_s(cpu,rs1_), fread_s(cpu,rs2_), &fl));
+        else
+            fwrite_d(cpu, rd_, f3 ? f64_max(fread_d(cpu,rs1_), fread_d(cpu,rs2_), &fl)
+                                  : f64_min(fread_d(cpu,rs1_), fread_d(cpu,rs2_), &fl));
+        faccrue(cpu, fl); break;
+    case 0x08: /* FCVT.S.D (fmt=0) / FCVT.D.S (fmt=1) */
+        if (fmt == 0) { if (bad) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+                        fwrite_s(cpu, rd_, f64_to_f32(fread_d(cpu, rs1_), rm, &fl)); }
+        else            fwrite_d(cpu, rd_, f32_to_f64(fread_s(cpu, rs1_), &fl)); /* exact widen */
+        faccrue(cpu, fl); break;
+    case 0x14: { /* FLE (f3=0) / FLT (f3=1) / FEQ (f3=2) -> integer rd */
+        int r;
+        if (fmt == 0) { uint32_t a = fread_s(cpu,rs1_), b = fread_s(cpu,rs2_);
+            r = (f3==2) ? f32_eq(a,b,&fl) : (f3==1) ? f32_lt(a,b,&fl) : f32_le(a,b,&fl); }
+        else { uint64_t a = fread_d(cpu,rs1_), b = fread_d(cpu,rs2_);
+            r = (f3==2) ? f64_eq(a,b,&fl) : (f3==1) ? f64_lt(a,b,&fl) : f64_le(a,b,&fl); }
+        reg_write(cpu, rd_, (uint64_t)r);
+        faccrue(cpu, fl); break;
+    }
+    case 0x1c: /* FMV.X.W|D (f3=0) / FCLASS (f3=1) -> integer rd */
+        if (f3 == 0) {
+            if (fmt == 0) reg_write(cpu, rd_, (uint64_t)(int64_t)(int32_t)(uint32_t)cpu->fregs[rs1_]);
+            else { if (cpu->xlen != 64) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+                   reg_write(cpu, rd_, cpu->fregs[rs1_]); }                 /* FMV.X.D */
+        } else {
+            reg_write(cpu, rd_, fmt == 0 ? f32_classify(fread_s(cpu, rs1_))
+                                         : f64_classify(fread_d(cpu, rs1_)));
+        }
+        break;
+    case 0x1e: /* FMV.W.X (fmt=0) / FMV.D.X (fmt=1) */
+        if (fmt == 0) fwrite_s(cpu, rd_, (uint32_t)reg_read(cpu, rs1_));
+        else { if (cpu->xlen != 64) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+               fwrite_d(cpu, rd_, reg_read(cpu, rs1_)); }
+        break;
+    case 0x18: { /* FCVT.W/WU/L/LU.S|D : float -> integer (saturating) */
+        if (bad) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+        if ((rs2_ == 2 || rs2_ == 3) && cpu->xlen != 64) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+        uint64_t r;
+        if (fmt == 0) { uint32_t a = fread_s(cpu, rs1_);
+            switch (rs2_) {
+                case 0:  r = (uint64_t)(int64_t)f32_to_i32(a, rm, &fl); break;             /* W  */
+                case 1:  r = (uint64_t)(int64_t)(int32_t)f32_to_u32(a, rm, &fl); break;     /* WU */
+                case 2:  r = (uint64_t)f32_to_i64(a, rm, &fl); break;                       /* L  */
+                default: r = f32_to_u64(a, rm, &fl); break;                                 /* LU */
+            }
+        } else { uint64_t a = fread_d(cpu, rs1_);
+            switch (rs2_) {
+                case 0:  r = (uint64_t)(int64_t)f64_to_i32(a, rm, &fl); break;
+                case 1:  r = (uint64_t)(int64_t)(int32_t)f64_to_u32(a, rm, &fl); break;
+                case 2:  r = (uint64_t)f64_to_i64(a, rm, &fl); break;
+                default: r = f64_to_u64(a, rm, &fl); break;
+            }
+        }
+        reg_write(cpu, rd_, r);
+        faccrue(cpu, fl); break;
+    }
+    case 0x1a: { /* FCVT.S|D.W/WU/L/LU : integer -> float */
+        if (bad) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+        if ((rs2_ == 2 || rs2_ == 3) && cpu->xlen != 64) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+        uint64_t x = reg_read(cpu, rs1_);
+        if (fmt == 0) { f32 r;
+            switch (rs2_) {
+                case 0:  r = i32_to_f32((int32_t)x, rm, &fl); break;
+                case 1:  r = u32_to_f32((uint32_t)x, rm, &fl); break;
+                case 2:  r = i64_to_f32((int64_t)x, rm, &fl); break;
+                default: r = u64_to_f32(x, rm, &fl); break;
+            }
+            fwrite_s(cpu, rd_, r);
+        } else { f64 r;
+            switch (rs2_) {
+                case 0:  r = i32_to_f64((int32_t)x, rm, &fl); break;
+                case 1:  r = u32_to_f64((uint32_t)x, rm, &fl); break;
+                case 2:  r = i64_to_f64((int64_t)x, rm, &fl); break;
+                default: r = u64_to_f64(x, rm, &fl); break;
+            }
+            fwrite_d(cpu, rd_, r);
+        }
+        faccrue(cpu, fl); break;
+    }
+    default:
+        raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); break;
+    }
+}
+
+/* Execute a fused multiply-add. The four forms are a*b+c with the sign bits of
+ * a and/or c flipped (an exact operation), so one softfloat primitive serves
+ * all: FMADD(0,0), FMSUB(0,1), FNMSUB(1,0), FNMADD(1,1). */
+static void exec_fmadd(CPU *cpu, uint32_t inst, int flipA, int flipC) {
+    uint32_t fmt = (inst >> 25) & 0x3;
+    uint32_t rd_ = rd(inst), rs1_ = rs1(inst), rs2_ = rs2(inst), rs3_ = inst >> 27;
+    unsigned fl = 0;
+    int bad; int rm = resolve_rm(cpu, inst, &bad);
+    if (fmt > 1 || bad) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+    if (fmt == 0) {
+        uint32_t a = fread_s(cpu, rs1_), b = fread_s(cpu, rs2_), c = fread_s(cpu, rs3_);
+        if (flipA) a ^= 0x80000000u;
+        if (flipC) c ^= 0x80000000u;
+        fwrite_s(cpu, rd_, f32_muladd(a, b, c, rm, &fl));
+    } else {
+        uint64_t a = fread_d(cpu, rs1_), b = fread_d(cpu, rs2_), c = fread_d(cpu, rs3_);
+        if (flipA) a ^= 0x8000000000000000ull;
+        if (flipC) c ^= 0x8000000000000000ull;
+        fwrite_d(cpu, rd_, f64_muladd(a, b, c, rm, &fl));
+    }
+    faccrue(cpu, fl);
+}
+
 static uint64_t exec_mret(CPU *cpu) {
     if (cpu->priv < PRIV_M) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, 0); return cpu->pc; }
     uint64_t s = cpu->csr[CSR_MSTATUS];
@@ -1022,6 +1260,23 @@ void cpu_step(CPU *cpu) {
             exec_amo(cpu, inst);
             break;
 
+        case OP_LOAD_FP:  /* RV-F/D: FLW/FLD */
+            exec_load_fp(cpu, inst);
+            break;
+
+        case OP_STORE_FP: /* RV-F/D: FSW/FSD */
+            exec_store_fp(cpu, inst);
+            break;
+
+        case OP_FP:       /* RV-F/D: OP-FP arithmetic/convert/move/compare */
+            exec_fp(cpu, inst);
+            break;
+
+        case OP_MADD:  exec_fmadd(cpu, inst, 0, 0); break; /* FMADD  */
+        case OP_MSUB:  exec_fmadd(cpu, inst, 0, 1); break; /* FMSUB  */
+        case OP_NMSUB: exec_fmadd(cpu, inst, 1, 0); break; /* FNMSUB */
+        case OP_NMADD: exec_fmadd(cpu, inst, 1, 1); break; /* FNMADD */
+
         case OP_FENCE:
             /* FENCE / FENCE.I: memory- and instruction-ordering hints. A single
              * hart that executes in program order, with no modelled instruction
@@ -1039,8 +1294,8 @@ void cpu_step(CPU *cpu) {
 
     if (cpu->mem->fault) { /* a load, store, or atomic left the mapped region */
         uint32_t op = opcode(inst);
-        uint32_t cause = (op == OP_STORE || op == OP_AMO) ? CAUSE_STORE_ACCESS
-                                                          : CAUSE_LOAD_ACCESS;
+        uint32_t cause = (op == OP_STORE || op == OP_AMO || op == OP_STORE_FP)
+                             ? CAUSE_STORE_ACCESS : CAUSE_LOAD_ACCESS;
         raise_trap(cpu, cause, cpu->mem->fault_addr);
         return; /* don't commit PC past the faulting instruction */
     }

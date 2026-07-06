@@ -47,7 +47,13 @@ enum {
     MSTATUS_MPRV = 1u << 17,
     MSTATUS_SUM  = 1u << 18,
     MSTATUS_MXR  = 1u << 19,
-    MSTATUS_MPP_SHIFT = 11
+    MSTATUS_MPP_SHIFT = 11,
+    /* Floating-point unit state (M20). FS != Off marks the F/D registers live;
+     * a float write sets it Dirty. Quanta does not trap when FS is Off (a
+     * deliberate leniency — see cpu.c), but tracks the state for a full-system
+     * guest's context switch. SD is the top XLEN bit summarising a dirty FS. */
+    MSTATUS_FS       = 3u << 13,
+    MSTATUS_FS_SHIFT = 13
 };
 
 /* Synchronous exception causes (mcause/scause with the interrupt bit clear).
@@ -105,6 +111,7 @@ typedef enum {
 
 typedef struct CPU {
     uint64_t regs[32];      /* x0..x31; x0 is always zero (sext_xlen in RV32) */
+    uint64_t fregs[32];     /* f0..f31 (M20): 64-bit, single-precision NaN-boxed */
     uint64_t pc;            /* program counter */
     int      xlen;          /* register width in bits: 32 (RV32) or 64 (RV64) */
     uint32_t hartid;        /* this hart's id (mhartid; a0 at boot); 0 on a uniprocessor */

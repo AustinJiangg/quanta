@@ -106,6 +106,13 @@ enum {
     OP_REG    = 0x33, /* ADD/SUB/.../AND          */
     OP_REG_32 = 0x3b, /* RV64: ADDW/SUBW + W ops  */
     OP_AMO    = 0x2f, /* RV-A: LR/SC and AMO*     */
+    OP_LOAD_FP  = 0x07, /* RV-F/D: FLW/FLD        */
+    OP_STORE_FP = 0x27, /* RV-F/D: FSW/FSD        */
+    OP_MADD     = 0x43, /* RV-F/D: FMADD          */
+    OP_MSUB     = 0x47, /* RV-F/D: FMSUB          */
+    OP_NMSUB    = 0x4b, /* RV-F/D: FNMSUB         */
+    OP_NMADD    = 0x4f, /* RV-F/D: FNMADD         */
+    OP_FP       = 0x53, /* RV-F/D: OP-FP          */
     OP_SYSTEM = 0x73  /* ECALL/EBREAK/CSR         */
 };
 
@@ -120,6 +127,10 @@ enum {
  * of the same state.
  * ------------------------------------------------------------------------ */
 enum {
+    /* Floating-point control/status (Zicsr views of fcsr, M20). fflags is
+     * fcsr[4:0] and frm is fcsr[7:5]; all three are user-accessible. */
+    CSR_FFLAGS = 0x001, CSR_FRM = 0x002, CSR_FCSR = 0x003,
+
     /* Unprivileged counters (read-only; live views of instret). */
     CSR_CYCLE    = 0xc00, CSR_TIME  = 0xc01, CSR_INSTRET  = 0xc02,
     CSR_CYCLEH   = 0xc80, CSR_TIMEH = 0xc81, CSR_INSTRETH = 0xc82,
@@ -153,6 +164,17 @@ static inline const char *reg_abi_name(uint32_t i) {
         "s0",   "s1", "a0", "a1", "a2",  "a3", "a4", "a5",
         "a6",   "a7", "s2", "s3", "s4",  "s5", "s6", "s7",
         "s8",   "s9", "s10","s11","t3",  "t4", "t5", "t6"
+    };
+    return names[i & 0x1f];
+}
+
+/* Float-register ABI names (f0..f31), for FP disassembly (M20). */
+static inline const char *freg_abi_name(uint32_t i) {
+    static const char *names[32] = {
+        "ft0", "ft1", "ft2",  "ft3",  "ft4", "ft5", "ft6",  "ft7",
+        "fs0", "fs1", "fa0",  "fa1",  "fa2", "fa3", "fa4",  "fa5",
+        "fa6", "fa7", "fs2",  "fs3",  "fs4", "fs5", "fs6",  "fs7",
+        "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10", "ft11"
     };
     return names[i & 0x1f];
 }

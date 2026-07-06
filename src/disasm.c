@@ -124,6 +124,43 @@ static void disasm_csr(uint32_t inst, uint32_t f3, char *buf, size_t buflen) {
     }
 }
 
+/* Disassemble an OP-FP instruction (M20). Not pinned by check-disasm (that
+ * covers the RV32 suite, which has no float), so this is best-effort for
+ * --trace readability rather than an exact objdump match. */
+static void disasm_fp(uint32_t inst, char *buf, size_t buflen) {
+    uint32_t op = inst >> 27, fmt = (inst >> 25) & 3, f3 = funct3(inst), rs2n = rs2(inst);
+    const char *w = fmt ? "d" : "s";
+    const char *fd = freg_abi_name(rd(inst)), *f1 = freg_abi_name(rs1(inst));
+    const char *f2 = freg_abi_name(rs2(inst));
+    const char *xd = reg_abi_name(rd(inst)), *x1 = reg_abi_name(rs1(inst));
+    switch (op) {
+    case 0x00: snprintf(buf, buflen, "fadd.%s %s,%s,%s", w, fd, f1, f2); return;
+    case 0x01: snprintf(buf, buflen, "fsub.%s %s,%s,%s", w, fd, f1, f2); return;
+    case 0x02: snprintf(buf, buflen, "fmul.%s %s,%s,%s", w, fd, f1, f2); return;
+    case 0x03: snprintf(buf, buflen, "fdiv.%s %s,%s,%s", w, fd, f1, f2); return;
+    case 0x0b: snprintf(buf, buflen, "fsqrt.%s %s,%s", w, fd, f1); return;
+    case 0x04:
+        if (f3 == 0 && rs1(inst) == rs2n) snprintf(buf, buflen, "fmv.%s %s,%s", w, fd, f1);
+        else snprintf(buf, buflen, "%s.%s %s,%s,%s",
+                      f3 == 0 ? "fsgnj" : f3 == 1 ? "fsgnjn" : "fsgnjx", w, fd, f1, f2);
+        return;
+    case 0x05: snprintf(buf, buflen, "%s.%s %s,%s,%s", f3 ? "fmax" : "fmin", w, fd, f1, f2); return;
+    case 0x08: snprintf(buf, buflen, fmt ? "fcvt.d.s %s,%s" : "fcvt.s.d %s,%s", fd, f1); return;
+    case 0x14: snprintf(buf, buflen, "%s.%s %s,%s,%s",
+                        f3 == 2 ? "feq" : f3 == 1 ? "flt" : "fle", w, xd, f1, f2); return;
+    case 0x1c:
+        if (f3 == 0) snprintf(buf, buflen, fmt ? "fmv.x.d %s,%s" : "fmv.x.w %s,%s", xd, f1);
+        else snprintf(buf, buflen, "fclass.%s %s,%s", w, xd, f1);
+        return;
+    case 0x1e: snprintf(buf, buflen, fmt ? "fmv.d.x %s,%s" : "fmv.w.x %s,%s", fd, x1); return;
+    case 0x18: snprintf(buf, buflen, "fcvt.%s.%s %s,%s",
+                        rs2n == 0 ? "w" : rs2n == 1 ? "wu" : rs2n == 2 ? "l" : "lu", w, xd, f1); return;
+    case 0x1a: snprintf(buf, buflen, "fcvt.%s.%s %s,%s", w,
+                        rs2n == 0 ? "w" : rs2n == 1 ? "wu" : rs2n == 2 ? "l" : "lu", fd, x1); return;
+    default: snprintf(buf, buflen, ".word 0x%08x", inst); return;
+    }
+}
+
 void disasm(uint64_t pc, uint32_t inst, int xlen, char *buf, size_t buflen) {
     /* A compressed (16-bit) instruction is the low halfword when its low two
      * bits are not 0b11. Expand it to the 32-bit instruction it abbreviates and
@@ -253,6 +290,32 @@ void disasm(uint64_t pc, uint32_t inst, int xlen, char *buf, size_t buflen) {
     case OP_FENCE:
         if (f3 == 0x1) snprintf(buf, buflen, "fence.i");
         else           snprintf(buf, buflen, "fence");
+        return;
+
+    case OP_LOAD_FP: { /* FLW / FLD */
+        int32_t imm = imm_i(inst);
+        const char *m = (f3 == 0x2) ? "flw" : (f3 == 0x3) ? "fld" : NULL;
+        if (m) snprintf(buf, buflen, "%s %s,%d(%s)", m, freg_abi_name(rd(inst)), imm, s1);
+        else   snprintf(buf, buflen, ".word 0x%08x", inst);
+        return;
+    }
+    case OP_STORE_FP: { /* FSW / FSD */
+        int32_t imm = imm_s(inst);
+        const char *m = (f3 == 0x2) ? "fsw" : (f3 == 0x3) ? "fsd" : NULL;
+        if (m) snprintf(buf, buflen, "%s %s,%d(%s)", m, freg_abi_name(rs2(inst)), imm, s1);
+        else   snprintf(buf, buflen, ".word 0x%08x", inst);
+        return;
+    }
+    case OP_MADD: case OP_MSUB: case OP_NMSUB: case OP_NMADD: {
+        const char *m = (op == OP_MADD) ? "fmadd" : (op == OP_MSUB) ? "fmsub" :
+                        (op == OP_NMSUB) ? "fnmsub" : "fnmadd";
+        snprintf(buf, buflen, "%s.%s %s,%s,%s,%s", m, ((inst >> 25) & 3) ? "d" : "s",
+                 freg_abi_name(rd(inst)), freg_abi_name(rs1(inst)),
+                 freg_abi_name(rs2(inst)), freg_abi_name(inst >> 27));
+        return;
+    }
+    case OP_FP:
+        disasm_fp(inst, buf, buflen);
         return;
 
     case OP_IMM: {
