@@ -82,7 +82,7 @@ void cpu_init(CPU *cpu, Memory *mem, uint64_t entry_pc, int xlen) {
      * writes are accepted as WARL storage. */
     uint64_t mxl = (xlen == 64) ? 2u : 1u;
     cpu->csr[CSR_MISA] = (mxl << (xlen - 2)) |
-                         (1u << 2) | (1u << 3) | (1u << 5) |  /* C, D, F */
+                         (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) | /* B, C, D, F */
                          (1u << 8) | (1u << 12) | (1u << 18) | (1u << 20); /* I, M, S, U */
 }
 
@@ -112,6 +112,274 @@ static void break_reservation(CPU *cpu, uint64_t addr) {
     }
 }
 
+/* ------------------------------------------------------------------------
+ * Bit-manipulation extensions (M21): Zba, Zbb, Zbs, Zbc.
+ *
+ * These reuse the OP / OP-IMM / OP-32 / OP-IMM-32 opcodes and are picked out of
+ * the base decode by their funct7 / funct6 / funct3 (and, for the unary Zbb
+ * ops, the rs2 field). Each exec_bitmanip_* returns 1 if it recognised and
+ * executed a bit-manip instruction, else 0, so the caller falls through to the
+ * base ISA — including the funct7 == 0x20 slots Zbb (andn/orn/xnor) shares with
+ * the base SUB/SRA. Results run through reg_write, which re-sign-extends to
+ * XLEN, so the group is width-agnostic except where the definition names a
+ * width: the *W word ops, the .uw zero-extends, and the whole-register scans
+ * (clz/ctz/cpop/rev8/orc.b) branch on cpu->xlen (`bits`).
+ * ------------------------------------------------------------------------ */
+
+/* All-ones mask for the low `bits` bits (bits is 32 or 64). */
+static inline uint64_t bm_mask(int bits) {
+    return bits == 64 ? ~(uint64_t)0 : (((uint64_t)1 << bits) - 1);
+}
+
+static int bm_clz(uint64_t v, int bits) {
+    int n = 0;
+    for (int i = bits - 1; i >= 0 && !((v >> i) & 1); i--) n++;
+    return n;
+}
+static int bm_ctz(uint64_t v, int bits) {
+    int n = 0;
+    for (int i = 0; i < bits && !((v >> i) & 1); i++) n++;
+    return n;
+}
+static int bm_cpop(uint64_t v, int bits) {
+    int n = 0;
+    for (int i = 0; i < bits; i++) n += (int)((v >> i) & 1);
+    return n;
+}
+/* Rotate the low `bits` bits of v right/left by sh (masked to bits-1). */
+static uint64_t bm_ror(uint64_t v, unsigned sh, int bits) {
+    v &= bm_mask(bits);
+    sh &= (unsigned)(bits - 1);
+    if (sh == 0) return v;
+    return ((v >> sh) | (v << (bits - sh))) & bm_mask(bits);
+}
+static uint64_t bm_rol(uint64_t v, unsigned sh, int bits) {
+    v &= bm_mask(bits);
+    sh &= (unsigned)(bits - 1);
+    if (sh == 0) return v;
+    return ((v << sh) | (v >> (bits - sh))) & bm_mask(bits);
+}
+/* orc.b: each byte becomes 0xff if any of its bits is set, else 0x00. */
+static uint64_t bm_orcb(uint64_t v, int bits) {
+    uint64_t r = 0;
+    for (int b = 0; b < bits; b += 8)
+        if ((v >> b) & 0xff) r |= (uint64_t)0xff << b;
+    return r;
+}
+/* rev8: reverse the byte order of the low `bits` bits. */
+static uint64_t bm_rev8(uint64_t v, int bits) {
+    uint64_t r = 0;
+    int nbytes = bits / 8;
+    for (int i = 0; i < nbytes; i++)
+        r |= ((v >> (i * 8)) & 0xff) << ((nbytes - 1 - i) * 8);
+    return r;
+}
+/* Carry-less product of a*b (each `bits` wide) into a 2*bits-bit value {hi,lo};
+ * bit i of the product is the XOR of a[j] & b[i-j]. Used by clmul/clmulh/clmulr. */
+static void bm_clmul128(uint64_t a, uint64_t b, int bits, uint64_t *hi, uint64_t *lo) {
+    uint64_t rl = 0, rh = 0;
+    a &= bm_mask(bits);
+    b &= bm_mask(bits);
+    for (int i = 0; i < bits && i < 64; i++) {
+        if ((b >> i) & 1) {
+            rl ^= a << i;
+            if (i > 0) rh ^= a >> (64 - i);
+        }
+    }
+    *hi = rh; *lo = rl;
+}
+/* Extract the `width`-bit field of the 128-bit {hi,lo} starting at bit `pos`.
+ * pos is unsigned and every shift is guarded into [0,63], so this is defined for
+ * any argument (the callers only ever pass 0, width-1, or width, width <= 64). */
+static uint64_t bm_bits128(uint64_t hi, uint64_t lo, unsigned pos, int width) {
+    uint64_t v;
+    if (pos == 0)         v = lo;
+    else if (pos < 64)    v = (lo >> pos) | (hi << (64 - pos));
+    else if (pos < 128)   v = hi >> (pos - 64);
+    else                  v = 0;
+    return v & bm_mask(width);
+}
+
+/* Bit-manip in the OP (register/register) opcode: Zba shNadd, Zbb logic/rotate/
+ * min/max, Zbs single-bit, Zbc carry-less multiply. */
+static int exec_bitmanip_op(CPU *cpu, uint32_t inst) {
+    uint32_t f7 = funct7(inst), f3 = funct3(inst);
+    int bits = cpu->xlen;
+    uint64_t a = reg_read(cpu, rs1(inst));
+    uint64_t b = reg_read(cpu, rs2(inst));
+    unsigned idx = (unsigned)b & (unsigned)(bits - 1); /* Zbs bit index */
+    uint64_t hi, lo, r;
+
+    switch (f7) {
+    case 0x10: /* Zba: shNadd */
+        switch (f3) {
+        case 0x2: r = (a << 1) + b; break;                       /* sh1add */
+        case 0x4: r = (a << 2) + b; break;                       /* sh2add */
+        case 0x6: r = (a << 3) + b; break;                       /* sh3add */
+        default: return 0;
+        }
+        break;
+    case 0x20: /* Zbb: andn/orn/xnor — the base SUB/SRA slots (f3 0/5) fall through */
+        switch (f3) {
+        case 0x7: r = a & ~b; break;                             /* andn */
+        case 0x6: r = a | ~b; break;                             /* orn  */
+        case 0x4: r = ~(a ^ b); break;                           /* xnor */
+        default: return 0;
+        }
+        break;
+    case 0x30: /* Zbb: rol/ror */
+        switch (f3) {
+        case 0x1: r = bm_rol(a, (unsigned)b, bits); break;       /* rol */
+        case 0x5: r = bm_ror(a, (unsigned)b, bits); break;       /* ror */
+        default: return 0;
+        }
+        break;
+    case 0x05: /* Zbc clmul* (f3 1/2/3) and Zbb min/max (f3 4..7) */
+        switch (f3) {
+        case 0x1: bm_clmul128(a, b, bits, &hi, &lo);
+                  r = bm_bits128(hi, lo, 0, bits); break;        /* clmul  */
+        case 0x2: bm_clmul128(a, b, bits, &hi, &lo);
+                  r = bm_bits128(hi, lo, bits - 1, bits); break; /* clmulr */
+        case 0x3: bm_clmul128(a, b, bits, &hi, &lo);
+                  r = bm_bits128(hi, lo, bits, bits); break;     /* clmulh */
+        case 0x4: r = ((int64_t)a < (int64_t)b) ? a : b; break;  /* min  */
+        case 0x5: r = (a < b) ? a : b; break;                    /* minu */
+        case 0x6: r = ((int64_t)a < (int64_t)b) ? b : a; break;  /* max  */
+        case 0x7: r = (a < b) ? b : a; break;                    /* maxu */
+        default: return 0;
+        }
+        break;
+    case 0x24: /* Zbs: bclr/bext */
+        switch (f3) {
+        case 0x1: r = a & ~((uint64_t)1 << idx); break;          /* bclr */
+        case 0x5: r = (a >> idx) & 1; break;                     /* bext */
+        default: return 0;
+        }
+        break;
+    case 0x14: /* Zbs: bset */
+        if (f3 != 0x1) return 0;
+        r = a | ((uint64_t)1 << idx);                            /* bset */
+        break;
+    case 0x34: /* Zbs: binv */
+        if (f3 != 0x1) return 0;
+        r = a ^ ((uint64_t)1 << idx);                            /* binv */
+        break;
+    case 0x04: /* Zbb: zext.h — RV32 form (RV64's is in OP-32) */
+        if (cpu->xlen != 32 || f3 != 0x4 || rs2(inst) != 0) return 0;
+        r = a & 0xffff;                                          /* zext.h */
+        break;
+    default:
+        return 0;
+    }
+    reg_write(cpu, rd(inst), r);
+    return 1;
+}
+
+/* Bit-manip in the OP-IMM opcode: the Zbb unary scans (funct3 0x1, funct7 0x30),
+ * the Zbs immediate single-bit ops and rori (by funct6), and orc.b/rev8. */
+static int exec_bitmanip_imm(CPU *cpu, uint32_t inst) {
+    uint32_t f3 = funct3(inst), f7 = funct7(inst);
+    uint32_t f6 = (inst >> 26) & 0x3f, rs2f = rs2(inst);
+    int bits = cpu->xlen;
+    uint64_t a = reg_read(cpu, rs1(inst));
+    unsigned shamt = (inst >> 20) & (bits == 64 ? 0x3fu : 0x1fu);
+    uint64_t r;
+
+    if (f3 == 0x1) {
+        if (f7 == 0x30) {          /* clz/ctz/cpop/sext.b/sext.h */
+            switch (rs2f) {
+            case 0x00: r = (uint64_t)bm_clz(a, bits); break;     /* clz    */
+            case 0x01: r = (uint64_t)bm_ctz(a, bits); break;     /* ctz    */
+            case 0x02: r = (uint64_t)bm_cpop(a, bits); break;    /* cpop   */
+            case 0x04: r = (uint64_t)(int64_t)(int8_t)a; break;  /* sext.b */
+            case 0x05: r = (uint64_t)(int64_t)(int16_t)a; break; /* sext.h */
+            default: return 0;
+            }
+        }
+        else if (f6 == 0x12) r = a & ~((uint64_t)1 << shamt);    /* bclri */
+        else if (f6 == 0x1a) r = a ^  ((uint64_t)1 << shamt);    /* binvi */
+        else if (f6 == 0x0a) r = a |  ((uint64_t)1 << shamt);    /* bseti */
+        else return 0;
+    } else if (f3 == 0x5) {
+        if (f6 == 0x18)                          r = bm_ror(a, shamt, bits); /* rori  */
+        else if (f6 == 0x12)                     r = (a >> shamt) & 1;       /* bexti */
+        else if (f7 == 0x14 && rs2f == 0x07)     r = bm_orcb(a, bits);       /* orc.b */
+        else if ((f7 == 0x34 || f7 == 0x35) && rs2f == 0x18)
+                                                 r = bm_rev8(a, bits);       /* rev8  */
+        else return 0;
+    } else {
+        return 0;
+    }
+    reg_write(cpu, rd(inst), r);
+    return 1;
+}
+
+/* Bit-manip in the OP-32 opcode (RV64 only): Zba add.uw / shNadd.uw, the RV64
+ * zext.h form, and the Zbb word rotates rolw/rorw. */
+static int exec_bitmanip_op32(CPU *cpu, uint32_t inst) {
+    uint32_t f7 = funct7(inst), f3 = funct3(inst);
+    uint64_t a   = reg_read(cpu, rs1(inst));
+    uint64_t b   = reg_read(cpu, rs2(inst));
+    uint64_t auw = a & 0xffffffffu;    /* zext32(rs1) for the .uw ops */
+    uint64_t r;
+
+    switch (f7) {
+    case 0x04: /* add.uw (f3 0) or zext.h (f3 4, rs2 0) */
+        if (f3 == 0x0)                          r = auw + b;      /* add.uw */
+        else if (f3 == 0x4 && rs2(inst) == 0)   r = a & 0xffff;   /* zext.h */
+        else return 0;
+        break;
+    case 0x10: /* shNadd.uw */
+        switch (f3) {
+        case 0x2: r = (auw << 1) + b; break;                      /* sh1add.uw */
+        case 0x4: r = (auw << 2) + b; break;                      /* sh2add.uw */
+        case 0x6: r = (auw << 3) + b; break;                      /* sh3add.uw */
+        default: return 0;
+        }
+        break;
+    case 0x30: /* rolw/rorw: rotate the low 32 bits, sign-extend the result */
+        switch (f3) {
+        case 0x1: r = (uint64_t)(int64_t)(int32_t)bm_rol(a, (unsigned)b, 32); break;
+        case 0x5: r = (uint64_t)(int64_t)(int32_t)bm_ror(a, (unsigned)b, 32); break;
+        default: return 0;
+        }
+        break;
+    default:
+        return 0;
+    }
+    reg_write(cpu, rd(inst), r);
+    return 1;
+}
+
+/* Bit-manip in the OP-IMM-32 opcode (RV64 only): slli.uw, the word scans
+ * clzw/ctzw/cpopw, and roriw. */
+static int exec_bitmanip_imm32(CPU *cpu, uint32_t inst) {
+    uint32_t f3 = funct3(inst), f7 = funct7(inst);
+    uint32_t f6 = (inst >> 26) & 0x3f, rs2f = rs2(inst);
+    uint64_t a = reg_read(cpu, rs1(inst));
+    uint64_t r;
+
+    if (f3 == 0x1) {
+        if (f6 == 0x02) {                                  /* slli.uw (6-bit shamt) */
+            r = (a & 0xffffffffu) << ((inst >> 20) & 0x3f);
+        } else if (f7 == 0x30) {                           /* clzw/ctzw/cpopw */
+            uint32_t w = (uint32_t)a;
+            switch (rs2f) {
+            case 0x00: r = (uint64_t)bm_clz(w, 32); break; /* clzw  */
+            case 0x01: r = (uint64_t)bm_ctz(w, 32); break; /* ctzw  */
+            case 0x02: r = (uint64_t)bm_cpop(w, 32); break;/* cpopw */
+            default: return 0;
+            }
+        } else return 0;
+    } else if (f3 == 0x5 && f7 == 0x30) {                  /* roriw (5-bit shamt) */
+        r = (uint64_t)(int64_t)(int32_t)bm_ror(a, (inst >> 20) & 0x1f, 32);
+    } else {
+        return 0;
+    }
+    reg_write(cpu, rd(inst), r);
+    return 1;
+}
+
 /* Execute OP-IMM: register/immediate arithmetic (ADDI, SLTI, shifts, ...).
  *
  * Width-agnostic: operands are read at full width and the sext invariant means
@@ -121,6 +389,7 @@ static void break_reservation(CPU *cpu, uint64_t addr) {
  * sign-extended 64-bit container. SRAI vs SRLI is bit 30 (it survives the wider
  * RV64 shamt, where the funct7 test would not). */
 static void exec_op_imm(CPU *cpu, uint32_t inst) {
+    if (exec_bitmanip_imm(cpu, inst)) return;          /* Zbb/Zbs immediate ops */
     uint64_t a    = reg_read(cpu, rs1(inst));
     int64_t  imm  = imm_i(inst);                       /* sign-extended to XLEN */
     uint32_t shamt = (uint32_t)imm & (cpu->xlen == 64 ? 0x3fu : 0x1fu);
@@ -250,6 +519,7 @@ static void exec_op(CPU *cpu, uint32_t inst) {
         exec_muldiv(cpu, inst);
         return;
     }
+    if (exec_bitmanip_op(cpu, inst)) return; /* Zba/Zbb/Zbs/Zbc register ops */
     uint64_t a = reg_read(cpu, rs1(inst));
     uint64_t b = reg_read(cpu, rs2(inst));
     uint32_t shamt = (uint32_t)b & (cpu->xlen == 64 ? 0x3fu : 0x1fu);
@@ -281,6 +551,7 @@ static void exec_op(CPU *cpu, uint32_t inst) {
  * it to 64 bits. The shamt is always 5 bits here. */
 static void exec_op_imm32(CPU *cpu, uint32_t inst) {
     if (cpu->xlen != 64) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
+    if (exec_bitmanip_imm32(cpu, inst)) return;   /* slli.uw, clzw/ctzw/cpopw, roriw */
     uint32_t a     = (uint32_t)reg_read(cpu, rs1(inst));
     int32_t  imm   = imm_i(inst);
     uint32_t shamt = imm & 0x1f;
@@ -332,6 +603,7 @@ static void exec_muldivw(CPU *cpu, uint32_t inst) {
 static void exec_op32(CPU *cpu, uint32_t inst) {
     if (cpu->xlen != 64) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); return; }
     if (funct7(inst) == 0x01) { exec_muldivw(cpu, inst); return; }
+    if (exec_bitmanip_op32(cpu, inst)) return; /* add.uw/shNadd.uw/zext.h/rolw/rorw */
     uint32_t a     = (uint32_t)reg_read(cpu, rs1(inst));
     uint32_t b     = (uint32_t)reg_read(cpu, rs2(inst));
     uint32_t shamt = b & 0x1f;

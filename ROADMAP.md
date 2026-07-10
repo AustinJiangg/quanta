@@ -1201,24 +1201,41 @@ differential net, the single most valuable check for IEEE edge cases. Permissive
 execution keeps the test user-mode and qemu-checkable while a full-system guest
 still sees the dirty state it needs for lazy context switching.
 
-## M21 — Bit manipulation (Zba/Zbb/Zbs/Zbc)
+## M21 — Bit manipulation (Zba/Zbb/Zbs/Zbc) (DONE)
 
 The bit-manipulation extensions modern toolchains and the kernel increasingly
 emit — mostly self-contained ALU work, a cheap and high-value follow-on to the
-float milestone.
+float milestone. They reuse the existing OP / OP-IMM / OP-32 / OP-IMM-32 opcodes
+and are picked out of the base decode by their funct7 / funct6 / funct3 (and, for
+the unary Zbb ops, the rs2 field), so rather than a new decoder each width gets
+four small `exec_bitmanip_*` intercepts in `cpu.c` that run before the base
+switch and return 0 to fall through — including the funct7 == 0x20 slots Zbb's
+andn/orn/xnor share with the base SUB/SRA. The core is width-agnostic (results
+run through `reg_write`, which re-sign-extends to XLEN); only the ops whose
+definition names a width — the *W word ops, the `.uw` zero-extends, and the
+whole-register scans clz/ctz/cpop/rev8/orc.b — branch on `cpu->xlen`. Carry-less
+multiply uses a portable two-word 128-bit product (`bm_clmul128`, no `__int128`),
+from which clmul/clmulh/clmulr slice the low/high/reversed field. The
+disassembler mirrors the decode and matches binutils exactly (pinned by
+`check-disasm`), and `misa` now advertises `B`.
 
-- [ ] **Build:** Zba (`sh1add`/`sh2add`/`sh3add`, `add.uw`, `slli.uw`), Zbb
-  (`andn`/`orn`/`xnor`, `clz`/`ctz`/`cpop`, `min`/`max`(`u`), `sext.b`/`sext.h`/
-  `zext.h`, `rol`/`ror`(`i`), `orc.b`, `rev8`), Zbs (`bclr`/`bext`/`binv`/`bset`
-  and immediates), and Zbc (carry-less multiply `clmul`/`clmulh`/`clmulr`),
-  mirrored in the disassembler and advertised in the isa string.
-- [ ] **ISA:** Zba, Zbb, Zbs, Zbc (RV32 and RV64 widths).
-- [ ] **Concept:** why bit manipulation is a common extension — the crypto,
+- [x] **Build:** Zba (`sh1add`/`sh2add`/`sh3add`, `add.uw`, `sh{1,2,3}add.uw`,
+  `slli.uw`), Zbb (`andn`/`orn`/`xnor`, `clz`/`ctz`/`cpop`(+`w`), `min`/`max`(`u`),
+  `sext.b`/`sext.h`/`zext.h`, `rol`/`ror`(`i`) and the `w` forms, `orc.b`, `rev8`),
+  Zbs (`bclr`/`bext`/`binv`/`bset` and immediates), and Zbc (carry-less multiply
+  `clmul`/`clmulh`/`clmulr`), mirrored in the disassembler and advertised in the
+  isa string.
+- [x] **ISA:** Zba, Zbb, Zbs, Zbc (RV32 and RV64 widths).
+- [x] **Concept:** why bit manipulation is a common extension — the crypto,
   hashing, and bignum kernels it accelerates.
-- [ ] **Done when:** the B-family arch-tests (or a hand-written suite) pass and the
-  programs agree with qemu.
-- [ ] **Commits:** `feat: add zba/zbb/zbs`, `feat: add zbc carryless multiply`,
-  `test: add bitmanip conformance`.
+- [x] **Done when:** a hand-written suite passes and agrees with qemu — the RV64
+  suite (`tests/rv64/test_rv64_bitmanip.S`, 43 checks, including the *W/.uw forms
+  and 6-bit shift immediates) runs green under `make check-rv64`'s qemu-riscv64
+  differential, and the RV32 suite (`tests/test_bitmanip.S`, 32 checks) is pinned
+  by `make check`, the qemu-riscv32 differential (`make check-diff`), and objdump
+  (`make check-disasm`). (Extending `make check-arch` to the official B family is
+  E16.)
+- [x] **Commits:** `feat: add zba/zbb/zbs/zbc bit manipulation`.
 
 ### Stage 6 — Platform realism, boot a distribution (M22–M24)
 

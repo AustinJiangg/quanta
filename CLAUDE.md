@@ -45,10 +45,12 @@ Sv39), and — through real **OpenSBI** firmware (`--bios`/`--kernel`) plus a
 **cpio initramfs** (`--initrd`, `tests/linux/`) — **mainline Linux 6.6 now boots
 to an interactive userspace shell**, and **SMP multi-hart** (`--harts=N`, up to 8
 harts on a deterministic round-robin scheduler, M19) on which upstream **xv6 boots
-across 3 harts**, and the **RV32/64 F and D floating-point extensions** (M20) on a
+across 3 harts**, the **RV32/64 F and D floating-point extensions** (M20) on a
 from-scratch, correctly-rounded IEEE-754 software float (`src/softfloat.{h,c}`, no
-dependency; validated bit-for-bit against qemu-riscv64, `tests/rv64/test_rv64_fpu.S`)
-— are implemented
+dependency; validated bit-for-bit against qemu-riscv64, `tests/rv64/test_rv64_fpu.S`),
+and the **RV32/64 bit-manipulation extensions** — Zba, Zbb, Zbs, and Zbc
+carry-less multiply (M21, `tests/test_bitmanip.S` / `tests/rv64/test_rv64_bitmanip.S`,
+differential-tested against qemu) — are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
@@ -237,7 +239,13 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   OP-FP arithmetic/convert/move/compare family, dispatched by `funct7`), and
   `exec_fmadd` (the four fused ops); `fread_s`/`fwrite_s` do the single-precision
   NaN-boxing, `resolve_rm` picks the rounding mode, and `fcsr`/`frm`/`fflags` are
-  CSR views — the IEEE arithmetic itself lives in `softfloat.c`.
+  CSR views — the IEEE arithmetic itself lives in `softfloat.c`. M21 adds the
+  bit-manipulation extensions (Zba/Zbb/Zbs/Zbc): four `exec_bitmanip_*` intercepts
+  (one per OP / OP-IMM / OP-32 / OP-IMM-32 opcode) run before the base ALU switch
+  and return 0 to fall through, so the base decode is untouched — including the
+  funct7 == 0x20 slots Zbb's andn/orn/xnor share with SUB/SRA; small `bm_*`
+  helpers (clz/ctz/cpop, rotate, orc.b, rev8, and a portable two-word carry-less
+  product `bm_clmul128` for clmul/clmulh/clmulr) do the work.
 - `src/softfloat.{h,c}` — from-scratch, correctly-rounded IEEE-754 binary32/
   binary64 (M20). One format-parameterised core serves both widths
   (`unpack → operate → round`); results are host-independent (no host FPU, no
@@ -266,7 +274,9 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   expanded mnemonic (with one compressed-only twist: `c.mv` shows as `mv`). M20
   adds `disasm_fp` for the OP-FP / load-FP / store-FP / fused-op families
   (best-effort for `--trace` readability; the float suite is RV64, out of the
-  RV32-only `check-disasm`).
+  RV32-only `check-disasm`). M21 adds `disasm_bitmanip` for the Zba/Zbb/Zbs/Zbc
+  families across the four ALU opcodes; it matches binutils exactly, so the RV32
+  bit-manip test *is* pinned by `check-disasm`.
 - `src/cache.{h,c}` — optional set-associative LRU cache model. A pure
   observability layer: `cpu_step`'s load/store paths feed it data addresses, it
   tallies hits/misses, but the bytes still come from `memory.c`, so results are
@@ -362,6 +372,13 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   result, signed-vs-unsigned min/max) plus LR/SC success and a broken-reservation
   failure. Atomics are user-mode, so it assembles `-march=rv32ia` and *is*
   differential-tested against qemu.
+- `tests/test_bitmanip.S` — the M21 RV32 bit-manip suite (Zba/Zbb/Zbs/Zbc), 32
+  checks over the RV32-applicable forms (no `*W`/`.uw`). Plain user-mode integer
+  code assembled `-march=rv32i_zba_zbb_zbs_zbc`, so it is pinned by `make check`,
+  differential-tested against qemu-riscv32 (`check-diff`), *and* disassembly-pinned
+  against objdump (`check-disasm`). Its RV64 sibling
+  `tests/rv64/test_rv64_bitmanip.S` (43 checks, adding the `*W`/`.uw` forms and
+  6-bit shift immediates) is in `check-rv64`'s qemu-riscv64 differential.
 - `tests/test_vm.S` — the M12 Sv32 suite: builds a page table by hand, enables
   paging, and drops to S-mode, proving non-identity translation (two VAs aliased
   to one frame), hardware dirty-bit update, and a precise load page fault caught
@@ -752,6 +769,26 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   test is user-mode (`-march=rv32ia`) and differential-tested against qemu — its
   SC-failure case overwrites the reserved word with a *different* value, so an
   address-based reservation (ours) and a value-based one (qemu-user) agree.
+- Bit-manipulation (M21, Zba/Zbb/Zbs/Zbc) is decoded by four `exec_bitmanip_*`
+  intercepts in `cpu.c`, one per reused opcode (OP/OP-IMM/OP-32/OP-IMM-32), each
+  called *before* the base ALU switch and returning 0 to fall through — so the
+  base decode is untouched and reserved encodings stay as lenient as before. Decode
+  traps to watch: (1) Zbb's andn/orn/xnor sit in the **funct7 == 0x20** group the
+  base uses for SUB/SRA, and clmul* share **funct7 == 0x05** with min/max — both
+  split by funct3, so the intercept returns 0 for the base/other funct3 values.
+  (2) The shift-immediate ops (bclri/binvi/bseti/rori/bexti and slli.uw) are
+  discriminated by **funct6** (bits [31:26]), not funct7, because their shamt is 6
+  bits in RV64 (bit 25 is shamt, not funct7); the unary scans (clz/ctz/cpop/
+  sext.b/sext.h and clzw/ctzw/cpopw) use the full funct7 == 0x30 plus a fixed rs2.
+  (3) rev8's immediate differs by width (funct7 0x34 on RV32, 0x35 on RV64), and
+  `bm_rev8`/`bm_orcb`/`bm_clz` reverse/scan `cpu->xlen` bits. Width handling
+  otherwise rides the sext invariant: results go through `reg_write`, so only the
+  named-width ops (`*W`, `.uw`, the whole-register scans) branch on XLEN.
+  (4) Carry-less multiply avoids `__int128`: `bm_clmul128` builds the 2·XLEN-bit
+  product in two words and `bm_bits128` slices the low (clmul) / high (clmulh) /
+  reversed (clmulr) field — its shifts are guarded into `[0,63]` so the analyzer
+  stays clean. `misa` advertises `B`; the disassembler matches binutils so the
+  RV32 test is in `check-disasm`, and both tests are qemu-differential.
 - Paging (Sv32, M12; Sv39, M18) lives in `mmu.c`, not `memory.c` — translation
   needs CPU state (satp/priv/mstatus), while `memory.c` stays a dumb physical
   array. **One walk loop serves both schemes**, parameterised by a descriptor

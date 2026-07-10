@@ -136,6 +136,11 @@ tests/test_trap.elf tests/test_priv.elf tests/test_vm.elf tests/test_irq.elf tes
 # tests/test_atomic.S uses the RV32A atomics, which the base assembler rejects.
 tests/test_atomic.elf: RVCFLAGS := $(subst rv32i,rv32ia,$(RVCFLAGS))
 
+# tests/test_bitmanip.S exercises the RV32 bit-manipulation extensions (M21);
+# enable Zba/Zbb/Zbs/Zbc for just this ELF. User-mode integer code, so qemu
+# cross-checks it via make check-diff and objdump via make check-disasm.
+tests/test_bitmanip.elf: RVCFLAGS := $(subst rv32i,rv32i_zba_zbb_zbs_zbc,$(RVCFLAGS))
+
 # M16 teaching kernel (tests/os/): a freestanding S-mode kernel that boots and
 # runs a userspace process — the integration of M8-M15. Unlike the conformance
 # tests it is multi-file C + asm with its own startup and linker script, so it
@@ -178,6 +183,11 @@ tests/rv64/%.elf: tests/rv64/%.S
 # plain user-mode code (fcsr/frm/fflags are unprivileged CSRs), so qemu-riscv64
 # cross-checks it via check-rv64 like the other user-mode RV64 tests.
 tests/rv64/test_rv64_fpu.elf: RV64FLAGS := $(subst rv64imac_zicsr,rv64imafdc_zicsr,$(RV64FLAGS))
+
+# The bit-manipulation test (M21) needs Zba/Zbb/Zbs/Zbc, including the RV64-only
+# *W/.uw forms. Plain user-mode code, so qemu-riscv64 cross-checks it via
+# check-rv64 like the other user-mode RV64 tests.
+tests/rv64/test_rv64_bitmanip.elf: RV64FLAGS := $(subst rv64imac_zicsr,rv64imac_zicsr_zba_zbb_zbs_zbc,$(RV64FLAGS))
 
 # The privileged trap test's handler advances mepc by a fixed 4 bytes, so its
 # ebreak must stay 4-byte: build it without the compressed extension, which would

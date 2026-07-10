@@ -161,6 +161,104 @@ static void disasm_fp(uint32_t inst, char *buf, size_t buflen) {
     }
 }
 
+/* Bit-manipulation disassembly (M21): Zba/Zbb/Zbs/Zbc across the OP / OP-IMM /
+ * OP-32 / OP-IMM-32 opcodes. Returns 1 if it recognised and rendered a bit-manip
+ * instruction (mirroring the executor's decode), else 0 so the base path runs.
+ * Mnemonics and operand order follow binutils so `make check-disasm` matches. */
+static int disasm_bitmanip(uint32_t inst, char *buf, size_t buflen) {
+    uint32_t op = opcode(inst), f3 = funct3(inst), f7 = funct7(inst);
+    uint32_t f6 = (inst >> 26) & 0x3f, rs2f = rs2(inst);
+    const char *d  = reg_abi_name(rd(inst));
+    const char *s1 = reg_abi_name(rs1(inst));
+    const char *s2 = reg_abi_name(rs2(inst));
+    const char *name = NULL;
+
+    if (op == OP_REG) {
+        switch (f7) {
+        case 0x10: name = f3==0x2?"sh1add":f3==0x4?"sh2add":f3==0x6?"sh3add":NULL; break;
+        case 0x20: name = f3==0x7?"andn":f3==0x6?"orn":f3==0x4?"xnor":NULL; break;
+        case 0x30: name = f3==0x1?"rol":f3==0x5?"ror":NULL; break;
+        case 0x05:
+            switch (f3) {
+            case 0x1: name = "clmul";  break; case 0x2: name = "clmulr"; break;
+            case 0x3: name = "clmulh"; break; case 0x4: name = "min";    break;
+            case 0x5: name = "minu";   break; case 0x6: name = "max";    break;
+            case 0x7: name = "maxu";   break;
+            }
+            break;
+        case 0x24: name = f3==0x1?"bclr":f3==0x5?"bext":NULL; break;
+        case 0x14: name = f3==0x1?"bset":NULL; break;
+        case 0x34: name = f3==0x1?"binv":NULL; break;
+        case 0x04:
+            if (f3==0x4 && rs2f==0) { snprintf(buf, buflen, "zext.h %s,%s", d, s1); return 1; }
+            break;
+        }
+        if (name) { snprintf(buf, buflen, "%s %s,%s,%s", name, d, s1, s2); return 1; }
+        return 0;
+    }
+    if (op == OP_REG_32) {
+        switch (f7) {
+        case 0x04:
+            if (f3==0x0)            { snprintf(buf, buflen, "add.uw %s,%s,%s", d, s1, s2); return 1; }
+            if (f3==0x4 && rs2f==0) { snprintf(buf, buflen, "zext.h %s,%s", d, s1); return 1; }
+            break;
+        case 0x10: name = f3==0x2?"sh1add.uw":f3==0x4?"sh2add.uw":f3==0x6?"sh3add.uw":NULL; break;
+        case 0x30: name = f3==0x1?"rolw":f3==0x5?"rorw":NULL; break;
+        }
+        if (name) { snprintf(buf, buflen, "%s %s,%s,%s", name, d, s1, s2); return 1; }
+        return 0;
+    }
+    if (op == OP_IMM) {
+        uint32_t shamt = (inst >> 20) & 0x3f;
+        if (f3 == 0x1) {
+            if (f7 == 0x30) {
+                switch (rs2f) {
+                case 0x00: name = "clz";    break; case 0x01: name = "ctz";    break;
+                case 0x02: name = "cpop";   break; case 0x04: name = "sext.b"; break;
+                case 0x05: name = "sext.h"; break;
+                }
+                if (name) { snprintf(buf, buflen, "%s %s,%s", name, d, s1); return 1; }
+                return 0;
+            }
+            if      (f6==0x12) name = "bclri";
+            else if (f6==0x1a) name = "binvi";
+            else if (f6==0x0a) name = "bseti";
+            else return 0;
+            snprintf(buf, buflen, "%s %s,%s,0x%x", name, d, s1, shamt);
+            return 1;
+        }
+        if (f3 == 0x5) {
+            if (f6==0x18) { snprintf(buf, buflen, "rori %s,%s,0x%x", d, s1, shamt); return 1; }
+            if (f6==0x12) { snprintf(buf, buflen, "bexti %s,%s,0x%x", d, s1, shamt); return 1; }
+            if (f7==0x14 && rs2f==0x07) { snprintf(buf, buflen, "orc.b %s,%s", d, s1); return 1; }
+            if ((f7==0x34||f7==0x35) && rs2f==0x18) { snprintf(buf, buflen, "rev8 %s,%s", d, s1); return 1; }
+        }
+        return 0;
+    }
+    if (op == OP_IMM_32) {
+        if (f3 == 0x1) {
+            if (f6 == 0x02) {
+                snprintf(buf, buflen, "slli.uw %s,%s,0x%x", d, s1, (inst>>20)&0x3f);
+                return 1;
+            }
+            if (f7 == 0x30) {
+                switch (rs2f) {
+                case 0x00: name = "clzw";  break; case 0x01: name = "ctzw"; break;
+                case 0x02: name = "cpopw"; break;
+                }
+                if (name) { snprintf(buf, buflen, "%s %s,%s", name, d, s1); return 1; }
+            }
+            return 0;
+        }
+        if (f3==0x5 && f7==0x30) {
+            snprintf(buf, buflen, "roriw %s,%s,0x%x", d, s1, (inst>>20)&0x1f);
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 void disasm(uint64_t pc, uint32_t inst, int xlen, char *buf, size_t buflen) {
     /* A compressed (16-bit) instruction is the low halfword when its low two
      * bits are not 0b11. Expand it to the 32-bit instruction it abbreviates and
@@ -319,6 +417,7 @@ void disasm(uint64_t pc, uint32_t inst, int xlen, char *buf, size_t buflen) {
         return;
 
     case OP_IMM: {
+        if (disasm_bitmanip(inst, buf, buflen)) return;
         int32_t imm = imm_i(inst);
         uint32_t shamt = (inst >> 20) & (xlen == 64 ? 0x3f : 0x1f);
         switch (f3) {
@@ -353,6 +452,7 @@ void disasm(uint64_t pc, uint32_t inst, int xlen, char *buf, size_t buflen) {
     }
 
     case OP_IMM_32: { /* RV64 *W immediate ops */
+        if (disasm_bitmanip(inst, buf, buflen)) return;
         int32_t imm = imm_i(inst);
         uint32_t shamt = (inst >> 20) & 0x1f;
         switch (f3) {
@@ -370,6 +470,7 @@ void disasm(uint64_t pc, uint32_t inst, int xlen, char *buf, size_t buflen) {
     }
 
     case OP_REG: {
+        if (disasm_bitmanip(inst, buf, buflen)) return;
         if (f7 == 0x01) { /* RV32M: multiply/divide share the OP opcode */
             static const char *m[8] = {
                 "mul", "mulh", "mulhsu", "mulhu", "div", "divu", "rem", "remu"
@@ -406,6 +507,7 @@ void disasm(uint64_t pc, uint32_t inst, int xlen, char *buf, size_t buflen) {
     }
 
     case OP_REG_32: { /* RV64 *W register ops */
+        if (disasm_bitmanip(inst, buf, buflen)) return;
         if (f7 == 0x01) { /* RV64M *W: mulw/divw/divuw/remw/remuw */
             static const char *mw[8] = {
                 "mulw", NULL, NULL, NULL, "divw", "divuw", "remw", "remuw"

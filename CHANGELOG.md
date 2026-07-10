@@ -9,6 +9,25 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **Bit-manipulation extensions (Zba/Zbb/Zbs/Zbc)** — Quanta now runs the
+  ratified `B` extension (Zba address-generation, Zbb basic bit-manip, Zbs
+  single-bit) plus Zbc carry-less multiply, at both RV32 and RV64 widths. They
+  reuse the existing OP / OP-IMM / OP-32 / OP-IMM-32 opcodes, so `cpu.c` decodes
+  them with four small `exec_bitmanip_*` intercepts that run before the base
+  switch and fall through when they do not match — including the funct7 == 0x20
+  slots Zbb's andn/orn/xnor share with the base SUB/SRA. The set covers Zba
+  (`sh{1,2,3}add`, `add.uw`, `sh{1,2,3}add.uw`, `slli.uw`), Zbb (`andn`/`orn`/
+  `xnor`, `clz`/`ctz`/`cpop` and their `w` forms, `min`/`max`(`u`), `sext.b`/
+  `sext.h`/`zext.h`, `rol`/`ror`/`rori` and the `w` forms, `orc.b`, `rev8`), Zbs
+  (`bclr`/`bext`/`binv`/`bset` and immediates), and Zbc (`clmul`/`clmulh`/
+  `clmulr`, via a portable two-word 128-bit carry-less product — no `__int128`).
+  The disassembler mirrors the decode and matches binutils exactly, and `misa`
+  advertises `B`. Pinned by a hand-written suite: `tests/rv64/test_rv64_bitmanip.S`
+  (43 checks, including the *W/.uw forms and 6-bit shift immediates)
+  differentially against qemu-riscv64 under `make check-rv64`, and
+  `tests/test_bitmanip.S` (32 checks) under `make check`, the qemu-riscv32
+  differential (`make check-diff`), and objdump (`make check-disasm`). (M21)
+
 - **RV32/64 F and D floating point (the missing "G")** — Quanta now runs the
   single- and double-precision floating-point extensions on top of a from-scratch,
   correctly-rounded IEEE-754 software float (`src/softfloat.{h,c}`, no third-party
