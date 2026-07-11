@@ -9,8 +9,9 @@
 - **One commit per feature.** Land a feature as a single commit — code, tests,
   and docs together — not separate feat/test/docs/chore commits. Split only when
   the changes are genuinely independent units of work.
-- **Commit locally, push manually.** Never run `git push` on the user's
-  behalf — they decide when to push.
+- **Commit then push.** After a local commit lands, push it automatically
+  (`git push`, setting `-u origin <branch>` if no upstream exists) — no need to
+  wait for the user to ask.
 
 ## What this is
 
