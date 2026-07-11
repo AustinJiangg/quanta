@@ -19,6 +19,12 @@
  *     over a single split virtqueue; the OS's root filesystem lives on it. Unlike
  *     the others it is a bus master — it DMAs against guest RAM — so the platform
  *     carries a pointer to memory for it (plat_attach_ram).
+ *   - VIRTIO-NET — a second virtio-mmio slot: a virtio-net device (modern / v2)
+ *     with a receive and a transmit virtqueue (M23). Frames the guest transmits
+ *     are handed to a host backend; frames the backend delivers are written into
+ *     the guest's posted receive buffers. With no backend attached it loops
+ *     transmitted frames straight back to the receive queue — no host networking,
+ *     which is what the deterministic test drives.
  *
  * The register models are self-contained (no CPU dependency): the memory layer
  * dispatches MMIO accesses here, and the CPU pulls the resulting interrupt-
@@ -36,6 +42,8 @@
 #define UART_SIZE   0x00000100u
 #define VIRTIO_BASE 0x10001000u   /* qemu virt's first virtio-mmio slot (xv6's VIRTIO0) */
 #define VIRTIO_SIZE 0x00001000u
+#define VIRTIO_NET_BASE 0x10002000u /* qemu virt's second virtio-mmio slot (M23) */
+#define VIRTIO_NET_SIZE 0x00001000u
 
 /* The maximum number of harts the machine models (M19). CLINT compares/IPIs and
  * PLIC contexts are sized for this; a run uses 1..QUANTA_MAX_HARTS, chosen with
@@ -54,6 +62,7 @@
 #define PLIC_NCONTEXTS (2u * QUANTA_MAX_HARTS)
 #define UART_IRQ       10u
 #define VIRTIO_IRQ     1u
+#define VIRTIO_NET_IRQ 2u
 
 /* mip/mie bit positions the platform drives — read-only reflections of device
  * state from software's point of view (machine/supervisor software/timer/
@@ -107,6 +116,51 @@ typedef struct {
     uint32_t interrupt_status; /* pending interrupt bits (bit 0 = used ring advanced) */
 } Virtio;
 
+/* One split virtqueue, as the driver programs it through the mmio register file.
+ * Shared by the multi-queue virtio-net device (M23); the block device above keeps
+ * its single queue inline for historical reasons. */
+typedef struct {
+    uint32_t num;         /* negotiated ring size (entries) */
+    uint32_t ready;       /* queue live */
+    uint64_t desc_addr;   /* guest-physical descriptor table */
+    uint64_t avail_addr;  /* guest-physical available (driver) ring */
+    uint64_t used_addr;   /* guest-physical used (device) ring */
+    uint16_t last_avail;  /* next available index the device will consume */
+} Virtqueue;
+
+/* A virtio-mmio network device (modern / version 2), on the second virtio slot
+ * (M23). Two virtqueues: queue 0 receives (the device writes incoming frames into
+ * driver-posted buffers), queue 1 transmits (the driver posts frames the device
+ * sends). A small receive FIFO buffers frames until the guest posts buffers to
+ * queue 0 — filled either by loopback (a transmitted frame, when no backend is
+ * attached) or by a host backend calling plat_net_rx. Only VIRTIO_F_VERSION_1 and
+ * VIRTIO_NET_F_MAC are negotiated, so the virtio-net header is 12 bytes and the
+ * driver reads the MAC from config space. */
+#define VIRTIO_NET_NQUEUES   2u
+#define VIRTIO_NET_RXQ       0u
+#define VIRTIO_NET_TXQ       1u
+#define VIRTIO_NET_FIFO      16u    /* buffered received frames awaiting RX buffers */
+#define VIRTIO_NET_FRAME_MAX 1600u  /* an ethernet frame (1500 MTU + headers + slack) */
+
+typedef struct {
+    uint32_t  status;           /* device status (ACKNOWLEDGE/DRIVER/FEATURES_OK/DRIVER_OK) */
+    uint32_t  features_sel;     /* DEVICE_FEATURES_SEL: which 32-bit half to read back */
+    uint32_t  driver_feat_sel;  /* DRIVER_FEATURES_SEL (accepted, not enforced) */
+    uint32_t  queue_sel;        /* which virtqueue subsequent num/ready/addr writes target */
+    uint32_t  interrupt_status; /* pending interrupt bits (bit 0 = a used ring advanced) */
+    Virtqueue vq[VIRTIO_NET_NQUEUES];
+    uint8_t   mac[6];           /* config-space MAC (VIRTIO_NET_F_MAC) */
+    /* Receive FIFO (a ring of whole ethernet frames, virtio-net header excluded). */
+    uint8_t   fifo[VIRTIO_NET_FIFO][VIRTIO_NET_FRAME_MAX];
+    uint32_t  fifo_len[VIRTIO_NET_FIFO];
+    uint32_t  fifo_head;        /* oldest buffered frame */
+    uint32_t  fifo_count;       /* number of buffered frames */
+    /* Host backend for transmitted frames (a TAP or usermode-NAT backend, later).
+     * NULL means loopback: a transmitted frame is fed straight back to receive. */
+    void    (*tx)(void *ctx, const uint8_t *frame, uint32_t len);
+    void     *tx_ctx;
+} VirtioNet;
+
 /* A raw block-device backing image (attached via --disk). Held here so a future
  * virtio-mmio block device can DMA against it; loaded into RAM so reads and
  * writes hit the buffer (writes do not persist to the file). data == NULL when
@@ -119,11 +173,12 @@ typedef struct {
 struct CPU; /* the harts, for cross-hart IPIs and LR/SC reservations (M19) */
 
 typedef struct Platform {
-    Clint   clint;
-    Uart    uart;
-    Plic    plic;
-    Virtio  virtio;
-    Disk    disk;
+    Clint     clint;
+    Uart      uart;
+    Plic      plic;
+    Virtio    virtio;
+    VirtioNet net;
+    Disk      disk;
     /* The harts sharing this platform (M19): the engine points these at its hart
      * array so the CLINT/atomics reach every hart. A store on any hart breaks the
      * others' reservations here, and hart 0 is the boot hart. nharts is 1 on a
@@ -178,6 +233,20 @@ void plat_tick(Platform *p);
  * the one-byte receive buffer is still full (the caller should hold the byte and
  * retry). This is the host-input side of the console — the CLI feeds stdin here. */
 int plat_uart_rx(Platform *p, uint8_t byte);
+
+/* Deliver a received ethernet frame to the virtio-net device (M23): buffer it and
+ * write it into the guest's next posted receive buffer, raising the device's PLIC
+ * interrupt. Returns 1 if buffered, or 0 if the frame is empty/oversized or the
+ * receive FIFO is full (the caller may hold the frame and retry). A host network
+ * backend calls this for each frame arriving from the outside. */
+int plat_net_rx(Platform *p, const uint8_t *frame, uint32_t len);
+
+/* Attach a host backend for frames the guest transmits: `tx(ctx, frame, len)` is
+ * called once per outgoing ethernet frame. Passing tx = NULL restores the default
+ * internal loopback (transmitted frames are fed back to the receive queue). */
+void plat_net_set_backend(Platform *p,
+                          void (*tx)(void *ctx, const uint8_t *frame, uint32_t len),
+                          void *ctx);
 
 /* The interrupt-pending bits the platform drives for hart `hart` (its MTIP/MSIP
  * from the CLINT, and MEIP/SEIP from its two PLIC contexts), to be merged into

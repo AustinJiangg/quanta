@@ -21,6 +21,10 @@ void plat_init(Platform *p) {
     for (uint32_t h = 0; h < QUANTA_MAX_HARTS; h++)
         p->clint.mtimecmp[h] = (uint64_t)-1; /* parked: no timer until armed */
     p->nharts = 1;
+    /* virtio-net's config-space MAC: a locally-administered address (matches the
+     * qemu default family), reported to the driver via VIRTIO_NET_F_MAC. */
+    static const uint8_t default_mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
+    memcpy(p->net.mac, default_mac, sizeof default_mac);
 }
 
 void plat_set_harts(Platform *p, struct CPU *harts, int n) {
@@ -29,11 +33,12 @@ void plat_set_harts(Platform *p, struct CPU *harts, int n) {
 }
 
 int plat_contains(uint64_t addr) {
-    return in_window(addr, TEST_BASE,   TEST_SIZE)   ||
-           in_window(addr, CLINT_BASE,  CLINT_SIZE)  ||
-           in_window(addr, PLIC_BASE,   PLIC_SIZE)   ||
-           in_window(addr, UART_BASE,   UART_SIZE)   ||
-           in_window(addr, VIRTIO_BASE, VIRTIO_SIZE);
+    return in_window(addr, TEST_BASE,       TEST_SIZE)   ||
+           in_window(addr, CLINT_BASE,      CLINT_SIZE)  ||
+           in_window(addr, PLIC_BASE,       PLIC_SIZE)   ||
+           in_window(addr, UART_BASE,       UART_SIZE)   ||
+           in_window(addr, VIRTIO_BASE,     VIRTIO_SIZE) ||
+           in_window(addr, VIRTIO_NET_BASE, VIRTIO_NET_SIZE);
 }
 
 /* SiFive test finisher — qemu virt's poweroff/reboot device. A 32-bit write
@@ -233,6 +238,29 @@ static void st32(uint8_t *b, uint32_t v) {
     b[2] = (uint8_t)(v >> 16); b[3] = (uint8_t)(v >> 24);
 }
 
+/* Collect a descriptor chain rooted at `head` into addr[]/len[] (and, when
+ * `write` is non-NULL, whether each descriptor is device-writable), bounded by
+ * the ring size and V_QUEUE_MAX so a cyclic `next` cannot spin. Returns the
+ * number of descriptors gathered. Shared by the block and net devices. */
+static uint32_t vq_chain(Platform *p, uint64_t desc_base, uint32_t qn, uint16_t head,
+                         uint64_t *addr, uint32_t *len, uint8_t *write) {
+    uint32_t n = 0;
+    uint16_t idx = head;
+    for (;;) {
+        if (n >= qn || n >= V_QUEUE_MAX) break;
+        uint8_t *d = dma_ptr(p, desc_base + (uint64_t)idx * 16, 16);
+        if (!d) break;
+        addr[n] = ld64(d);
+        len[n]  = ld32(d + 8);
+        uint16_t flags = ld16(d + 12);
+        if (write) write[n] = (flags & VRING_DESC_F_WRITE) ? 1u : 0u;
+        n++;
+        if (!(flags & VRING_DESC_F_NEXT)) break;
+        idx = ld16(d + 14);
+    }
+    return n;
+}
+
 /* Service one request chain rooted at descriptor `head`: descriptor 0 is the
  * block request header (type + starting sector), the last descriptor is a 1-byte
  * status the device writes, and the descriptors between are the data payload.
@@ -246,20 +274,7 @@ static uint32_t virtio_service(Platform *p, uint16_t head) {
     /* Collect the chain, bounded by the ring size so a cyclic `next` can't spin. */
     uint64_t addr[V_QUEUE_MAX];
     uint32_t len[V_QUEUE_MAX];
-    uint32_t n = 0;
-    uint16_t idx = head;
-    for (;;) {
-        if (n >= qn) break;
-        uint8_t *d = dma_ptr(p, v->desc_addr + (uint64_t)idx * 16, 16);
-        if (!d) break;
-        addr[n] = ld64(d);
-        len[n]  = ld32(d + 8);
-        uint16_t flags = ld16(d + 12);
-        uint16_t next  = ld16(d + 14);
-        n++;
-        if (!(flags & VRING_DESC_F_NEXT)) break;
-        idx = next;
-    }
+    uint32_t n = vq_chain(p, v->desc_addr, qn, head, addr, len, NULL);
     if (n < 2) return 0;   /* need at least a header and a status byte */
 
     /* Descriptor 0: the request header. */
@@ -374,6 +389,232 @@ static void virtio_write(Platform *p, uint32_t off, uint32_t val) {
 }
 
 /* ------------------------------------------------------------------------
+ * virtio-mmio network device (modern / version 2).
+ *
+ * The second virtio slot (M23). Two split virtqueues: queue 0 receives, queue 1
+ * transmits. On a transmit notify we gather the chain, strip the 12-byte
+ * virtio-net header, and hand the ethernet frame to the host backend (or loop it
+ * back to receive when none is attached). Incoming frames (loopback or backend)
+ * are buffered in a small FIFO and written into the driver's posted receive
+ * buffers as they become available. Register layout and the virtqueue mechanics
+ * are shared with the block device above (the V_* offsets, vq_chain, dma_ptr).
+ * ------------------------------------------------------------------------ */
+
+#define VIRTIO_NET_ID        1u
+#define VIRTIO_NET_HDR_LEN   12u   /* virtio_net_hdr_v1 (VERSION_1) is 12 bytes */
+#define VIRTIO_NET_F_MAC_BIT  5u   /* device-features bit: config-space MAC is valid */
+
+/* Buffer a received ethernet frame in the FIFO (the virtio-net header is added on
+ * delivery, so it is excluded here). Returns 0 if empty, oversized, or the FIFO
+ * is full — the frame is then dropped, as a real NIC drops on overrun. */
+static int net_fifo_push(VirtioNet *n, const uint8_t *frame, uint32_t len) {
+    if (len == 0 || len > VIRTIO_NET_FRAME_MAX) return 0;
+    if (n->fifo_count >= VIRTIO_NET_FIFO)       return 0;
+    uint32_t tail = (n->fifo_head + n->fifo_count) % VIRTIO_NET_FIFO;
+    memcpy(n->fifo[tail], frame, len);
+    n->fifo_len[tail] = len;
+    n->fifo_count++;
+    return 1;
+}
+
+/* Concatenate the readable bytes of a descriptor chain into out[0..cap). */
+static uint32_t net_gather(Platform *p, const uint64_t *addr, const uint32_t *len,
+                           uint32_t cnt, uint8_t *out, uint32_t cap) {
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < cnt && total < cap; i++) {
+        uint8_t *b = dma_ptr(p, addr[i], len[i]);
+        if (!b) continue;
+        for (uint32_t k = 0; k < len[i] && total < cap; k++) out[total++] = b[k];
+    }
+    return total;
+}
+
+/* Write [hdr | frame] sequentially across a chain's writable buffers, stopping
+ * when the source is exhausted or the buffers fill. Returns the bytes written. */
+static uint32_t net_scatter(Platform *p, const uint64_t *addr, const uint32_t *len,
+                            uint32_t cnt, const uint8_t *hdr, uint32_t hdrlen,
+                            const uint8_t *frame, uint32_t frlen) {
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint8_t *b = dma_ptr(p, addr[i], len[i]);
+        if (!b) continue;
+        for (uint32_t k = 0; k < len[i]; k++) {
+            if (total < hdrlen)              b[k] = hdr[total];
+            else if (total - hdrlen < frlen) b[k] = frame[total - hdrlen];
+            else                             return total;
+            total++;
+        }
+    }
+    return total;
+}
+
+/* Drain buffered receive frames into the driver's posted receive buffers (queue
+ * 0): gather each head chain, write the 12-byte virtio-net header then the frame,
+ * and post the completion to the used ring. Stops when the FIFO empties or no
+ * buffer is posted; raises the interrupt if anything was delivered. */
+static void net_deliver_rx(Platform *p) {
+    VirtioNet *n = &p->net;
+    Virtqueue *q = &n->vq[VIRTIO_NET_RXQ];
+    if (!q->ready || q->num == 0 || q->num > V_QUEUE_MAX) return;
+    uint8_t *avail = dma_ptr(p, q->avail_addr, 4 + (uint64_t)q->num * 2);
+    uint8_t *used  = dma_ptr(p, q->used_addr,  4 + (uint64_t)q->num * 8);
+    if (!avail || !used) return;
+
+    int delivered = 0;
+    while (n->fifo_count > 0) {
+        uint16_t avail_idx = ld16(avail + 2);
+        if (q->last_avail == avail_idx) break;          /* no receive buffer posted */
+
+        uint16_t slot = (uint16_t)(q->last_avail % q->num);
+        uint16_t head = ld16(avail + 4 + (size_t)slot * 2);
+        uint64_t addr[V_QUEUE_MAX];
+        uint32_t len[V_QUEUE_MAX];
+        uint32_t cnt = vq_chain(p, q->desc_addr, q->num, head, addr, len, NULL);
+
+        uint8_t hdr[VIRTIO_NET_HDR_LEN];
+        memset(hdr, 0, sizeof hdr);
+        st16(hdr + 10, 1);                              /* num_buffers = 1 (v1 header) */
+
+        uint32_t fi   = n->fifo_head;
+        uint32_t wlen = net_scatter(p, addr, len, cnt, hdr, VIRTIO_NET_HDR_LEN,
+                                    n->fifo[fi], n->fifo_len[fi]);
+
+        uint16_t uidx = ld16(used + 2);
+        uint8_t *elem = used + 4 + (size_t)(uidx % q->num) * 8;
+        st32(elem, head);
+        st32(elem + 4, wlen);
+        st16(used + 2, (uint16_t)(uidx + 1));
+
+        q->last_avail++;
+        n->fifo_head = (fi + 1) % VIRTIO_NET_FIFO;
+        n->fifo_count--;
+        delivered = 1;
+    }
+    if (delivered) n->interrupt_status |= 0x1u;
+}
+
+/* Send one frame the guest transmitted: to the host backend, or loop it back to
+ * the receive path when no backend is attached. */
+static void net_transmit(Platform *p, const uint8_t *frame, uint32_t len) {
+    VirtioNet *n = &p->net;
+    if (n->tx) { n->tx(n->tx_ctx, frame, len); return; }
+    if (net_fifo_push(n, frame, len)) net_deliver_rx(p);
+}
+
+/* Consume every frame the driver made available on the transmit queue (queue 1). */
+static void net_process_tx(Platform *p) {
+    VirtioNet *n = &p->net;
+    Virtqueue *q = &n->vq[VIRTIO_NET_TXQ];
+    if (!q->ready || q->num == 0 || q->num > V_QUEUE_MAX) return;
+    uint8_t *avail = dma_ptr(p, q->avail_addr, 4 + (uint64_t)q->num * 2);
+    uint8_t *used  = dma_ptr(p, q->used_addr,  4 + (uint64_t)q->num * 8);
+    if (!avail || !used) return;
+
+    int sent = 0;
+    uint16_t avail_idx = ld16(avail + 2);
+    while (q->last_avail != avail_idx) {
+        uint16_t slot = (uint16_t)(q->last_avail % q->num);
+        uint16_t head = ld16(avail + 4 + (size_t)slot * 2);
+        uint64_t addr[V_QUEUE_MAX];
+        uint32_t len[V_QUEUE_MAX];
+        uint32_t cnt = vq_chain(p, q->desc_addr, q->num, head, addr, len, NULL);
+
+        uint8_t  buf[VIRTIO_NET_HDR_LEN + VIRTIO_NET_FRAME_MAX];
+        uint32_t total = net_gather(p, addr, len, cnt, buf, sizeof buf);
+        if (total > VIRTIO_NET_HDR_LEN)
+            net_transmit(p, buf + VIRTIO_NET_HDR_LEN, total - VIRTIO_NET_HDR_LEN);
+
+        uint16_t uidx = ld16(used + 2);
+        uint8_t *elem = used + 4 + (size_t)(uidx % q->num) * 8;
+        st32(elem, head);
+        st32(elem + 4, 0);                              /* nothing written to a TX buffer */
+        st16(used + 2, (uint16_t)(uidx + 1));
+
+        q->last_avail++;
+        sent = 1;
+    }
+    if (sent) n->interrupt_status |= 0x1u;
+}
+
+/* A status write of 0 soft-resets the device; clear the programmable state but
+ * keep host state (the MAC, the backend, the FIFO storage). */
+static void net_reset(VirtioNet *n) {
+    n->status = 0;
+    n->features_sel = 0;
+    n->driver_feat_sel = 0;
+    n->queue_sel = 0;
+    n->interrupt_status = 0;
+    memset(n->vq, 0, sizeof n->vq);
+    n->fifo_head = n->fifo_count = 0;
+}
+
+static uint32_t virtio_net_read(Platform *p, uint32_t off) {
+    VirtioNet *n = &p->net;
+    Virtqueue *q = (n->queue_sel < VIRTIO_NET_NQUEUES) ? &n->vq[n->queue_sel] : NULL;
+    switch (off) {
+        case V_MAGIC:         return V_MAGIC_VALUE;
+        case V_VERSION:       return 2u;
+        case V_DEVICE_ID:     return VIRTIO_NET_ID;
+        case V_VENDOR_ID:     return V_VENDOR_QEMU;
+        /* Low half: VIRTIO_NET_F_MAC (bit 5). High half (sel 1): VIRTIO_F_VERSION_1
+         * (feature bit 32 -> bit 0 of the upper word). */
+        case V_DEVICE_FEAT:   return (n->features_sel == 1)
+                                   ? 1u : (1u << VIRTIO_NET_F_MAC_BIT);
+        case V_QUEUE_NUM_MAX: return V_QUEUE_MAX;
+        case V_QUEUE_READY:   return q ? q->ready : 0u;
+        case V_INT_STATUS:    return n->interrupt_status;
+        case V_STATUS:        return n->status;
+        case V_CONFIG_GEN:    return 0u;
+        /* Config space: the 6-byte MAC (VIRTIO_NET_F_MAC), low bytes first. */
+        case V_CONFIG:        return (uint32_t)n->mac[0] | (uint32_t)n->mac[1] << 8
+                                   | (uint32_t)n->mac[2] << 16 | (uint32_t)n->mac[3] << 24;
+        case V_CONFIG + 4:    return (uint32_t)n->mac[4] | (uint32_t)n->mac[5] << 8;
+        default:              return 0u;
+    }
+}
+
+static void virtio_net_write(Platform *p, uint32_t off, uint32_t val) {
+    VirtioNet *n = &p->net;
+    Virtqueue *q = (n->queue_sel < VIRTIO_NET_NQUEUES) ? &n->vq[n->queue_sel] : NULL;
+    switch (off) {
+        case V_DEVICE_FEAT_SEL: n->features_sel = val; return;
+        case V_DRIVER_FEAT_SEL: n->driver_feat_sel = val; return;
+        case V_QUEUE_SEL:       n->queue_sel = val; return;
+        case V_QUEUE_NUM:       if (q) q->num = val; return;
+        case V_QUEUE_READY:     if (q) q->ready = val & 1u; return;
+        case V_QUEUE_NOTIFY:
+            if (val == VIRTIO_NET_TXQ)      net_process_tx(p);
+            else if (val == VIRTIO_NET_RXQ) net_deliver_rx(p);
+            return;
+        case V_INT_ACK: n->interrupt_status &= ~val; return;
+        case V_STATUS:
+            n->status = val;
+            if (val == 0) net_reset(n);
+            return;
+        case V_DESC_LOW:   if (q) q->desc_addr  = (q->desc_addr  & 0xffffffff00000000ull) | val; return;
+        case V_DESC_HIGH:  if (q) q->desc_addr  = (q->desc_addr  & 0x00000000ffffffffull) | ((uint64_t)val << 32); return;
+        case V_AVAIL_LOW:  if (q) q->avail_addr = (q->avail_addr & 0xffffffff00000000ull) | val; return;
+        case V_AVAIL_HIGH: if (q) q->avail_addr = (q->avail_addr & 0x00000000ffffffffull) | ((uint64_t)val << 32); return;
+        case V_USED_LOW:   if (q) q->used_addr  = (q->used_addr  & 0xffffffff00000000ull) | val; return;
+        case V_USED_HIGH:  if (q) q->used_addr  = (q->used_addr  & 0x00000000ffffffffull) | ((uint64_t)val << 32); return;
+        default: return;   /* DRIVER_FEAT: accepted, ignored (features not enforced) */
+    }
+}
+
+int plat_net_rx(Platform *p, const uint8_t *frame, uint32_t len) {
+    if (!net_fifo_push(&p->net, frame, len)) return 0;
+    net_deliver_rx(p);
+    return 1;
+}
+
+void plat_net_set_backend(Platform *p,
+                          void (*tx)(void *ctx, const uint8_t *frame, uint32_t len),
+                          void *ctx) {
+    p->net.tx     = tx;
+    p->net.tx_ctx = ctx;
+}
+
+/* ------------------------------------------------------------------------
  * PLIC.
  * ------------------------------------------------------------------------ */
 
@@ -383,6 +624,7 @@ static uint32_t plic_lines(const Platform *p) {
     uint32_t lines = 0;
     if (uart_asserted(&p->uart))    lines |= (1u << UART_IRQ);
     if (p->virtio.interrupt_status) lines |= (1u << VIRTIO_IRQ);
+    if (p->net.interrupt_status)    lines |= (1u << VIRTIO_NET_IRQ);
     return lines;
 }
 
@@ -502,6 +744,8 @@ uint32_t plat_read(Platform *p, uint64_t addr, uint32_t size) {
         word = plic_read(p, (addr - PLIC_BASE) & ~3u);
     else if (in_window(addr, VIRTIO_BASE, VIRTIO_SIZE))
         word = virtio_read(p, (uint32_t)(addr - VIRTIO_BASE) & ~3u);
+    else if (in_window(addr, VIRTIO_NET_BASE, VIRTIO_NET_SIZE))
+        word = virtio_net_read(p, (uint32_t)(addr - VIRTIO_NET_BASE) & ~3u);
     else
         return 0;
 
@@ -523,6 +767,8 @@ void plat_write(Platform *p, uint64_t addr, uint32_t size, uint32_t value) {
         plic_write(p, (addr - PLIC_BASE) & ~3u, value);
     else if (in_window(addr, VIRTIO_BASE, VIRTIO_SIZE))
         virtio_write(p, (uint32_t)(addr - VIRTIO_BASE) & ~3u, value);
+    else if (in_window(addr, VIRTIO_NET_BASE, VIRTIO_NET_SIZE))
+        virtio_net_write(p, (uint32_t)(addr - VIRTIO_NET_BASE) & ~3u, value);
 }
 
 uint32_t plat_mip_bits(Platform *p, uint32_t hart) {

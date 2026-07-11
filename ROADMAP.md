@@ -1300,6 +1300,25 @@ A network is the biggest missing capability. The device is a second virtio-mmio
 model; the hard part is the host backend, done in stages so a testable version
 lands first.
 
+**The virtio-net device has landed (first of three commits).** `device.c` gains a
+modern (v2) virtio-net model on the second virtio slot (`VIRTIO_NET_BASE`
+0x10002000, PLIC source 2): two split virtqueues (0 = receive, 1 = transmit), a
+config-space MAC (`VIRTIO_NET_F_MAC`), and a small receive FIFO. It negotiates
+only `VIRTIO_F_VERSION_1` + `VIRTIO_NET_F_MAC`, so the virtio-net header is 12
+bytes. On a transmit notify `net_process_tx` gathers the chain, strips the header,
+and hands the frame to a host backend (`plat_net_set_backend`); `net_deliver_rx`
+writes buffered frames into the driver's posted receive buffers. The virtqueue
+mechanics are shared with the block device (the `V_*` offsets, an extracted
+`vq_chain` walker, `dma_ptr`). With **no backend attached the device loops
+transmitted frames straight back to receive**, which needs no host networking and
+is what the deterministic test drives: `tests/rv64/test_rv64_virtio_net.S` (23
+checks — identity, feature handshake, MAC read, both queues, and a
+transmit→loopback→receive round trip with the interrupt) runs under `make
+check-virtnet`, quanta-only like the block test. Still to come: the Linux-facing
+**TAP backend** (`feat: add a tap backend`) and the from-scratch **usermode
+NAT/SLIRP stack** (`feat: add a usermode nat network stack`), plus a `virtio,mmio`
+DTB node so a guest Linux discovers the device.
+
 - [ ] **Build:** a virtio-net device (modern, RX/TX virtqueues) in `device.c`, and
   a host backend in tiers: first a Linux **TAP** backend behind a flag, then a
   from-scratch **usermode NAT/SLIRP** stack (ARP/IP/ICMP/UDP/TCP + DHCP + a DNS

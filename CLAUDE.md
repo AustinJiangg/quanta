@@ -94,6 +94,7 @@ make check-devices # check the MMIO devices and interrupt delivery (needs cross-
 make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-toolchain)
 make check-uart-rx # check UART receive (piped stdin) and the --disk backend (M18)
 make check-virtio  # check the virtio-mmio block device on a --disk image (M18)
+make check-virtnet # check the virtio-mmio network device via loopback (M23)
 make check-smp     # check SMP: 4 harts, contended LR/SC, a CLINT IPI (M19)
 make check-hsm     # check SBI HSM: park/restart secondary harts (M22)
 make check-snapshot # check machine snapshot/restore replays a run bit-for-bit (E10)
@@ -198,6 +199,17 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   block-device image (`--disk`, owned by the engine) the virtio device serves —
   and, unlike the other (register-only) devices, a pointer to guest RAM
   (`plat_attach_ram`) so the virtio block device can DMA (it is a bus master).
+  M23 adds a **virtio-mmio network device** (`VirtioNet`, `virtio_net_*`, second
+  virtio slot `0x10002000`, PLIC source 2): two split virtqueues (0 = receive,
+  1 = transmit), a config-space MAC (`VIRTIO_NET_F_MAC`), and a small receive
+  FIFO. On a transmit `QUEUE_NOTIFY` `net_process_tx` gathers each chain, strips
+  the 12-byte virtio-net header, and hands the frame to a host backend
+  (`plat_net_set_backend`) — or, with none attached, loops it straight back to
+  receive; `net_deliver_rx` writes buffered frames (header + payload) into the
+  driver's posted receive buffers and advances the used ring. `plat_net_rx` is the
+  host-input side a backend calls. It shares the virtqueue mechanics with the block
+  device (the `V_*` register offsets, the extracted `vq_chain` chain walker,
+  `dma_ptr`). The TAP and usermode-NAT backends are the next M23 steps.
 - `src/dtb.{h,c}` — the flattened device-tree (FDT) generator (M14): `dtb_build`
   serialises a standard `.dtb` blob (big-endian header, memory-reservation block,
   structure block, deduplicated strings) from a `DtbConfig` describing the RAM
@@ -1032,6 +1044,33 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   gp-relative `addi rd, gp, off` — but the test framework uses `gp` (x3) as its
   check-id register, not `__global_pointer$`, so a relaxed address would be
   garbage (the same class of gotcha as the fixed-`+4` mepc handlers avoiding C).
+- virtio-mmio network device (M23, the network-path enabler): a second modern
+  (version 2) virtio device in `device.c`, on the **second** virtio slot
+  (`VIRTIO_NET_BASE` 0x10002000, PLIC source 2), the qemu `virt` layout. Unlike the
+  single-queue block device it has **two** virtqueues — queue 0 receive, queue 1
+  transmit — so it honours `QUEUE_SEL` to route the num/ready/desc/avail/used
+  writes and the `QUEUE_NOTIFY` value to the right queue (block ignored both,
+  having one queue). The first commit ships a deterministic **loopback** backend:
+  with no host backend attached (`net.tx == NULL`), a frame the guest transmits is
+  fed straight back into the receive FIFO and delivered into the driver's posted
+  receive buffers — so `test_rv64_virtio_net.S` drives it end to end with no host
+  networking (`make check-virtnet`, quanta-only like the block test, `-mno-relax`
+  for the same `la`/`gp` reason). Design points: it negotiates only
+  `VIRTIO_F_VERSION_1` + `VIRTIO_NET_F_MAC`, so the virtio-net header is **12
+  bytes** (v1, `num_buffers` at offset 10) and the driver reads the MAC
+  (`52:54:00:12:34:56`, set in `plat_init`) from config space; the receive FIFO
+  (`VIRTIO_NET_FIFO` frames of `VIRTIO_NET_FRAME_MAX` bytes) buffers frames until
+  the guest posts buffers, and a soft reset (`net_reset`, status write 0) clears
+  the programmable state but **preserves** the MAC, the backend, and the FIFO
+  storage (host state a guest reset should not drop). It grew `Platform` by the
+  FIFO, so snapshot files' layout signature changed (old files reject cleanly) —
+  `check-snapshot`/`check-replay` stay green because the device is inert until
+  programmed (`interrupt_status` 0 keeps it out of `plic_lines`). The `net.tx`
+  function pointer is NULL on this path, so it round-trips through a snapshot
+  harmlessly; a real backend will need it re-wired on restore (a commit-2 concern).
+  A DTB `virtio,mmio` node is deferred to the Linux-networking step, as the block
+  device's was — the bare-metal test hardcodes the address. TAP and usermode-NAT
+  backends are the next two M23 commits.
 - Booting an OS (M16, `tests/os/`): the teaching kernel is *entered in M-mode*
   (Quanta's loader enters every ELF in M-mode), and its `boot.S` does the
   drop-to-S itself — the same pattern `test_sbi`/`test_stimer` use — rather than

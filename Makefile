@@ -57,7 +57,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-smp check-hsm check-os check-rv64 check-diff check-arch check-snapshot check-replay embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-virtnet check-smp check-hsm check-os check-rv64 check-diff check-arch check-snapshot check-replay embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -168,10 +168,12 @@ $(KOS_ELF): $(KOS_SRC) tests/os/kernel.ld
 # against qemu-riscv64.
 RV64_SRC := $(wildcard tests/rv64/*.S)
 RV64_ELF := $(RV64_SRC:.S=.elf)
-# The virtio test needs a --disk image and the SMP test needs --harts, so they
-# run under their own targets (check-virtio, check-smp) rather than the generic
-# exit-0/differential runner; build them, but keep them out of that list.
-RV64_RUN := $(filter-out tests/rv64/test_rv64_virtio.elf tests/rv64/test_rv64_smp.elf tests/rv64/test_rv64_hsm.elf,$(RV64_ELF))
+# The virtio block/net tests, the SMP test, and the HSM test need their own run
+# setup (a --disk image, --harts, or a dedicated MMIO check), so they run under
+# their own targets (check-virtio, check-virtnet, check-smp, check-hsm) rather
+# than the generic exit-0/differential runner; build them, but keep them out of
+# that list.
+RV64_RUN := $(filter-out tests/rv64/test_rv64_virtio.elf tests/rv64/test_rv64_virtio_net.elf tests/rv64/test_rv64_smp.elf tests/rv64/test_rv64_hsm.elf,$(RV64_ELF))
 RV64FLAGS := -march=rv64imac_zicsr -mabi=lp64 -nostdlib -nostartfiles \
              -Ttext=0x80000000 -Itests
 
@@ -201,6 +203,11 @@ tests/rv64/test_rv64_priv.elf: RV64FLAGS := $(subst rv64imac_zicsr,rv64ima_zicsr
 # — so relaxed addresses would be garbage. Disable relaxation to keep `la`
 # PC-relative (auipc+addi) and gp-independent.
 tests/rv64/test_rv64_virtio.elf: RV64FLAGS += -mno-relax
+
+# The virtio-net test (M23) likewise takes the address of its in-RAM virtqueues
+# and buffers with `la`, so keep relaxation off for the same reason as the block
+# test — the framework uses gp as its check-id register, not __global_pointer$.
+tests/rv64/test_rv64_virtio_net.elf: RV64FLAGS += -mno-relax
 
 # The SMP test takes the address of its in-RAM shared words (counter/barrier/flag)
 # and its IPI handler with `la`, and sets no global pointer — so like the virtio
@@ -310,6 +317,14 @@ check-rv64: $(BIN) $(RV64_ELF)
 check-virtio: $(BIN) tests/rv64/test_rv64_virtio.elf
 	@sh tests/check_virtio.sh
 
+# Exercise the M23 virtio-net device: a bare-metal driver brings the device up,
+# sets up a receive and a transmit virtqueue, and transmits a frame that the
+# internal loopback backend delivers back into receive by DMA, confirming the
+# interrupt fires. Quanta-only (machine-mode + MMIO + virtio); needs no host
+# networking (loopback), so no extra flags.
+check-virtnet: $(BIN) tests/rv64/test_rv64_virtio_net.elf
+	@sh tests/check_virtnet.sh
+
 # Exercise SMP (M19): boot the multi-hart test with --harts=4 and assert a clean
 # exit 0 — every hart saw its own mhartid, the contended LR/SC counter reached
 # NHARTS*ITERS with no lost updates, and a CLINT IPI was delivered hart-to-hart.
@@ -387,7 +402,7 @@ sanitize:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
-		check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio \
+		check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-virtnet \
 		check-smp check-hsm check-os check-rv64 check-diff check-snapshot check-replay
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
@@ -419,7 +434,7 @@ COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
 
 coverage:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-smp check-os check-snapshot check-replay
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-virtnet check-smp check-os check-snapshot check-replay
 	@sh tests/coverage.sh
 
 # Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),
