@@ -172,6 +172,12 @@ void quanta_net_set_backend(Quanta *q,
  * --netdev=user). Inert for the raw-image/demo boot path, which builds no tree. */
 void quanta_set_netdev_advertised(Quanta *q, int on);
 
+/* Emit the virtio-mmio block device node in the boot device tree (so a
+ * distribution kernel discovers its root disk). Call before loading, since the
+ * tree is built during load but the disk is attached after; off by default. The
+ * CLI sets it when --disk/--disk-ro is given. Inert for the raw-image/demo path. */
+void quanta_set_disk_advertised(Quanta *q, int on);
+
 /* --- optional cache model --- */
 
 /* Attach a set-associative LRU cache over data accesses (geometry as the

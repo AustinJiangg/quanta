@@ -44,6 +44,7 @@ struct Quanta {
     int      cache_on;  /* a cache has been attached */
     int      loaded;    /* memory is initialised and PC/sp are set */
     int      netdev_advertised; /* emit the virtio-net node in the boot DTB (M23) */
+    int      disk_advertised;   /* emit the virtio-blk node in the boot DTB (M24) */
 };
 
 /* Map the internal halt reason to the public enum. */
@@ -168,6 +169,16 @@ static void dtb_config(const Quanta *q, DtbConfig *cfg, const char *bootargs) {
         cfg->virtio_net_irq  = VIRTIO_NET_IRQ;
     } else {
         cfg->virtio_net_base = 0; cfg->virtio_net_size = 0; cfg->virtio_net_irq = 0;
+    }
+    /* Advertise the virtio-mmio block device only when a --disk image is attached
+     * (the flag is set before load, since the DTB is built during load but the disk
+     * is attached after), so a distribution kernel finds its root disk in the tree
+     * (M24) and a non-disk boot's tree is byte-identical. */
+    if (q->disk_advertised) {
+        cfg->virtio_blk_base = VIRTIO_BASE; cfg->virtio_blk_size = VIRTIO_SIZE;
+        cfg->virtio_blk_irq  = VIRTIO_IRQ;
+    } else {
+        cfg->virtio_blk_base = 0; cfg->virtio_blk_size = 0; cfg->virtio_blk_irq = 0;
     }
     /* RV64 now walks Sv39 (M18); RV32 uses Sv32. */
     cfg->isa      = rv64 ? "rv64imac_zicsr" : "rv32ima_zicsr_zifencei";
@@ -488,6 +499,10 @@ void quanta_net_set_backend(Quanta *q,
 
 void quanta_set_netdev_advertised(Quanta *q, int on) {
     if (q) q->netdev_advertised = on ? 1 : 0;
+}
+
+void quanta_set_disk_advertised(Quanta *q, int on) {
+    if (q) q->disk_advertised = on ? 1 : 0;
 }
 
 /*

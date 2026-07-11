@@ -766,6 +766,9 @@ int main(int argc, char **argv) {
      * without --netdev the node is omitted and existing boots are unperturbed.
      * Set before loading, since the DTB is built during the boot handoff. */
     quanta_set_netdev_advertised(q, netdev != NULL);
+    /* Likewise advertise the virtio-blk device only when a --disk image is given,
+     * so a distribution kernel finds its root disk (M24); set before loading. */
+    quanta_set_disk_advertised(q, diskpath != NULL);
 
     /* --bios selects the firmware boot path: an M-mode firmware (OpenSBI) that
      * hands off to an S-mode OS image (--kernel), the way a real machine boots. */

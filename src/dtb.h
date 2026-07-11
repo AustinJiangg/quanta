@@ -55,6 +55,9 @@ typedef struct {
     uint32_t virtio_net_base; /* virtio-mmio net device window (0 = not advertised) */
     uint32_t virtio_net_size;
     uint32_t virtio_net_irq;  /* its PLIC source number                            */
+    uint32_t virtio_blk_base; /* virtio-mmio block device window (0 = not advertised) */
+    uint32_t virtio_blk_size;
+    uint32_t virtio_blk_irq;  /* its PLIC source number                            */
 } DtbConfig;
 
 /* A comfortable upper bound on the blob this builder emits; a uniprocessor tree

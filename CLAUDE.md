@@ -1055,7 +1055,9 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
 - virtio-mmio block device (M18, the xv6 root-fs enabler): a modern (version 2)
   block device in `device.c` with one split virtqueue, on the qemu `virt` first
   slot (`VIRTIO_BASE` 0x10001000, PLIC source 1) — the addresses xv6 hardcodes, so
-  no DTB node is needed for it (a `virtio` DTB node is deferred to the Linux work).
+  it needs no DTB node (a distribution kernel that *does* discover it from the tree
+  gets a `virtio@10001000` node under `--disk`, added in M24 — see the writable-disk
+  gotcha).
   It is the project's first **bus-master** device: unlike the register-only
   CLINT/PLIC/UART, it DMAs against guest RAM, so `Platform` carries a RAM pointer
   set by `plat_attach_ram` (from `start_at`) and `dma_ptr` does the bounds-checked
@@ -1101,6 +1103,16 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   fseek offset is bounded by `LONG_MAX` (a >2 GiB image would need `fseeko`, out of
   portable C — no chosen guest is that large). Pinned by `check-virtio` (write
   persists through `--disk`; `--disk-ro` leaves the image byte-for-byte untouched).
+  The block device is also **advertised in the boot DTB** as a `virtio@10001000`
+  node (dtb.c, `virtio,mmio`, PLIC source 1) so a distribution kernel discovers its
+  root disk — gated on `quanta_set_disk_advertised` (which the CLI sets from
+  `--disk`/`--disk-ro`), set **before load** since the DTB is built during load but
+  the disk is attached after (the same before-load pattern as the net node's
+  `quanta_set_netdev_advertised`, and for the same reason `plat_init`'s
+  whole-`Platform` memset forbids attaching the disk pre-load). A no-disk boot's
+  tree is byte-identical (xv6, which hardcodes the address, is unperturbed either
+  way). The worst case — 8 harts + block + net nodes — is 3562 B, within
+  `DTB_MAX_SIZE` (4096).
 - virtio-mmio network device (M23, the network-path enabler): a second modern
   (version 2) virtio device in `device.c`, on the **second** virtio slot
   (`VIRTIO_NET_BASE` 0x10002000, PLIC source 2), the qemu `virt` layout. Unlike the

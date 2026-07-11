@@ -268,6 +268,20 @@ size_t dtb_build(uint8_t *buf, size_t cap, const DtbConfig *cfg) {
     prop_u32(&f, "interrupts", cfg->uart_irq);
     end_node(&f);
 
+    /* virtio-mmio block device (M24): advertised only when a --disk image is
+     * attached (base != 0), so a distribution kernel discovers its root disk from
+     * the device tree (xv6 hardcodes the address and ignores this). Its interrupt
+     * is routed to the PLIC like the UART's. */
+    if (cfg->virtio_blk_base) {
+        snprintf(unit, sizeof unit, "virtio@%x", cfg->virtio_blk_base);
+        begin_node(&f, unit);
+        prop_str(&f, "compatible", "virtio,mmio");
+        prop_reg(&f, cfg->virtio_blk_base, cfg->virtio_blk_size);
+        prop_u32(&f, "interrupt-parent", PHANDLE_PLIC);
+        prop_u32(&f, "interrupts", cfg->virtio_blk_irq);
+        end_node(&f);
+    }
+
     /* virtio-mmio network device (M23): advertised only when a --netdev backend
      * is attached (base != 0), so a guest OS binds it exactly when it is usable.
      * Its interrupt is routed to the PLIC like the UART's. */
