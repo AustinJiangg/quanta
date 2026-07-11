@@ -6,9 +6,10 @@
 - **Conventional Commits**, kept short: `<type>: <imperative summary>`,
   lowercase, no trailing period, max 50 chars. Types: feat, fix, docs,
   refactor, chore, test, perf.
-- **One commit per feature.** Land a feature as a single commit — code, tests,
-  and docs together — not separate feat/test/docs/chore commits. Split only when
-  the changes are genuinely independent units of work.
+- **Commit by logical unit.** Keep a change's code, tests, and docs together —
+  don't split by file type (feat/test/docs/chore). Within a feature, split into
+  several commits when it has logically independent parts and separate commits
+  aid review; otherwise land it as one.
 - **Commit then push.** After a local commit lands, push it automatically
   (`git push`, setting `-u origin <branch>` if no upstream exists) — no need to
   wait for the user to ask.
