@@ -268,6 +268,19 @@ size_t dtb_build(uint8_t *buf, size_t cap, const DtbConfig *cfg) {
     prop_u32(&f, "interrupts", cfg->uart_irq);
     end_node(&f);
 
+    /* virtio-mmio network device (M23): advertised only when a --netdev backend
+     * is attached (base != 0), so a guest OS binds it exactly when it is usable.
+     * Its interrupt is routed to the PLIC like the UART's. */
+    if (cfg->virtio_net_base) {
+        snprintf(unit, sizeof unit, "virtio@%x", cfg->virtio_net_base);
+        begin_node(&f, unit);
+        prop_str(&f, "compatible", "virtio,mmio");
+        prop_reg(&f, cfg->virtio_net_base, cfg->virtio_net_size);
+        prop_u32(&f, "interrupt-parent", PHANDLE_PLIC);
+        prop_u32(&f, "interrupts", cfg->virtio_net_irq);
+        end_node(&f);
+    }
+
     /* SiFive test finisher: the firmware's (and OS's) poweroff/reboot device.
      * The compatible is a two-string list — OpenSBI's reset driver binds to
      * either "sifive,test1" or "sifive,test0". */

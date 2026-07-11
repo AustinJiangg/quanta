@@ -160,6 +160,12 @@ void quanta_net_set_backend(Quanta *q,
                             void (*tx)(void *ctx, const uint8_t *frame, uint32_t len),
                             void *ctx);
 
+/* Emit the virtio-net device node in the boot device tree (so a guest OS
+ * discovers and binds it). Call before loading; off by default, since the node
+ * should appear only when a network backend is attached (the CLI sets it for
+ * --netdev=user). Inert for the raw-image/demo boot path, which builds no tree. */
+void quanta_set_netdev_advertised(Quanta *q, int on);
+
 /* --- optional cache model --- */
 
 /* Attach a set-associative LRU cache over data accesses (geometry as the

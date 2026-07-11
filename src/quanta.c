@@ -43,6 +43,7 @@ struct Quanta {
     uint32_t dtb_addr;  /* where the boot device tree was placed (0 if none, M14) */
     int      cache_on;  /* a cache has been attached */
     int      loaded;    /* memory is initialised and PC/sp are set */
+    int      netdev_advertised; /* emit the virtio-net node in the boot DTB (M23) */
 };
 
 /* Map the internal halt reason to the public enum. */
@@ -156,6 +157,14 @@ static void dtb_config(const Quanta *q, DtbConfig *cfg, const char *bootargs) {
     cfg->nharts     = (uint32_t)q->nharts;
     cfg->bootargs   = bootargs;
     cfg->initrd_start = 0;           cfg->initrd_end = 0; /* set by setup_firmware_boot */
+    /* Advertise the virtio-net device only when --netdev attached a backend (M23),
+     * so a guest OS discovers it exactly when it is usable. */
+    if (q->netdev_advertised) {
+        cfg->virtio_net_base = VIRTIO_NET_BASE; cfg->virtio_net_size = VIRTIO_NET_SIZE;
+        cfg->virtio_net_irq  = VIRTIO_NET_IRQ;
+    } else {
+        cfg->virtio_net_base = 0; cfg->virtio_net_size = 0; cfg->virtio_net_irq = 0;
+    }
     /* RV64 now walks Sv39 (M18); RV32 uses Sv32. */
     cfg->isa      = rv64 ? "rv64imac_zicsr" : "rv32ima_zicsr_zifencei";
     cfg->mmu_type = rv64 ? "riscv,sv39"     : "riscv,sv32";
@@ -460,6 +469,10 @@ void quanta_net_set_backend(Quanta *q,
                             void *ctx) {
     if (!q) return;
     plat_net_set_backend(&q->plat, tx, ctx);
+}
+
+void quanta_set_netdev_advertised(Quanta *q, int on) {
+    if (q) q->netdev_advertised = on ? 1 : 0;
 }
 
 /*

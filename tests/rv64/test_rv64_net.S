@@ -70,7 +70,7 @@
     /* ---- queue 0 (receive) ---- */
     sw    zero, VIRTIO_QUEUE_SEL(s0)
     lw    t0, VIRTIO_QUEUE_NUM_MAX(s0)
-    CHECK 4, t0, 8
+    CHECK 4, t0, 256
     li    t0, 8
     sw    t0, VIRTIO_QUEUE_NUM(s0)
     sw    s1, VIRTIO_DESC_LOW(s0)

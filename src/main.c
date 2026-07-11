@@ -16,6 +16,10 @@
 
 #include <unistd.h>
 #include <sys/select.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <termios.h>
 #include <signal.h>
 
@@ -276,20 +280,160 @@ static void console_pump(Quanta *q) {
     if (pending >= 0 && quanta_uart_input(q, (uint8_t)pending)) pending = -1;
 }
 
+/* ---------------------------------------------------------------------------
+ * POSIX socket backend for the usermode NAT stack (--netdev=user).
+ *
+ * The network stack (netstack.c) is host-independent; it reaches the real world
+ * through this NetIo backend, the driver's third OS-specific corner (after the
+ * console input above and gdbstub.c's sockets). A NAT flow is named by the small
+ * integer id the stack allocates; we key our socket table by that same id. All
+ * sockets are non-blocking, polled once per run-loop tick (net_pump) with a
+ * zero-timeout select, and host-side events are handed back to the stack through
+ * its netstack_host_* entry points.
+ * ------------------------------------------------------------------------- */
+typedef struct { int fd; int proto; int connecting; } NetSock;
+typedef struct { NetStack *ns; NetSock socks[NS_NAT_MAX]; } NetPosix;
+
+static int net_io_open(void *ctx, int id, int proto, const uint8_t ip[4],
+                       uint16_t port) {
+    NetPosix *np = ctx;
+    if (id < 0 || id >= NS_NAT_MAX || np->socks[id].fd >= 0) return -1;
+    int fd = socket(AF_INET, proto == NS_PROTO_TCP ? SOCK_STREAM : SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    memcpy(&sa.sin_addr, ip, 4);
+    int r = connect(fd, (struct sockaddr *)&sa, sizeof sa);
+    np->socks[id].proto = proto;
+    np->socks[id].connecting = 0;
+    if (proto == NS_PROTO_TCP) {
+        if (r < 0 && errno != EINPROGRESS) { close(fd); return -1; }
+        np->socks[id].connecting = 1;             /* completion reported via poll */
+    } else if (r < 0) {
+        close(fd);
+        return -1;
+    }
+    np->socks[id].fd = fd;
+    return 0;
+}
+
+static int net_io_send(void *ctx, int id, const uint8_t *data, uint32_t len) {
+    NetPosix *np = ctx;
+    if (id < 0 || id >= NS_NAT_MAX || np->socks[id].fd < 0) return -1;
+    ssize_t n = send(np->socks[id].fd, data, len, 0);
+    if (n >= 0) return (int)n;
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
+    return -1;
+}
+
+static void net_io_shutdown(void *ctx, int id) {
+    NetPosix *np = ctx;
+    if (id >= 0 && id < NS_NAT_MAX && np->socks[id].fd >= 0)
+        shutdown(np->socks[id].fd, SHUT_WR);
+}
+
+static void net_io_close(void *ctx, int id) {
+    NetPosix *np = ctx;
+    if (id >= 0 && id < NS_NAT_MAX && np->socks[id].fd >= 0) {
+        close(np->socks[id].fd);
+        np->socks[id].fd = -1;
+        np->socks[id].connecting = 0;
+    }
+}
+
+/* The first `nameserver` in /etc/resolv.conf is the resolver DNS packets to the
+ * virtual DNS server (10.0.2.3) are relayed to; fall back to a public one. */
+static void resolve_upstream_dns(uint8_t out[4]) {
+    out[0] = 8; out[1] = 8; out[2] = 8; out[3] = 8;
+    FILE *f = fopen("/etc/resolv.conf", "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        unsigned a, b, c, d;
+        if (sscanf(line, " nameserver %u.%u.%u.%u", &a, &b, &c, &d) == 4 &&
+            a < 256 && b < 256 && c < 256 && d < 256) {
+            out[0] = (uint8_t)a; out[1] = (uint8_t)b;
+            out[2] = (uint8_t)c; out[3] = (uint8_t)d;
+            break;
+        }
+    }
+    fclose(f);
+}
+
+/* Poll all open NAT sockets once (zero timeout) and drive the stack: complete
+ * TCP connects, deliver received bytes, and retry buffered writes. A callback
+ * may free a flow (closing its fd), so the fd is re-checked before each use. */
+static void net_pump(NetPosix *np) {
+    if (!np) return;
+    fd_set rfds, wfds;
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    int maxfd = -1;
+    for (int id = 0; id < NS_NAT_MAX; id++) {
+        int fd = np->socks[id].fd;
+        if (fd < 0) continue;
+        int want_r = 0, want_w = 0;
+        if (np->socks[id].connecting) {
+            want_w = 1;                            /* watch for connect completion */
+        } else {
+            if (netstack_rx_room(np->ns, id) > 0) want_r = 1;
+            if (netstack_wants_write(np->ns, id)) want_w = 1;
+        }
+        if (want_r) { FD_SET(fd, &rfds); if (fd > maxfd) maxfd = fd; }
+        if (want_w) { FD_SET(fd, &wfds); if (fd > maxfd) maxfd = fd; }
+    }
+    if (maxfd < 0) return;
+    struct timeval tv = { 0, 0 };
+    if (select(maxfd + 1, &rfds, &wfds, NULL, &tv) <= 0) return;
+
+    for (int id = 0; id < NS_NAT_MAX; id++) {
+        int fd = np->socks[id].fd;
+        if (fd < 0) continue;
+        if (np->socks[id].connecting && FD_ISSET(fd, &wfds)) {
+            int err = 0;
+            socklen_t el = sizeof err;
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+            np->socks[id].connecting = 0;
+            if (err) { netstack_host_reset(np->ns, id); continue; }
+            netstack_host_connected(np->ns, id);
+            if (np->socks[id].fd < 0) continue;    /* freed by the callback */
+        }
+        if (np->socks[id].fd >= 0 && FD_ISSET(fd, &rfds)) {
+            uint32_t room = netstack_rx_room(np->ns, id);
+            if (room > 0) {
+                static uint8_t buf[16384];
+                uint32_t cap = room < sizeof buf ? room : (uint32_t)sizeof buf;
+                ssize_t n = recv(fd, buf, cap, 0);
+                if (n > 0)       netstack_host_recv(np->ns, id, buf, (uint32_t)n);
+                else if (n == 0) netstack_host_closed(np->ns, id);
+                else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                    netstack_host_reset(np->ns, id);
+            }
+        }
+        if (np->socks[id].fd >= 0 && !np->socks[id].connecting &&
+            FD_ISSET(fd, &wfds) && netstack_wants_write(np->ns, id))
+            netstack_host_writable(np->ns, id);
+    }
+}
+
 /* Step until the program halts, or a safety limit is hit so a buggy program can
  * never spin forever. With trace set, narrate each instruction to stderr; with a
  * pipeline, feed it each retired instruction. `max_steps` caps the run as a
  * runaway guard (0 = no cap, for an interactive full-system guest that
  * legitimately runs billions of instructions). Returns the instruction count. */
 static uint64_t run_until_halt(Quanta *q, int trace, Pipeline *pipe,
-                               uint64_t max_steps) {
+                               uint64_t max_steps, NetPosix *net) {
     uint64_t steps = 0;
     while (quanta_halt_reason(q) == QUANTA_RUN && !g_console_quit &&
            (max_steps == 0 || steps < max_steps)) {
-        /* Feed any waiting console input to the UART, occasionally — often enough
-         * to feel responsive, rarely enough that the select() is not a per-
-         * instruction tax. Harmless when no input is waiting. */
-        if ((steps & 0x3ff) == 0) console_pump(q);
+        /* Feed any waiting console input to the UART, and poll the NAT sockets,
+         * occasionally — often enough to feel responsive, rarely enough that the
+         * select()s are not a per-instruction tax. Harmless when nothing waits. */
+        if ((steps & 0x3ff) == 0) { console_pump(q); net_pump(net); }
         uint32_t pc   = quanta_pc(q);
         uint32_t inst = pipe ? quanta_read_u32(q, pc, NULL) : 0;
         if (trace) trace_step(q);
@@ -382,6 +526,9 @@ int main(int argc, char **argv) {
     int nharts = 1;             /* --harts=N: number of harts for SMP (M19) */
     const char *netdev = NULL;  /* --netdev=user: attach the usermode network stack (M23) */
     NetStack *ns = NULL;        /* the usermode network stack, when --netdev=user */
+    NetPosix  netbk;            /* its POSIX socket backend (for outbound NAT)     */
+    NetIo     netio;            /* the NetIo vtable pointing at netbk              */
+    NetPosix *netbp = NULL;     /* passed to the run loop only when --netdev=user  */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
             printf("quanta %s\n", quanta_version());
@@ -521,6 +668,12 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    /* Advertise the virtio-net device in the boot device tree only when a network
+     * backend is attached, so a guest OS discovers it exactly when it is usable;
+     * without --netdev the node is omitted and existing boots are unperturbed.
+     * Set before loading, since the DTB is built during the boot handoff. */
+    quanta_set_netdev_advertised(q, netdev != NULL);
+
     /* --bios selects the firmware boot path: an M-mode firmware (OpenSBI) that
      * hands off to an S-mode OS image (--kernel), the way a real machine boots. */
     if (bios && !kernel) {
@@ -581,7 +734,9 @@ int main(int argc, char **argv) {
     /* Optionally attach the usermode network stack to the virtio-net device: it
      * presents a virtual gateway (10.0.2.0/24) the guest can DHCP against and
      * ping, needing no host privileges. The device's transmit path feeds the
-     * stack, and the stack's replies come back through the receive path. */
+     * stack, and the stack's replies come back through the receive path. Its
+     * POSIX socket backend gives the guest outbound UDP/TCP NAT and a DNS relay
+     * to the real network; the run loop polls those sockets via net_pump. */
     if (netdev) {
         ns = netstack_new(net_deliver_to_guest, q);
         if (!ns) {
@@ -590,6 +745,18 @@ int main(int argc, char **argv) {
             return 1;
         }
         quanta_net_set_backend(q, net_backend_tx, ns);
+
+        for (int s = 0; s < NS_NAT_MAX; s++) netbk.socks[s].fd = -1;
+        netbk.ns       = ns;
+        netio.ctx      = &netbk;
+        netio.open     = net_io_open;
+        netio.send     = net_io_send;
+        netio.shutdown = net_io_shutdown;
+        netio.close    = net_io_close;
+        uint8_t upstream_dns[4];
+        resolve_upstream_dns(upstream_dns);
+        netstack_set_io(ns, &netio, upstream_dns);
+        netbp = &netbk;
     }
 
     /* The loader set PC to the entry point and sp to the top of the region. */
@@ -673,7 +840,7 @@ int main(int argc, char **argv) {
         printf("Console: raw mode — Ctrl-A x to quit, Ctrl-A Ctrl-A for a literal Ctrl-A.\n\n");
 
     /* Any output the program writes via syscalls appears here, mid-run. */
-    uint64_t steps = run_until_halt(q, trace, pipe_on ? &pipe : NULL, max_steps);
+    uint64_t steps = run_until_halt(q, trace, pipe_on ? &pipe : NULL, max_steps, netbp);
 
     console_restore();
     QuantaHalt halt = quanta_halt_reason(q);

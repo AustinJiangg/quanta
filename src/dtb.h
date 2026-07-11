@@ -52,6 +52,9 @@ typedef struct {
     const char *bootargs;     /* /chosen bootargs (kernel command line); "" if none */
     uint32_t initrd_start;    /* /chosen linux,initrd-start/-end (an initramfs the  */
     uint32_t initrd_end;      /* firmware placed in RAM); both 0 = no initrd        */
+    uint32_t virtio_net_base; /* virtio-mmio net device window (0 = not advertised) */
+    uint32_t virtio_net_size;
+    uint32_t virtio_net_irq;  /* its PLIC source number                            */
 } DtbConfig;
 
 /* A comfortable upper bound on the blob this builder emits; a uniprocessor tree

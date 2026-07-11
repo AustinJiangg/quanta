@@ -83,7 +83,7 @@
     /* ---- 3. queue 0 setup ---- */
     sw    zero, VIRTIO_QUEUE_SEL(s0)
     lw    t0, VIRTIO_QUEUE_NUM_MAX(s0)
-    CHECK 6, t0, 8                      /* advertised ring capacity */
+    CHECK 6, t0, 256                    /* advertised ring capacity */
     li    t0, 8
     sw    t0, VIRTIO_QUEUE_NUM(s0)
     sw    s1, VIRTIO_DESC_LOW(s0)       /* descriptor table (guest physical) */

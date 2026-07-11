@@ -95,7 +95,7 @@ make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-t
 make check-uart-rx # check UART receive (piped stdin) and the --disk backend (M18)
 make check-virtio  # check the virtio-mmio block device on a --disk image (M18)
 make check-virtnet # check the virtio-mmio network device via loopback (M23)
-make check-net     # check the usermode network stack (ARP/ICMP/DHCP) (M23)
+make check-net     # check the usermode network stack (ARP/ICMP/DHCP + UDP/TCP/DNS NAT) (M23)
 make check-smp     # check SMP: 4 harts, contended LR/SC, a CLINT IPI (M19)
 make check-hsm     # check SBI HSM: park/restart secondary harts (M22)
 make check-snapshot # check machine snapshot/restore replays a run bit-for-bit (E10)
@@ -131,7 +131,9 @@ manage, and the boot DTB advertises the real size (`tests/os/` needs it). Add
 the virtio-mmio block device serves as an OS's root filesystem (M18). Add
 `--netdev=user` to attach the from-scratch usermode network stack to the
 virtio-net device: it presents a virtual gateway on 10.0.2.0/24 (the qemu-slirp
-layout) the guest can DHCP against and ping, with no host privileges (M23). With the
+layout) the guest can DHCP against and ping, and does outbound UDP/TCP NAT plus a
+DNS relay to the real network through host sockets — no host privileges (M23,
+mainline Linux 6.6 brings up `eth0` and DHCPs an address through it). With the
 `--bios`/`--kernel` firmware-boot path, add `--initrd=FILE` to stage a cpio
 initramfs in RAM as the kernel's root filesystem (advertised via the DTB
 `/chosen` `linux,initrd-start`/`-end`) — how Linux reaches its `/init` (M18). Add
@@ -226,9 +228,16 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   through the callback given at `netstack_new`, holding no reference to the CPU or
   platform (so `tests/net_test.c` drives it standalone). Answers ARP for the
   gateway/DNS IPs, ICMP echo to the gateway, and DHCP (DISCOVER→OFFER,
-  REQUEST→ACK, handing the guest 10.0.2.15). `main.c`'s `--netdev=user` bridges it
-  to the device (device transmit → `netstack_input`, replies → `quanta_net_rx`).
-  Outbound UDP/TCP NAT to host sockets and a DNS relay are the next M23 step.
+  REQUEST→ACK, handing the guest 10.0.2.15). For traffic *beyond* the gateway it
+  does outbound **NAT**: UDP datagrams and a from-scratch minimal **TCP**
+  bridge (the stack terminates the guest's connection and streams bytes to/from a
+  host socket), plus a **DNS relay** (packets to 10.0.2.3 go to the host's real
+  resolver). All host-socket I/O is delegated to an injected `NetIo` backend so
+  the stack stays host-independent and unit-testable — the POSIX implementation
+  lives in `main.c`. `main.c`'s `--netdev=user` bridges it to the device (device
+  transmit → `netstack_input`, replies → `quanta_net_rx`) and polls the NAT
+  sockets each run-loop tick (`net_pump`). A Linux TAP backend is the remaining
+  M23 step (it needs host privileges, so it is a manual milestone).
 - `src/decode.h` — shared instruction decoding: field-extraction and
   immediate-decoding helpers, the opcode map, and ABI register names, all
   `static inline`. The executor and the disassembler decode through this, so
@@ -363,13 +372,14 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   keeps a monotonic step count and a ring of machine snapshots, and answers `bs`/
   `bc` (reverse-step/-continue) by restoring the nearest checkpoint and replaying
   forward (see the reverse-debugging gotcha). Reached via `--gdb` from `main.c`, and embeddable. Its POSIX-sockets
-  feature macro is local to the `.c` — one of the project's two OS-specific
-  corners (the other is `main.c`'s console input).
+  feature macro is local to the `.c` — one of the project's three OS-specific
+  corners (the others are `main.c`'s console input and its NAT sockets, M23).
 - `src/main.c` — the CLI driver, a thin client over `quanta.h`: argument parsing,
   the `--trace` narration, the `--pipeline`/`--cache` overlays, the `--gdb` stub
   hand-off, the `--signature` arch-test dump, `--disk` attachment, the
-  `--netdev=user` network backend (creating the `netstack` and bridging it to the
-  virtio-net device, M23), the
+  `--netdev=user` network backend (creating the `netstack`, bridging it to the
+  virtio-net device, and — the driver's third OS corner — providing the POSIX
+  socket `NetIo` for outbound NAT plus `net_pump` in the run loop, M23), the
   `--snapshot`/`--restore` machine state save/resume (E10), the
   `--bios`/`--kernel` firmware-boot path (loads an M-mode firmware that hands off
   to an S-mode OS via `quanta_load_firmware`), the
@@ -1053,7 +1063,8 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   `vdisk_lock` with interrupts off until it sleeps. We negotiate no features (bar
   advertising `VIRTIO_F_VERSION_1`) and never fail `FEATURES_OK`, so a driver that
   skips the VERSION_1 ack (xv6 does) still comes up. Only queue 0 exists; the ring
-  size is capped at `V_QUEUE_MAX` (8, xv6's `NUM`). Inert until a guest programs it
+  size is capped at `V_QUEUE_MAX` (256; see the virtio ring-size gotcha — it was 8,
+  xv6's `NUM`, until Linux's virtio-net needed a larger ring). Inert until a guest programs it
   (`interrupt_status` 0 keeps it out of `plic_lines`), so every pre-M18 test is
   unaffected. `test_rv64_virtio.S` is built `-mno-relax`: it takes the address of
   its in-RAM queue with `la`, and linker relaxation would rewrite that into a
@@ -1098,19 +1109,68 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   test cannot. Design points: (1) the virtual-gateway services are **synchronous**
   — a reply is produced during the guest's transmit notify (device →
   `net_backend_tx` → `netstack_input` → `net_deliver_to_guest` → `quanta_net_rx` →
-  the receive FIFO), so **no main-loop pump is needed** for this commit (an async
-  host-socket/TAP backend later will need one). (2) All packet parsing is
+  the receive FIFO), so **no main-loop pump is needed** for the gateway services
+  (the NAT backend below adds `net_pump` for its async host sockets). (2) All packet parsing is
   bounds-checked against the frame length (guest-controlled input); the IP header
   length from the header is clamped to what the frame actually carries. (3) The IP
   and ICMP checksums are computed (RFC 1071); the UDP checksum is left 0 (legal on
   IPv4). (4) DHCP replies are broadcast (the client has no address yet), pad the
   BOOTP body to 300 bytes, and echo the request's xid. (5) The `main.c` bridge owns
   the `NetStack` and frees it on every exit path (gdb and normal), since
-  `quanta_destroy` does not (it is external to the engine). Outbound UDP/TCP NAT to
-  real host sockets, a DNS relay, a `virtio,mmio` DTB node (so Linux discovers the
-  device), and a Linux TAP backend are the remaining M23 steps — the host-socket
-  ones need a real guest to validate, so they are manual milestones like the OS
-  boots, not deterministic checks.
+  `quanta_destroy` does not (it is external to the engine). A Linux TAP backend is
+  the remaining M23 step (it needs `/dev/net/tun` + `CAP_NET_ADMIN`, so it can't be
+  tested deterministically here — a manual milestone like the OS boots).
+- Usermode NAT (M23, `src/netstack.c` + `main.c`'s POSIX backend): for traffic
+  past the virtual gateway the stack does outbound NAT to real host sockets, so a
+  guest reaches the outside (a UDP query, a TCP stream, DNS) with no privileges.
+  Design points: **(1)** the stack stays host-independent — it never includes a
+  socket header. All host I/O is delegated to an injected **`NetIo`** vtable
+  (`open`/`send`/`shutdown`/`close`); the POSIX implementation (`net_io_*` +
+  `net_pump`) lives in `main.c`, the driver's **third** OS-specific corner (after
+  the console input and gdbstub's sockets). A NAT flow is named by a small integer
+  id the stack allocates; the backend keys its socket table by the same id — one
+  shared identity space. This keeps `tests/net_test.c` able to drive the whole NAT
+  path against a **mock** `NetIo` — the deterministic net for the protocol logic,
+  since the real sockets need a live guest to exercise. **(2)** The stack
+  *terminates* the guest's TCP itself (a small state machine: SYN→connect,
+  SYN-ACK on connect completion, data both ways with the advertised windows for
+  flow control, FIN/RST for teardown). The crucial simplification: the virtio link
+  guest↔stack is synchronous and **lossless**, so the bridge needs **no
+  retransmission timers** — only correct seq/ack bookkeeping. It buffers per flow
+  (guest→host awaiting host writability, host→guest awaiting the guest's window),
+  advertises its receive window as the free guest→host space (backpressure), and
+  drops sent bytes immediately (no retransmit). **(3)** Host-side events come back
+  through `netstack_host_connected`/`recv`/`closed`/`reset`/`writable`, driven by
+  `net_pump`'s zero-timeout `select` over the open sockets (called each run-loop
+  tick like `console_pump`); `netstack_rx_room`/`wants_write` are the poll-loop
+  queries that build the fd sets and apply backpressure. **(4)** The **DNS relay**
+  is a NAT special case: a flow to the virtual DNS server (10.0.2.3) connects to
+  the host's real resolver (read from `/etc/resolv.conf`, fallback 8.8.8.8) but
+  still presents 10.0.2.3 as the reply's source, so the guest's resolver is happy.
+  **(5)** The `virtio,mmio` **DTB node** (dtb.c, gated on
+  `quanta_set_netdev_advertised`, which `--netdev` sets) is emitted only when a
+  backend is attached, so a guest OS binds the device exactly when it is usable and
+  every non-net boot's tree is byte-identical. Ping to the *outside* is unsupported
+  (raw ICMP needs privilege); ping to the gateway still works. Pinned by the
+  mock-io UDP/TCP/DNS tests in `net_test.c` (`make check-net`); the real POSIX path
+  is a manual milestone validated against a booting guest — **mainline Linux 6.6
+  brings up `eth0` and DHCPs 10.0.2.15 through the NAT** (`ip=dhcp`: `IP-Config:
+  Complete: device=eth0, ipaddr=10.0.2.15`).
+- virtio ring size (M23, the Linux-networking fix): `V_QUEUE_MAX` — the largest
+  virtqueue the devices advertise (`V_QUEUE_NUM_MAX`) and the cap on a driver's
+  `QUEUE_NUM` — was **8** (xv6's `NUM`), which wedges Linux's virtio-net. Linux
+  stops a TX queue whenever fewer than `2 + MAX_SKB_FRAGS` (≈19) descriptors are
+  free and only restarts it after reaping completions drops below that — so with an
+  8-entry ring `num_free` (≤8) is *always* < 19: it stopped the TX queue on the
+  first frame and could never restart it, and the guest hung at "Sending DHCP
+  requests" with a `NETDEV WATCHDOG` TX timeout. Raising `V_QUEUE_MAX` to **256**
+  (qemu's default virtio ring size) fixes it; xv6 still hardcodes `NUM`=8 (≤256, so
+  unaffected), and the value bounds only the on-stack `addr[]`/`len[]` chain arrays
+  and `vq_chain`'s loop, not any struct field (so the snapshot layout is unchanged).
+  The bare-metal virtio tests assert the advertised capacity, so their expected
+  `QUEUE_NUM_MAX` moved 8→256. This was invisible until a real Linux drove the
+  device — xv6 (which set `NUM`=8 itself) and the bare-metal tests never needed a
+  larger ring.
 - Booting an OS (M16, `tests/os/`): the teaching kernel is *entered in M-mode*
   (Quanta's loader enters every ELF in M-mode), and its `boot.S` does the
   drop-to-S itself — the same pattern `test_sbi`/`test_stimer` use — rather than

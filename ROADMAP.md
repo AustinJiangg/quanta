@@ -1330,13 +1330,28 @@ device↔backend↔stack↔CPU path. The `main.c` bridge (`net_backend_tx` /
 `net_deliver_to_guest`) is synchronous — a reply is produced during the guest's
 transmit — so no background pump is needed yet.
 
-Still to come, chosen for testability/ethos over the roadmap's original
-TAP-then-NAT order (TAP needs `/dev/net/tun` + `CAP_NET_ADMIN`, so it can't be
-tested deterministically here): **outbound UDP/TCP NAT to real host sockets** and a
-**DNS relay** (so the guest reaches the outside — `feat: add a usermode nat network
-stack`), a **`virtio,mmio` DTB node** so a guest Linux discovers the device, and
-the **Linux TAP backend** (`feat: add a tap backend`). The host-socket pieces need
-a real guest to validate, so they are manual milestones like the OS boots.
+**The usermode NAT stack has landed (third commit).** `netstack.c` now does
+outbound **NAT** for traffic past the virtual gateway: **UDP** datagrams, a
+from-scratch minimal **TCP** bridge (the stack terminates the guest's connection —
+SYN→connect, SYN-ACK on connect, bidirectional data with the advertised windows
+for flow control, FIN/RST teardown — and streams bytes to/from a host socket; the
+virtio link is lossless, so it needs no retransmission timers), and a **DNS relay**
+(packets to 10.0.2.3 go to the host's real resolver from `/etc/resolv.conf`). The
+stack stays host-independent: all socket I/O is delegated to an injected `NetIo`
+vtable whose POSIX implementation (`net_io_*` + a `net_pump` in the run loop) lives
+in `main.c`, so `tests/net_test.c` drives the whole NAT path against a **mock**
+backend (UDP/TCP/DNS, `make check-net`) — the deterministic net for the protocol
+logic. A `virtio,mmio` **DTB node** (gated on `--netdev`) lets a guest Linux
+discover the device. Validating against a real guest surfaced two bugs: the boot
+DTB now advertises the net device, and the virtio **ring capacity was raised from 8
+to 256** — Linux's virtio-net stops its TX queue when fewer than `2 + MAX_SKB_FRAGS`
+(≈19) descriptors are free, so the 8-entry ring (xv6's size) wedged the TX queue on
+the first frame and never restarted it. With those, **mainline Linux 6.6 brings up
+`eth0` and reaches the network through the NAT.**
+
+Still to come: the **Linux TAP backend** (`feat: add a tap backend`) — it needs
+`/dev/net/tun` + `CAP_NET_ADMIN`, so it can't be tested deterministically here and
+is a manual milestone like the OS boots.
 
 - [ ] **Build:** a virtio-net device (modern, RX/TX virtqueues) in `device.c`, and
   a host backend in tiers: first a Linux **TAP** backend behind a flag, then a

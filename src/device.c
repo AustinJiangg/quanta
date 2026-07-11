@@ -201,7 +201,10 @@ int plat_uart_rx(Platform *p, uint8_t byte) {
 #define V_MAGIC_VALUE  0x74726976u  /* "virt" */
 #define V_VENDOR_QEMU  0x554d4551u  /* "QEMU" */
 #define V_BLK_ID       2u
-#define V_QUEUE_MAX    8u           /* ring entries we support (xv6 uses 8) */
+#define V_QUEUE_MAX    256u         /* ring entries we support (xv6 uses 8; Linux's
+                                     * virtio-net needs >= 2 + MAX_SKB_FRAGS free to
+                                     * keep its TX queue running, so 8 is too small —
+                                     * it would stop the queue and never restart it) */
 
 #define VRING_DESC_F_NEXT  1u       /* buffer continues in `next` */
 #define VRING_DESC_F_WRITE 2u       /* device-writable (vs device-readable) */
