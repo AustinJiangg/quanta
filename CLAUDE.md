@@ -1044,7 +1044,9 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   `check-uart-rx`'s piped stdin relies on, keeping the change inert for every test.
   `--disk=FILE` reads a raw image wholly into
   a malloc'd buffer held in `Platform.disk` (engine-owned, freed in
-  `quanta_destroy`); the virtio-mmio block device below serves it. `tests/uart_echo.S`
+  `quanta_destroy`); the virtio-mmio block device below serves it, now
+  **write-through-persisting** guest writes back to the file (M24 — see the
+  writable-disk gotcha). `tests/uart_echo.S`
   (a plain-rv32i echo guest) is driven by
   `check-uart-rx` with piped stdin — it is deliberately *not* named `test_*` and
   is `filter-out`'d of `TEST_SRC`, because it needs host input to terminate and
@@ -1066,9 +1068,9 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   completion → the PLIC interrupt raised (which the guest ACKs via `INT_ACK`,
   deasserting the line). Synchronous completion means the used index has already
   advanced when the notify store returns; it is safe for xv6, which holds
-  `vdisk_lock` with interrupts off until it sleeps. We negotiate no features (bar
-  advertising `VIRTIO_F_VERSION_1`) and never fail `FEATURES_OK`, so a driver that
-  skips the VERSION_1 ack (xv6 does) still comes up. Only queue 0 exists; the ring
+  `vdisk_lock` with interrupts off until it sleeps. We advertise `VIRTIO_F_VERSION_1`
+  (plus `VIRTIO_BLK_F_FLUSH` on a writable disk, M24) and never fail `FEATURES_OK`,
+  so a driver that skips the VERSION_1 ack (xv6 does) still comes up. Only queue 0 exists; the ring
   size is capped at `V_QUEUE_MAX` (256; see the virtio ring-size gotcha — it was 8,
   xv6's `NUM`, until Linux's virtio-net needed a larger ring). Inert until a guest programs it
   (`interrupt_status` 0 keeps it out of `plic_lines`), so every pre-M18 test is
@@ -1077,6 +1079,28 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   gp-relative `addi rd, gp, off` — but the test framework uses `gp` (x3) as its
   check-id register, not `__global_pointer$`, so a relaxed address would be
   garbage (the same class of gotcha as the fixed-`+4` mepc handlers avoiding C).
+- Writable disk (M24, the distribution-boot enabler): `--disk=FILE` is now
+  **writable by default** — the block device **write-throughs** each `T_OUT` span
+  to the backing file (`Disk.file`, kept open `"r+b"`) and `fflush`es it on a
+  virtio `T_FLUSH`, so guest writes persist across the run (and across a guest
+  reboot). It advertises `VIRTIO_BLK_F_FLUSH` when writable so a guest issues cache
+  flushes we honour. **The image is still read wholly into RAM** (`Disk.data`) —
+  reads/DMA hit the buffer and the buffer is what the snapshot serialises (E10), so
+  the write-through file is a *mirror*, not the source of truth; keeping RAM
+  authoritative preserves snapshot/restore (a bigger image would want `mmap`, a
+  future optimisation). `--disk-ro=FILE` is the opt-out: `file` stays NULL, writes
+  land in the RAM image but are **discarded at exit** (a qemu snapshot-mode
+  overlay), leaving the host file untouched — this is exactly the pre-M24 `--disk`
+  behaviour, and `quanta_attach_disk` (the back-compat API) maps to it. Ownership:
+  the engine `fflush`es + `fclose`s `Disk.file` in `quanta_destroy` and when a new
+  disk replaces it; `quanta_restore` treats `file`/`writable` as **live-engine
+  fields not captured by the snapshot** (re-wired from the running machine, like
+  `Disk.data`), and a `--restore`d machine has `file == NULL` (no backing `--disk`).
+  Adding the two fields grew `Platform`, so old `--snapshot` files reject on the
+  layout signature (documented-acceptable, as when the net FIFO was added). The
+  fseek offset is bounded by `LONG_MAX` (a >2 GiB image would need `fseeko`, out of
+  portable C — no chosen guest is that large). Pinned by `check-virtio` (write
+  persists through `--disk`; `--disk-ro` leaves the image byte-for-byte untouched).
 - virtio-mmio network device (M23, the network-path enabler): a second modern
   (version 2) virtio device in `device.c`, on the **second** virtio slot
   (`VIRTIO_NET_BASE` 0x10002000, PLIC source 2), the qemu `virt` layout. Unlike the

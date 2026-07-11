@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 
 /*
  * MMIO device models — see device.h for the platform overview. Each device is a
@@ -209,11 +210,14 @@ int plat_uart_rx(Platform *p, uint8_t byte) {
 #define VRING_DESC_F_NEXT  1u       /* buffer continues in `next` */
 #define VRING_DESC_F_WRITE 2u       /* device-writable (vs device-readable) */
 
-#define VIRTIO_BLK_T_IN  0u         /* read: disk -> memory  */
-#define VIRTIO_BLK_T_OUT 1u         /* write: memory -> disk */
+#define VIRTIO_BLK_T_IN    0u       /* read: disk -> memory  */
+#define VIRTIO_BLK_T_OUT   1u       /* write: memory -> disk */
+#define VIRTIO_BLK_T_FLUSH 4u       /* flush the writeback cache to the backing file */
 #define VIRTIO_BLK_S_OK    0u
 #define VIRTIO_BLK_S_IOERR 1u
 #define SECTOR_SIZE 512u
+
+#define VIRTIO_BLK_F_FLUSH 9u       /* device has a writeback cache it can flush (M24) */
 
 /* Bounds-checked pointer into guest RAM for a DMA of `len` bytes at physical
  * address `addr`. NULL means the range is out of RAM (or no RAM is attached): a
@@ -301,12 +305,28 @@ static uint32_t virtio_service(Platform *p, uint16_t head) {
             int in_image = p->disk.data && pos < p->disk.size;
             if (type == VIRTIO_BLK_T_IN)                    /* disk -> memory */
                 buf[k] = in_image ? p->disk.data[pos] : 0;
-            else if (type == VIRTIO_BLK_T_OUT && in_image)  /* memory -> disk */
+            else if (type == VIRTIO_BLK_T_OUT && in_image)  /* memory -> RAM image */
                 p->disk.data[pos] = buf[k];
+        }
+        /* Write-through the in-image span of this buffer to the backing file so the
+         * write survives the run (M24). Clamped to the image so a short image never
+         * overruns; the fseek offset is bounded by LONG_MAX (a >2 GiB image would
+         * need fseeko, out of portable C — no chosen guest image is that large). */
+        if (type == VIRTIO_BLK_T_OUT && p->disk.writable && p->disk.file
+                && p->disk.data && off < p->disk.size && off <= (uint64_t)LONG_MAX) {
+            uint64_t end = off + len[i];
+            if (end > p->disk.size) end = p->disk.size;
+            if (fseek(p->disk.file, (long)off, SEEK_SET) == 0)
+                fwrite(p->disk.data + off, 1, (size_t)(end - off), p->disk.file);
         }
         if (type == VIRTIO_BLK_T_IN) written += len[i];
         off += len[i];
     }
+
+    /* A FLUSH request carries no data buffers; push the write-through file to the
+     * OS so the guest's fsync/sync durably reaches the image (M24). */
+    if (type == VIRTIO_BLK_T_FLUSH && p->disk.writable && p->disk.file)
+        fflush(p->disk.file);
 
     /* Last descriptor: the status byte the driver reads on completion. */
     uint8_t *st = dma_ptr(p, addr[last], 1);
@@ -354,9 +374,12 @@ static uint32_t virtio_read(Platform *p, uint32_t off) {
         case V_VERSION:       return 2u; // NOLINT(bugprone-branch-clone)
         case V_DEVICE_ID:     return V_BLK_ID;
         case V_VENDOR_ID:     return V_VENDOR_QEMU;
-        /* We negotiate only VIRTIO_F_VERSION_1 (feature bit 32), so the low half
-         * reads back 0 and the high half reads back bit 0 set. */
-        case V_DEVICE_FEAT:   return (v->features_sel == 1) ? 1u : 0u;
+        /* High half (features_sel==1): VIRTIO_F_VERSION_1 (feature bit 32). Low
+         * half: block feature bits — a writable disk advertises FLUSH so the guest
+         * issues cache flushes we honour (M24); a read-only overlay advertises none. */
+        case V_DEVICE_FEAT:
+            if (v->features_sel == 1) return 1u;
+            return p->disk.writable ? (1u << VIRTIO_BLK_F_FLUSH) : 0u;
         case V_QUEUE_NUM_MAX: return V_QUEUE_MAX;
         case V_QUEUE_READY:   return v->queue_ready;
         case V_INT_STATUS:    return v->interrupt_status;

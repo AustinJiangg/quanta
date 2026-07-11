@@ -130,11 +130,17 @@ QuantaStatus quanta_elf_symbol(const char *path, const char *name,
 /* --- optional block device --- */
 
 /* Attach a raw disk image from `path` as the machine's block device, read wholly
- * into memory (so reads and writes hit the buffer; writes do not persist back to
- * the file). A future virtio-mmio block device DMAs against it — e.g. an OS
- * mounting its root filesystem. Returns QUANTA_ERR_LOAD if the file cannot be
- * read, QUANTA_ERR_NOMEM on allocation failure, QUANTA_ERR_INVAL on a NULL
- * argument. Replaces any previously attached disk. */
+ * into memory. When `writable`, guest writes are written through to the file and a
+ * virtio FLUSH is honoured, so they persist across the run (M24); when 0, writes
+ * land in the in-memory image only and are discarded at exit, leaving `path`
+ * untouched (a snapshot-mode overlay). The virtio-mmio block device DMAs against
+ * it — e.g. an OS mounting its root filesystem. Returns QUANTA_ERR_LOAD if the
+ * file cannot be opened/read (writable needs read-write permission),
+ * QUANTA_ERR_NOMEM on allocation failure, QUANTA_ERR_INVAL on a NULL argument.
+ * Replaces any previously attached disk. */
+QuantaStatus quanta_attach_disk_ex(Quanta *q, const char *path, int writable);
+
+/* Back-compatible read-only (non-persistent) attach: quanta_attach_disk_ex(.., 0). */
 QuantaStatus quanta_attach_disk(Quanta *q, const char *path);
 
 /* --- console input --- */

@@ -110,6 +110,10 @@ static void machine_poll_halt(Quanta *q) {
 void quanta_destroy(Quanta *q) {
     if (!q) return;
     if (q->cache_on) cache_free(&q->cache);
+    if (q->plat.disk.file) {           /* flush write-through and release the handle */
+        fflush(q->plat.disk.file);
+        fclose(q->plat.disk.file);
+    }
     free(q->plat.disk.data); /* the attached disk image, if any */
     mem_free(&q->mem);
     free(q);
@@ -378,9 +382,9 @@ QuantaStatus quanta_load_image(Quanta *q, uint32_t base, uint32_t size,
     return QUANTA_OK;
 }
 
-QuantaStatus quanta_attach_disk(Quanta *q, const char *path) {
+QuantaStatus quanta_attach_disk_ex(Quanta *q, const char *path, int writable) {
     if (!q || !path) return QUANTA_ERR_INVAL;
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, writable ? "r+b" : "rb");
     if (!f) return QUANTA_ERR_LOAD;
 
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return QUANTA_ERR_LOAD; }
@@ -397,12 +401,23 @@ QuantaStatus quanta_attach_disk(Quanta *q, const char *path) {
             return QUANTA_ERR_LOAD;
         }
     }
-    fclose(f);
+    /* Read-only: the image is now cached in RAM, so drop the handle — writes will
+     * hit the RAM copy and be discarded. Writable: keep it open "r+b" for the block
+     * device's write-through (the initial read above leaves the position at EOF; the
+     * device fseeks before each write, so the read->write switch stays conforming). */
+    if (!writable) { fclose(f); f = NULL; }
 
-    free(q->plat.disk.data); /* replace any previously attached disk */
-    q->plat.disk.data = data;
-    q->plat.disk.size = (uint64_t)n;
+    if (q->plat.disk.file) fclose(q->plat.disk.file); /* release a previous handle */
+    free(q->plat.disk.data);                          /* replace any previous image  */
+    q->plat.disk.data     = data;
+    q->plat.disk.size     = (uint64_t)n;
+    q->plat.disk.file     = f;
+    q->plat.disk.writable = (f != NULL);
     return QUANTA_OK;
+}
+
+QuantaStatus quanta_attach_disk(Quanta *q, const char *path) {
+    return quanta_attach_disk_ex(q, path, 0);
 }
 
 QuantaStatus quanta_enable_cache(Quanta *q, uint32_t size_bytes,
@@ -548,6 +563,8 @@ QuantaStatus quanta_restore(Quanta *q, const QuantaSnapshot *s) {
 
     uint8_t *live_ram  = q->mem.data;        /* engine-owned buffers to keep */
     uint8_t *live_disk = q->plat.disk.data;
+    FILE    *live_file = q->plat.disk.file;  /* the --disk backing handle, not in the snapshot */
+    int      live_wr   = q->plat.disk.writable;
 
     /* Harts: value copy, then re-point each hart's borrowed pointers at the live
      * memory and (if enabled) cache. */
@@ -579,6 +596,8 @@ QuantaStatus quanta_restore(Quanta *q, const QuantaSnapshot *s) {
     q->plat.ram_size = q->mem.size;
     q->plat.disk.data = live_disk;
     q->plat.disk.size = s->disk_size;
+    q->plat.disk.file = live_file;     /* the snapshot never captured the host handle */
+    q->plat.disk.writable = live_wr;
     if (live_disk && s->disk_data) memcpy(live_disk, s->disk_data, s->disk_size);
 
     return QUANTA_OK;
@@ -746,6 +765,10 @@ QuantaStatus quanta_load_snapshot(Quanta *q, const char *path) {
         }
         q->plat.disk.size = s->disk_size;
     }
+    /* A restored checkpoint has no --disk backing file: writes hit the in-RAM image
+     * and are discarded. quanta_restore preserves these live-engine fields. */
+    q->plat.disk.file     = NULL;
+    q->plat.disk.writable = 0;
     q->nharts = s->nharts;
     q->loaded = 1;   /* so quanta_restore's guard passes */
 

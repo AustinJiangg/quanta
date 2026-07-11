@@ -2,6 +2,7 @@
 #define QUANTA_DEVICE_H
 
 #include <stdint.h>
+#include <stdio.h>
 
 /*
  * Platform devices (M13): the memory-mapped hardware a full system needs beyond
@@ -161,13 +162,19 @@ typedef struct {
     void     *tx_ctx;
 } VirtioNet;
 
-/* A raw block-device backing image (attached via --disk). Held here so a future
- * virtio-mmio block device can DMA against it; loaded into RAM so reads and
- * writes hit the buffer (writes do not persist to the file). data == NULL when
- * no disk is attached. The bytes are owned by the engine, which frees them. */
+/* A block-device backing image (attached via --disk). Loaded wholly into RAM so
+ * reads and DMA are fast and the image round-trips through a snapshot (E10). When
+ * `writable` (the default --disk), the block device write-throughs each written
+ * span to `file` (kept open "r+b") and pushes it to the OS on a virtio FLUSH, so
+ * guest writes persist across the run (M24). A read-only attach (--disk-ro) keeps
+ * `file` NULL: writes still land in the RAM image but are discarded at exit (a
+ * qemu snapshot-mode overlay), leaving the host file untouched. data == NULL when
+ * no disk is attached. The bytes and the file handle are owned by the engine. */
 typedef struct {
     uint8_t *data;
     uint64_t size;
+    FILE    *file;      /* backing file for write-through, or NULL (read-only/none) */
+    int      writable;  /* writes persist to `file` and FLUSH is honoured */
 } Disk;
 
 struct CPU; /* the harts, for cross-hart IPIs and LR/SC reservations (M19) */

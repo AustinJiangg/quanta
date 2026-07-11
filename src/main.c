@@ -34,7 +34,7 @@
  * Usage:
  *   quanta [--version] [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]]
  *          [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] [--gdb[=PORT]] [--signature=FILE]
- *          [--disk=FILE] [--netdev=user|tap] [--snapshot=FILE] [--restore=FILE]
+ *          [--disk=FILE | --disk-ro=FILE] [--netdev=user|tap] [--snapshot=FILE] [--restore=FILE]
  *          [--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]]
  *          [program.elf]
  *
@@ -54,7 +54,9 @@
  * receive path during the run, so a full-system guest has a keyboard. When stdin
  * is a terminal the run puts it in raw mode (character-at-a-time, no host echo,
  * Ctrl-A x to quit), mirroring qemu's -nographic console; a pipe or file is read
- * verbatim. --disk attaches a raw block-device image the virtio-mmio device serves.
+ * verbatim. --disk attaches a raw block-device image the virtio-mmio device serves,
+ * persisting guest writes back to the file; --disk-ro attaches it read-only (guest
+ * writes are buffered in RAM and discarded at exit, leaving the file untouched).
  *
  * With a path, Quanta loads that RV32I ELF executable and runs it from its
  * entry point. With no argument, it runs a tiny built-in demo program — a
@@ -588,7 +590,8 @@ int main(int argc, char **argv) {
     uint64_t max_steps = 100ull * 1000 * 1000; /* --max-steps runaway cap (0 = none) */
     const char *path = NULL;
     const char *sigfile = NULL; /* --signature=FILE: arch-test signature dump */
-    const char *diskpath = NULL; /* --disk=FILE: raw block-device backing image */
+    const char *diskpath = NULL; /* --disk=FILE / --disk-ro=FILE: block-device image */
+    int disk_writable = 1;       /* --disk persists writes (M24); --disk-ro is an overlay */
     const char *bios = NULL;    /* --bios=FILE: M-mode firmware ELF (OpenSBI) */
     const char *kernel = NULL;  /* --kernel=FILE: raw S-mode OS image (Linux Image) */
     const char *append = NULL;  /* --append=STRING: kernel command line (DTB bootargs) */
@@ -657,8 +660,16 @@ int main(int argc, char **argv) {
             }
         } else if (strncmp(argv[i], "--disk=", 7) == 0) {
             diskpath = argv[i] + 7;
+            disk_writable = 1;
             if (diskpath[0] == '\0') {
                 fprintf(stderr, "--disk needs a file path\n");
+                return 2;
+            }
+        } else if (strncmp(argv[i], "--disk-ro=", 10) == 0) {
+            diskpath = argv[i] + 10;
+            disk_writable = 0;
+            if (diskpath[0] == '\0') {
+                fprintf(stderr, "--disk-ro needs a file path\n");
                 return 2;
             }
         } else if (strncmp(argv[i], "--bios=", 7) == 0) {
@@ -717,7 +728,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] "
-                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [--netdev=user|tap] "
+                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE|--disk-ro=FILE] [--netdev=user|tap] "
                     "[--snapshot=FILE] [--restore=FILE] "
                     "[--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]] "
                     "[program.elf]\n",
@@ -728,7 +739,7 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] "
-                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [--netdev=user|tap] "
+                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE|--disk-ro=FILE] [--netdev=user|tap] "
                     "[--snapshot=FILE] [--restore=FILE] "
                     "[--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]] "
                     "[program.elf]\n",
@@ -806,9 +817,11 @@ int main(int argc, char **argv) {
     }
 
     /* Optionally attach a raw disk image, loaded after the program so the guest
-     * region already exists. A future virtio-mmio block device DMAs against it. */
-    if (diskpath && quanta_attach_disk(q, diskpath) != QUANTA_OK) {
-        fprintf(stderr, "failed to load disk image %s\n", diskpath);
+     * region already exists. The virtio-mmio block device DMAs against it. --disk
+     * persists guest writes back to the file (M24); --disk-ro is a discard overlay. */
+    if (diskpath && quanta_attach_disk_ex(q, diskpath, disk_writable) != QUANTA_OK) {
+        fprintf(stderr, "failed to load disk image %s%s\n", diskpath,
+                disk_writable ? " (needs read-write permission)" : "");
         quanta_destroy(q);
         return 1;
     }
@@ -874,7 +887,8 @@ int main(int argc, char **argv) {
                    bios, w, (unsigned long long)entry,
                    w, (unsigned long long)quanta_dtb_addr(q));
             printf("Kernel:  %s\n", kernel);
-            if (diskpath) printf("Disk:    %s\n", diskpath);
+            if (diskpath) printf("Disk:    %s%s\n", diskpath,
+                                 disk_writable ? "" : " (read-only)");
             printf("\n");
         } else if (restorepath) {
             printf("Restored from snapshot %s (pc = 0x%0*llx, dtb = 0x%0*llx)\n\n",
@@ -886,7 +900,8 @@ int main(int argc, char **argv) {
             printf("Loaded %s (entry = 0x%0*llx, sp = 0x%0*llx, dtb = 0x%0*llx)\n",
                    path, w, (unsigned long long)entry, w, (unsigned long long)sp,
                    w, (unsigned long long)quanta_dtb_addr(q));
-            if (diskpath) printf("Disk:  %s\n", diskpath);
+            if (diskpath) printf("Disk:  %s%s\n", diskpath,
+                                 disk_writable ? "" : " (read-only)");
             printf("\n");
         }
     }
