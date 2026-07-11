@@ -103,6 +103,7 @@ make check-snapshot # check machine snapshot/restore replays a run bit-for-bit (
 make check-replay  # check --snapshot/--restore file round-trip and resume (E10)
 make check-os      # boot the M16 teaching kernel to userspace (needs cross-toolchain)
 make linux-initramfs # build the Linux initramfs (tests/linux/) for the OpenSBI->Linux boot (M18)
+make alpine-rootfs # build the Alpine RV64 ext4 rootfs (tests/alpine/) for the distribution boot (M24)
 make check-rv64    # RV64IMAC conformance (tests/rv64/), diff vs qemu-riscv64 (M17)
 make check-diff    # differential-test against qemu-riscv32 (needs qemu-user-static)
 make check-arch    # official riscv-arch-test conformance (needs cross-toolchain + clone)
@@ -128,8 +129,13 @@ not combine with `--trace`/`--pipeline`. Add `--memory=SIZE` (bytes, with an
 optional `K`/`M`/`G` suffix, e.g. `--memory=8M`) to grow the guest RAM region
 beyond its ELF image — spare RAM lands above the image for an OS-style guest to
 manage, and the boot DTB advertises the real size (`tests/os/` needs it). Add
-`--disk=FILE` to attach a raw block-device image (read wholly into memory) that
-the virtio-mmio block device serves as an OS's root filesystem (M18). Add
+`--disk=FILE` to attach a raw block-device image the virtio-mmio block device
+serves as an OS's root filesystem (M18); it is **writable** by default —
+guest writes are written through to the file, so they persist across a run and a
+guest reboot (M24) — while `--disk-ro=FILE` keeps the file untouched (writes are
+buffered in RAM and discarded at exit). With this, upstream **Alpine Linux
+(riscv64) boots from an ext4 disk to a login shell and persists changes across a
+reboot** (`tests/alpine/`, `make alpine-rootfs`). Add
 `--netdev=user` to attach the from-scratch usermode network stack to the
 virtio-net device: it presents a virtual gateway on 10.0.2.0/24 (the qemu-slirp
 layout) the guest can DHCP against and ping, and does outbound UDP/TCP NAT plus a
@@ -571,6 +577,15 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   `Image` and OpenSBI firmware are external artifacts supplied at run time, so
   there is no `make` boot target — a manual milestone like xv6; `README.md` has
   the recipe.
+- `tests/alpine/` — the M24 distribution boot (Alpine Linux riscv64 on a writable
+  virtio disk). `mkrootfs.sh` (`make alpine-rootfs`) fetches the official Alpine
+  minirootfs and packs it into a **writable ext4 image** (`build/alpine/
+  alpine.ext4`) — root-owned via `fakeroot`+`mke2fs -d` (no root needed), a getty
+  on `ttyS0`, a known root password, and a self-validating `init=/qtest.sh` that
+  writes a persistence marker and powers off. `README.md` has the boot recipe (the
+  external kernel `Image` + OpenSBI, like the Linux boot) and the two-run
+  persistence demonstration. A manual milestone (long full-system run), so no
+  `make check` target; the writable-disk half is pinned by `check-virtio`.
 - `tests/rv64/test_rv64_virtio.S` + `tests/check_virtio.sh` — the M18 virtio-mmio
   block-device test (`make check-virtio`): a bare-metal RV64 machine-mode driver
   probes the device identity, runs the status/feature handshake, sets up a split

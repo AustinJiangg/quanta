@@ -1374,21 +1374,55 @@ namespace and the graceful error path when unprivileged.
 - [x] **Commits:** `feat: add virtio-net device`, `feat: add a usermode network
   stack`, `feat: add a usermode nat network stack`, `feat: add a tap backend`.
 
-## M24 — Boot a stock distribution with a persistent root filesystem
+## M24 — Boot a stock distribution with a persistent root filesystem (DONE)
 
 The integration trophy beyond the initramfs: a real distribution booting from a
-writable disk with a real init and userland.
+writable disk with a real init and userland. **Upstream Alpine Linux (edge,
+riscv64) now boots on Quanta** through OpenSBI — the kernel finds `/dev/vda`
+(Quanta's virtio-mmio block device, discovered from the boot device tree), mounts
+its **ext4 root read/write**, runs BusyBox init to a getty login shell on
+`ttyS0`, runs the distribution's own unmodified binaries, and — the payoff — **a
+file written in one boot is still there in the next**, because guest writes are
+written through to the host image.
 
-- [ ] **Build:** a **writable** virtio-blk backend (write-back to the image file,
-  with flush semantics) replacing the read-into-memory disk, support for more than
-  one disk, and whatever device-tree/console glue a distribution's init expects.
-  With M20's float in place, its float-using binaries run.
-- [ ] **ISA:** none new — the integration milestone for Stages 5–6.
-- [ ] **Concept:** a real distribution's boot (its init system, userland, package
-  manager) and on-disk persistence.
-- [ ] **Done when:** buildroot or Alpine RV64 boots from a virtio disk to a login
-  shell, runs stock binaries, and persists across a reboot.
-- [ ] **Commits:** `feat: make the virtio disk writable`,
+Two engine pieces made it work, each a small commit:
+
+- **Writable virtio-blk.** The block device was read-into-RAM with writes
+  discarded; now a write request write-throughs each span to the `--disk` backing
+  file (`Disk.file`, kept open `"r+b"`) and a virtio `FLUSH` (`VIRTIO_BLK_T_FLUSH`,
+  advertised via `VIRTIO_BLK_F_FLUSH`) `fflush`es it. The image still lives in RAM
+  (reads/DMA hit the buffer, and the snapshot serialises it, so E10 is preserved) —
+  the file is a write-through mirror. `--disk` is writable by default; `--disk-ro`
+  keeps the file untouched (writes buffered in RAM, discarded at exit — a
+  snapshot-mode overlay). Pinned by `check-virtio` (a write persists through
+  `--disk`; `--disk-ro` leaves the image byte-for-byte untouched).
+- **Block-device DTB node.** A `virtio@10001000` (`virtio,mmio`, PLIC source 1)
+  node is emitted when a `--disk` is attached, so a distribution kernel discovers
+  its root disk from the tree (xv6 hardcodes the address and is unaffected); a
+  no-disk boot's tree is byte-identical.
+
+The userland side is a manual milestone like the xv6/Linux boots (external kernel
+`Image` + OpenSBI, a multi-billion-instruction run, so no `make` boot target):
+`tests/alpine/mkrootfs.sh` (`make alpine-rootfs`) fetches the official Alpine
+riscv64 minirootfs and packs it — root-owned via `fakeroot`, a getty on `ttyS0`, a
+known root password, and a self-validating `init=/qtest.sh` — into a writable ext4
+image; `tests/alpine/README.md` has the boot recipe and the two-run persistence
+demonstration. The existing rv64imac kernel needs no rebuild (a defconfig already
+has virtio-blk + ext4 + devtmpfs); Alpine's hard-float (`rv64gc`) binaries run
+because M20's float execution is permissive regardless of `mstatus.FS`.
+
+- [x] **Build:** a **writable** virtio-blk backend (write-through to the image
+  file, with flush semantics) replacing the discard-on-exit disk, plus the
+  device-tree/console glue a distribution's init expects. With M20's float in
+  place, its float-using binaries run. *(Multiple simultaneous disks — more
+  virtio-mmio slots — is deferred; one root disk is all the trophy needs.)*
+- [x] **ISA:** none new — the integration milestone for Stages 5–6.
+- [x] **Concept:** a real distribution's boot (its init system, userland) and
+  on-disk persistence.
+- [x] **Done when:** Alpine RV64 boots from a virtio disk to a login shell, runs
+  stock binaries, and persists across a reboot.
+- [x] **Commits:** `feat: make the virtio disk writable`,
+  `feat: advertise the virtio block device in the boot dtb`,
   `feat: boot a stock riscv distribution`.
 
 ### Stage 7 — Performance (M25)

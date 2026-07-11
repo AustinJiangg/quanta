@@ -57,7 +57,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-virtnet check-net check-smp check-hsm check-os check-rv64 check-diff check-arch check-snapshot check-replay embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-virtnet check-net check-smp check-hsm check-os check-rv64 check-diff check-arch check-snapshot check-replay embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean alpine-rootfs
 
 all: $(BIN)
 
@@ -281,6 +281,13 @@ check-opensbi: $(BIN) tests/opensbi_payload.bin
 # recipe. Output: build/linux/initramfs.cpio.
 linux-initramfs:
 	@sh tests/linux/mkinitramfs.sh
+
+# Build the Alpine RV64 root filesystem for the M24 distribution boot. A manual
+# milestone like the Linux boot: the kernel Image and OpenSBI are external, and a
+# full boot runs billions of instructions, so there is no boot target — see
+# tests/alpine/README.md. Output: build/alpine/alpine.ext4 (a writable ext4 disk).
+alpine-rootfs:
+	@sh tests/alpine/mkrootfs.sh
 
 # Exercise the M13 platform: the device/interrupt test must exit clean (CLINT
 # timer, software IPI, and a PLIC-routed external interrupt all fire) and its
