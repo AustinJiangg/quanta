@@ -1294,7 +1294,7 @@ online, the scheduler running across them).
 - [x] **Commits:** `feat: add sbi hsm hart management`,
   `feat: boot linux smp under opensbi`.
 
-## M23 — virtio-net and a network path
+## M23 — virtio-net and a network path (DONE)
 
 A network is the biggest missing capability. The device is a second virtio-mmio
 model; the hard part is the host backend, done in stages so a testable version
@@ -1349,23 +1349,30 @@ to 256** — Linux's virtio-net stops its TX queue when fewer than `2 + MAX_SKB_
 the first frame and never restarted it. With those, **mainline Linux 6.6 brings up
 `eth0` and reaches the network through the NAT.**
 
-Still to come: the **Linux TAP backend** (`feat: add a tap backend`) — it needs
-`/dev/net/tun` + `CAP_NET_ADMIN`, so it can't be tested deterministically here and
-is a manual milestone like the OS boots.
+**The Linux TAP backend has landed (final commit) — M23 is complete.**
+`--netdev=tap[=IFNAME]` (`main.c`) bridges the virtio-net device to a host TAP
+device (`/dev/net/tun`, `IFF_TAP`) at layer 2: it bypasses the usermode stack and
+just shuttles ethernet frames (`tap_backend_tx` → the fd; `net_pump` drains the fd
+→ `quanta_net_rx`), leaving the host to own addressing/routing/NAT. Creating a
+fresh TAP needs `CAP_NET_ADMIN`, but attaching to a persistent one pre-created for
+the user works unprivileged — the intended use. Linux-only, and a manual milestone:
+there is no host TAP to test against here, so it has no `make check` target (like
+the OS boots), validated instead by clean bring-up in a `unshare -Urn` net
+namespace and the graceful error path when unprivileged.
 
-- [ ] **Build:** a virtio-net device (modern, RX/TX virtqueues) in `device.c`, and
-  a host backend in tiers: first a Linux **TAP** backend behind a flag, then a
-  from-scratch **usermode NAT/SLIRP** stack (ARP/IP/ICMP/UDP/TCP + DHCP + a DNS
-  relay) so networking needs no privileges and no dependency — the from-scratch
-  answer that fits the project's ethos. A loopback/packet-capture backend backs
-  the deterministic test.
-- [ ] **ISA:** none new — a second bus-master virtio device.
-- [ ] **Concept:** virtio-net, packet DMA, the device/backend split, usermode
+- [x] **Build:** a virtio-net device (modern, RX/TX virtqueues) in `device.c`, and
+  a host backend in tiers — done in the ethos-first order (testable before
+  privileged): the deterministic **loopback** backend, then the from-scratch
+  **usermode NAT/SLIRP** stack (ARP/ICMP/DHCP + UDP/TCP NAT + a DNS relay, no
+  privileges, no dependency), then the Linux **TAP** backend behind `--netdev=tap`.
+- [x] **ISA:** none new — a second bus-master virtio device.
+- [x] **Concept:** virtio-net, packet DMA, the device/backend split, usermode
   networking.
-- [ ] **Done when:** a guest Linux gets a link, DHCPs an address, and reaches the
-  host (ping / `wget` through the NAT).
-- [ ] **Commits:** `feat: add virtio-net device`, `feat: add a tap backend`,
-  `feat: add a usermode nat network stack`.
+- [x] **Done when:** a guest Linux gets a link and DHCPs an address (mainline Linux
+  6.6 brings up `eth0` = 10.0.2.15 through the NAT); the usermode NAT (UDP/TCP/DNS)
+  is pinned by the mock-io tests, the outbound host-socket reach is a manual check.
+- [x] **Commits:** `feat: add virtio-net device`, `feat: add a usermode network
+  stack`, `feat: add a usermode nat network stack`, `feat: add a tap backend`.
 
 ## M24 — Boot a stock distribution with a persistent root filesystem
 

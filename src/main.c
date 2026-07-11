@@ -17,11 +17,16 @@
 #include <unistd.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <termios.h>
 #include <signal.h>
+#if defined(__linux__)
+#include <net/if.h>
+#include <linux/if_tun.h>   /* the TAP backend (--netdev=tap); Linux-only */
+#endif
 
 /*
  * Quanta driver — a thin client over libquanta.
@@ -29,7 +34,7 @@
  * Usage:
  *   quanta [--version] [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]]
  *          [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] [--gdb[=PORT]] [--signature=FILE]
- *          [--disk=FILE] [--netdev=user] [--snapshot=FILE] [--restore=FILE]
+ *          [--disk=FILE] [--netdev=user|tap] [--snapshot=FILE] [--restore=FILE]
  *          [--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]]
  *          [program.elf]
  *
@@ -364,10 +369,48 @@ static void resolve_upstream_dns(uint8_t out[4]) {
     fclose(f);
 }
 
+/* ---------------------------------------------------------------------------
+ * TAP backend for --netdev=tap: a raw layer-2 bridge to a host TAP device.
+ *
+ * Unlike the usermode stack, this does no protocol work — it shuttles whole
+ * ethernet frames between the guest's virtio-net device and /dev/net/tun, and
+ * the host owns the other end (its own addressing, routing, and NAT). Creating a
+ * fresh TAP needs CAP_NET_ADMIN, but attaching to a persistent one pre-created
+ * for this user (`ip tuntap add tapN mode tap user $USER`) works unprivileged,
+ * which is the intended use. Linux-only; a manual milestone (no host TAP to test
+ * against here). Returns the fd, or -1 (with errno set) if it cannot attach.
+ * ------------------------------------------------------------------------- */
+#if defined(__linux__)
+static int tap_open(const char *name) {
+    int fd = open("/dev/net/tun", O_RDWR);
+    if (fd < 0) return -1;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof ifr);
+    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;          /* raw ethernet frames, no header */
+    if (name && *name) {
+        strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+        ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+    }
+    if (ioctl(fd, TUNSETIFF, &ifr) < 0) { close(fd); return -1; }
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    return fd;
+}
+#else
+static int tap_open(const char *name) { (void)name; errno = ENOSYS; return -1; }
+#endif
+
+/* Device transmit callback for the TAP backend: write the frame to the TAP fd
+ * (ctx is &tap_fd). A short/failed write drops the frame, as a real NIC would. */
+static void tap_backend_tx(void *ctx, const uint8_t *frame, uint32_t len) {
+    int fd = *(int *)ctx;
+    if (fd >= 0) { ssize_t w = write(fd, frame, len); (void)w; }
+}
+
 /* Poll all open NAT sockets once (zero timeout) and drive the stack: complete
  * TCP connects, deliver received bytes, and retry buffered writes. A callback
  * may free a flow (closing its fd), so the fd is re-checked before each use. */
-static void net_pump(NetPosix *np) {
+static void net_pump_user(NetPosix *np) {
     if (!np) return;
     fd_set rfds, wfds;
     FD_ZERO(&rfds);
@@ -420,13 +463,42 @@ static void net_pump(NetPosix *np) {
     }
 }
 
+/* The active network backend the run loop pumps: exactly one of the usermode NAT
+ * sockets (--netdev=user) or a TAP fd (--netdev=tap). */
+typedef struct {
+    NetPosix *user;    /* --netdev=user: NAT sockets to poll (NULL for tap)    */
+    Quanta   *q;       /* engine, for delivering received TAP frames to the guest */
+    int       tap_fd;  /* --netdev=tap: the TAP device fd (-1 for user)         */
+} NetPump;
+
+/* Service the active backend once. For TAP, drain a bounded burst of frames from
+ * the host into the guest's receive path (a frame the FIFO cannot hold is dropped,
+ * like a real NIC under overrun). Guest transmit goes the other way through the
+ * device backend callback (tap_backend_tx), so it needs no polling. */
+static void net_pump(NetPump *np) {
+    if (!np) return;
+    if (np->user) { net_pump_user(np->user); return; }
+    if (np->tap_fd < 0) return;
+    for (int i = 0; i < 64; i++) {
+        fd_set rf;
+        FD_ZERO(&rf);
+        FD_SET(np->tap_fd, &rf);
+        struct timeval tv = { 0, 0 };
+        if (select(np->tap_fd + 1, &rf, NULL, NULL, &tv) <= 0) break;
+        uint8_t buf[2048];
+        ssize_t n = read(np->tap_fd, buf, sizeof buf);
+        if (n <= 0) break;
+        quanta_net_rx(np->q, buf, (uint32_t)n);
+    }
+}
+
 /* Step until the program halts, or a safety limit is hit so a buggy program can
  * never spin forever. With trace set, narrate each instruction to stderr; with a
  * pipeline, feed it each retired instruction. `max_steps` caps the run as a
  * runaway guard (0 = no cap, for an interactive full-system guest that
  * legitimately runs billions of instructions). Returns the instruction count. */
 static uint64_t run_until_halt(Quanta *q, int trace, Pipeline *pipe,
-                               uint64_t max_steps, NetPosix *net) {
+                               uint64_t max_steps, NetPump *net) {
     uint64_t steps = 0;
     while (quanta_halt_reason(q) == QUANTA_RUN && !g_console_quit &&
            (max_steps == 0 || steps < max_steps)) {
@@ -524,11 +596,15 @@ int main(int argc, char **argv) {
     const char *snappath = NULL;   /* --snapshot=FILE: save machine state on exit (E10) */
     const char *restorepath = NULL;/* --restore=FILE: resume from a saved snapshot (E10) */
     int nharts = 1;             /* --harts=N: number of harts for SMP (M19) */
-    const char *netdev = NULL;  /* --netdev=user: attach the usermode network stack (M23) */
-    NetStack *ns = NULL;        /* the usermode network stack, when --netdev=user */
-    NetPosix  netbk;            /* its POSIX socket backend (for outbound NAT)     */
-    NetIo     netio;            /* the NetIo vtable pointing at netbk              */
-    NetPosix *netbp = NULL;     /* passed to the run loop only when --netdev=user  */
+    const char *netdev = NULL;  /* --netdev=user|tap: attach a network backend (M23) */
+    int         tap_mode = 0;   /* --netdev=tap selected (else the usermode stack)  */
+    const char *tap_ifname = NULL; /* --netdev=tap=IFNAME: attach to this TAP device */
+    int         tap_fd = -1;    /* the open TAP fd, when --netdev=tap               */
+    NetStack *ns = NULL;        /* the usermode network stack, when --netdev=user   */
+    NetPosix  netbk;            /* its POSIX socket backend (for outbound NAT)      */
+    NetIo     netio;            /* the NetIo vtable pointing at netbk               */
+    NetPump   pump;             /* the active backend the run loop services         */
+    NetPump  *netbp = NULL;     /* passed to the run loop only when a backend is on */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
             printf("quanta %s\n", quanta_version());
@@ -626,16 +702,22 @@ int main(int argc, char **argv) {
             }
         } else if (strncmp(argv[i], "--netdev=", 9) == 0) {
             netdev = argv[i] + 9;
-            if (strcmp(netdev, "user") != 0) {
-                fprintf(stderr, "unknown --netdev backend '%s' (want 'user')\n",
-                        netdev);
+            if (strcmp(netdev, "user") == 0) {
+                tap_mode = 0;                     /* usermode NAT stack (default) */
+            } else if (strcmp(netdev, "tap") == 0 || strncmp(netdev, "tap=", 4) == 0) {
+                tap_mode = 1;                     /* raw layer-2 bridge to a host TAP */
+                const char *eq = strchr(netdev, '=');
+                tap_ifname = eq ? eq + 1 : NULL;
+            } else {
+                fprintf(stderr, "unknown --netdev backend '%s' (want 'user' or "
+                        "'tap[=IFNAME]')\n", netdev);
                 return 2;
             }
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] "
-                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [--netdev=user] "
+                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [--netdev=user|tap] "
                     "[--snapshot=FILE] [--restore=FILE] "
                     "[--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]] "
                     "[program.elf]\n",
@@ -646,7 +728,7 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] "
-                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [--netdev=user] "
+                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [--netdev=user|tap] "
                     "[--snapshot=FILE] [--restore=FILE] "
                     "[--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]] "
                     "[program.elf]\n",
@@ -731,13 +813,29 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Optionally attach the usermode network stack to the virtio-net device: it
-     * presents a virtual gateway (10.0.2.0/24) the guest can DHCP against and
-     * ping, needing no host privileges. The device's transmit path feeds the
-     * stack, and the stack's replies come back through the receive path. Its
-     * POSIX socket backend gives the guest outbound UDP/TCP NAT and a DNS relay
-     * to the real network; the run loop polls those sockets via net_pump. */
-    if (netdev) {
+    /* Optionally attach a network backend to the virtio-net device. --netdev=tap
+     * is a raw layer-2 bridge to a host TAP device (the host owns addressing and
+     * routing); --netdev=user is the built-in usermode stack — a virtual gateway
+     * (10.0.2.0/24) the guest can DHCP against and ping, with outbound UDP/TCP NAT
+     * and a DNS relay to the real network, needing no host privileges. Either way
+     * the device's transmit path feeds the backend and its receives come back
+     * through quanta_net_rx; the run loop services the backend via net_pump. */
+    if (netdev && tap_mode) {
+        tap_fd = tap_open(tap_ifname);
+        if (tap_fd < 0) {
+            fprintf(stderr, "failed to open TAP device%s%s: %s\n",
+                    tap_ifname ? " " : "", tap_ifname ? tap_ifname : "",
+                    strerror(errno));
+            fprintf(stderr, "(pre-create a TAP owned by you: "
+                    "`sudo ip tuntap add %s mode tap user $USER`, or run with "
+                    "CAP_NET_ADMIN)\n", tap_ifname ? tap_ifname : "tap0");
+            quanta_destroy(q);
+            return 1;
+        }
+        quanta_net_set_backend(q, tap_backend_tx, &tap_fd);
+        pump.user = NULL; pump.q = q; pump.tap_fd = tap_fd;
+        netbp = &pump;
+    } else if (netdev) {
         ns = netstack_new(net_deliver_to_guest, q);
         if (!ns) {
             fprintf(stderr, "failed to create the network stack\n");
@@ -756,7 +854,8 @@ int main(int argc, char **argv) {
         uint8_t upstream_dns[4];
         resolve_upstream_dns(upstream_dns);
         netstack_set_io(ns, &netio, upstream_dns);
-        netbp = &netbk;
+        pump.user = &netbk; pump.q = q; pump.tap_fd = -1;
+        netbp = &pump;
     }
 
     /* The loader set PC to the entry point and sp to the top of the region. */
@@ -823,6 +922,7 @@ int main(int argc, char **argv) {
         }
         quanta_destroy(q);
         netstack_free(ns);
+        if (tap_fd >= 0) close(tap_fd);
         return gdb_status;
     }
 
@@ -926,5 +1026,6 @@ int main(int argc, char **argv) {
     if (snap_failed && status == 0) status = 1; /* surface a snapshot-write failure */
     quanta_destroy(q);
     netstack_free(ns);
+    if (tap_fd >= 0) close(tap_fd);
     return status;
 }

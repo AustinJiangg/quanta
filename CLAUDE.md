@@ -133,7 +133,10 @@ the virtio-mmio block device serves as an OS's root filesystem (M18). Add
 virtio-net device: it presents a virtual gateway on 10.0.2.0/24 (the qemu-slirp
 layout) the guest can DHCP against and ping, and does outbound UDP/TCP NAT plus a
 DNS relay to the real network through host sockets — no host privileges (M23,
-mainline Linux 6.6 brings up `eth0` and DHCPs an address through it). With the
+mainline Linux 6.6 brings up `eth0` and DHCPs an address through it). Or
+`--netdev=tap[=IFNAME]` to bridge the virtio-net device to a host TAP at layer 2
+(the host owns addressing/routing; attach to a persistent TAP owned by the user,
+or run with `CAP_NET_ADMIN`). With the
 `--bios`/`--kernel` firmware-boot path, add `--initrd=FILE` to stage a cpio
 initramfs in RAM as the kernel's root filesystem (advertised via the DTB
 `/chosen` `linux,initrd-start`/`-end`) — how Linux reaches its `/init` (M18). Add
@@ -236,8 +239,10 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   the stack stays host-independent and unit-testable — the POSIX implementation
   lives in `main.c`. `main.c`'s `--netdev=user` bridges it to the device (device
   transmit → `netstack_input`, replies → `quanta_net_rx`) and polls the NAT
-  sockets each run-loop tick (`net_pump`). A Linux TAP backend is the remaining
-  M23 step (it needs host privileges, so it is a manual milestone).
+  sockets each run-loop tick (`net_pump`). `--netdev=tap` is the alternative
+  backend — a raw layer-2 bridge to a host TAP device (`main.c`'s `tap_open`/
+  `tap_backend_tx`), for when the host provides real networking; it bypasses the
+  stack entirely. M23 is complete.
 - `src/decode.h` — shared instruction decoding: field-extraction and
   immediate-decoding helpers, the opcode map, and ABI register names, all
   `static inline`. The executor and the disassembler decode through this, so
@@ -1117,9 +1122,23 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   IPv4). (4) DHCP replies are broadcast (the client has no address yet), pad the
   BOOTP body to 300 bytes, and echo the request's xid. (5) The `main.c` bridge owns
   the `NetStack` and frees it on every exit path (gdb and normal), since
-  `quanta_destroy` does not (it is external to the engine). A Linux TAP backend is
-  the remaining M23 step (it needs `/dev/net/tun` + `CAP_NET_ADMIN`, so it can't be
-  tested deterministically here — a manual milestone like the OS boots).
+  `quanta_destroy` does not (it is external to the engine). The `--netdev=tap`
+  backend (below) is the layer-2 alternative; with it M23 is complete.
+- TAP backend (M23, `main.c` `--netdev=tap[=IFNAME]`): the layer-2 alternative to
+  the usermode stack — a raw bridge to a host TAP device (`/dev/net/tun`,
+  `IFF_TAP|IFF_NO_PI`), for when the *host* provides the addressing/routing/NAT
+  (the emulator just shuttles ethernet frames). It bypasses `netstack.c` entirely:
+  `tap_backend_tx` `write()`s each guest frame to the TAP fd, and `net_pump` drains
+  readable frames the other way into `quanta_net_rx`. The two backends are mutually
+  exclusive (one `NetPump` the run loop services — `.user` set for `user`, `.tap_fd`
+  for `tap`). Creating a fresh TAP needs `CAP_NET_ADMIN`, but attaching to a
+  **persistent** TAP pre-created for the user (`ip tuntap add tapN mode tap user
+  $USER`) works unprivileged — the intended use. Linux-only (`#if __linux__`; else
+  `--netdev=tap` errors `ENOSYS`), and a **manual milestone**: there is no host TAP
+  to test against here (`TUNSETIFF` needs privileges), so no `make check` target —
+  the code is validated by clean bring-up in a `unshare -Urn` net namespace and by
+  the graceful error path when unprivileged. It is the driver's OS-specific corner
+  along with the console input and NAT sockets.
 - Usermode NAT (M23, `src/netstack.c` + `main.c`'s POSIX backend): for traffic
   past the virtual gateway the stack does outbound NAT to real host sockets, so a
   guest reaches the outside (a UDP query, a TCP stream, DNS) with no privileges.
