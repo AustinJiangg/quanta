@@ -94,6 +94,7 @@ make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-t
 make check-uart-rx # check UART receive (piped stdin) and the --disk backend (M18)
 make check-virtio  # check the virtio-mmio block device on a --disk image (M18)
 make check-smp     # check SMP: 4 harts, contended LR/SC, a CLINT IPI (M19)
+make check-hsm     # check SBI HSM: park/restart secondary harts (M22)
 make check-snapshot # check machine snapshot/restore replays a run bit-for-bit (E10)
 make check-replay  # check --snapshot/--restore file round-trip and resume (E10)
 make check-os      # boot the M16 teaching kernel to userspace (needs cross-toolchain)
@@ -303,10 +304,13 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
 - `src/sbi.{h,c}` — the SBI firmware interface (M15): the "firmware" side of an
   S-mode `ecall`. `sbi_call` dispatches on the extension id (`a7`) and function
   id (`a6`) and implements the Base extension (probe/version), console
-  putchar/getchar, TIME `set_timer`, HSM `hart_get_status`, and SRST
-  `system_reset`/shutdown (which halts the machine). Self-contained — it only
-  reads/writes the hart's registers and, for `set_timer`, the CLINT; the SEE in
-  `cpu.c` routes S-mode `ecall`s here when no guest M-mode handler is installed.
+  putchar/getchar, TIME `set_timer`, the full HSM extension (M22:
+  `hart_start`/`hart_stop`/`hart_suspend`/`hart_get_status`), and SRST
+  `system_reset`/shutdown (which halts the machine). Self-contained — it
+  reads/writes the calling hart's registers and, for `set_timer`, the CLINT; HSM
+  reaches sibling harts through `cpu->mem->plat->harts` (M19's shared array) to
+  park/restart them. The SEE in `cpu.c` routes S-mode `ecall`s here when no guest
+  M-mode handler is installed.
 - `src/quanta.{h,c}` — the public `libquanta` engine API: an opaque `Quanta *`
   handle wrapping CPU + memory + the optional cache, with lifecycle, ELF/raw-image
   loading, `quanta_step`/`quanta_run`, and register/memory accessors. The engine
@@ -563,6 +567,18 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   `-mno-relax` (like the virtio test — `la` on its in-RAM words must stay
   PC-relative, gp is not the global pointer). Quanta-only, excluded from
   `check-rv64`'s generic runner (`RV64_RUN`).
+- `tests/rv64/test_rv64_hsm.S` + `tests/check_hsm.sh` — the M22 SBI HSM test
+  (`make check-hsm`, run with `--harts=4`): all four harts enter in M-mode and drop
+  to S-mode with no `mtvec` (so their `ecall`s reach Quanta's built-in SBI —
+  Quanta is the firmware). The three secondaries park themselves via SBI
+  `hart_stop`; hart 0 waits for each to report `STOPPED` (`hart_get_status`),
+  `hart_start`s each at a `worker` that `amoadd.d`-increments a shared counter and
+  stops again, then checks the counter reached `NHARTS-1`, the harts are `STOPPED`
+  again, hart 0 itself is `STARTED`, and the two error cases (out-of-range hartid →
+  `INVALID_PARAM`, already-started hart → `ALREADY_AVAILABLE`). Clean exit 0 via the
+  SiFive test finisher; a non-zero code (16..23) is the failing stage. Quanta-only
+  (multi-hart + SBI, no qemu differential), built `-mno-relax`, excluded from
+  `RV64_RUN` like the SMP test.
 - `tests/coverage.sh` — collects gcov line coverage after an instrumented build
   (`make coverage`): prefers lcov (HTML under `build/coverage`) and falls back to
   plain gcov. Observability only, like the cache/pipeline overlays.
@@ -870,6 +886,48 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   cannot have both its own M-mode trap handler and the SBI. SBI console output
   goes straight to stdout (like the UART and the `write` syscall), so it composes
   with `--quiet`.
+- SBI return values are **XLEN-wide sign-extended longs** (M22, a real RV64 bug
+  fixed): `sbi_return` writes the (negative) error code into `a0` and a value into
+  `a1`. It once cast the error through a `uint32_t`, which zero-extends in the
+  64-bit register — so an RV64 supervisor reading `a0` as a `long` saw
+  `0x00000000fffffffd` instead of `-3`, and any code comparing against a
+  sign-extended `-3` mismatched. `sbi_return` now sign-extends the error
+  (`(uint64_t)(int64_t)error`); the value fields are small non-negatives, so
+  zero-extending them is equivalent. This was invisible for a decade of milestones
+  because every earlier SBI test only checked `a0 != 0` (call failed vs. not),
+  never a specific negative code — the HSM test's explicit `INVALID_PARAM`/
+  `ALREADY_AVAILABLE` comparisons are the first to pin the exact value.
+- SBI HSM — hart state management (M22): the firmware side of SMP hart bring-up,
+  in `sbi_hsm` (`sbi.c`), reached only when Quanta is the firmware (a from-scratch
+  SMP kernel on the direct boot; under OpenSBI this path is bypassed and OpenSBI
+  provides HSM itself). Each hart carries an `hsm_state` (`HSM_STARTED`/`STOPPED`/…,
+  initialised `STARTED` in `cpu_init`). `hart_stop` parks the calling hart
+  (`halted=1`, `HSM_STOPPED`) — a stopped hart's round-robin slot is a no-op until
+  restarted, and it does **not** return. `hart_start(hartid,addr,opaque)` resolves
+  the sibling through `cpu->mem->plat->harts` (`hsm_hart`, bounds-checked against
+  `plat->nharts`), rejects an out-of-range id (`INVALID_PARAM`) or an
+  already-started hart (`ALREADY_AVAILABLE`), else `hsm_enter`s it: pc=addr,
+  priv=S, a0=hartid, a1=opaque, satp=Bare, `sstatus.SIE` cleared, reservation
+  dropped, TLB flushed, `HSM_STARTED`, unhalted. `hart_get_status` returns the
+  state; `hart_suspend` retentive (type 0) is a nop-return (WFI is a nop here) and
+  non-retentive (type 0x80000000) re-enters at the resume address. The direct-boot
+  SMP path (`setup_boot`) still brings **all** harts up at reset (xv6's `-bios
+  none` convention), so a kernel that expects that is unaffected; HSM is for a
+  kernel that instead parks and wakes harts itself. Pinned by
+  `tests/rv64/test_rv64_hsm.S` / `make check-hsm`.
+- SMP under an M-mode firmware (M22, deferred): booting **Linux** SMP under OpenSBI
+  needs every hart to enter the firmware at reset and be released by OpenSBI's
+  warm-boot path (SBI `hart_start` → a CLINT IPI). Prototyped (bring all harts into
+  `setup_firmware_boot` instead of parking the secondaries) and **reverted**:
+  bringing them all in does get a secondary CPU *into* the Linux kernel (cpu1 runs
+  and prints "Bringing up secondary CPUs"), but completing a secondary's onlining
+  livelocks — a deep blind-kernel-debug problem, and shipping it would degrade the
+  untested `--harts>1 --bios` Linux path from "boots 1 CPU" to "livelock". So the
+  firmware path still parks the secondaries (`halted=1`, a clean `HALT_EXIT`, not a
+  fault) and only the boot hart runs; the *direct* ELF path is the SMP route (xv6
+  `--harts=3`), and Quanta's own SBI HSM above serves a from-scratch SMP kernel.
+  Left as future work (the M22 "done when" — Linux `--harts=4` with the scheduler
+  across all harts — is not there yet).
 - SBI supervisor-timer delivery: `set_timer` routes through
   `cpu_arm_supervisor_timer` (cpu.c), which programs the CLINT comparator, clears
   any pending supervisor timer (STIP), and arms `sbi_timer_armed`. Each step

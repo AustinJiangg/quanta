@@ -109,6 +109,21 @@ typedef enum {
     HALT_MEM_FAULT         /* fetch/load/store outside mapped memory */
 } HaltReason;
 
+/* SBI HSM hart states (M22): the lifecycle of a hart under a firmware that owns
+ * hart bring-up. On the direct boot every hart is STARTED; the SBI HSM calls move
+ * a hart between STARTED and STOPPED (a stopped hart's scheduler slot is a no-op
+ * until hart_start wakes it) or into SUSPENDED. The numeric values are the SBI
+ * spec's hart-state ids that hart_get_status returns. */
+typedef enum {
+    HSM_STARTED         = 0,
+    HSM_STOPPED         = 1,
+    HSM_START_PENDING   = 2,
+    HSM_STOP_PENDING    = 3,
+    HSM_SUSPENDED       = 4,
+    HSM_SUSPEND_PENDING = 5,
+    HSM_RESUME_PENDING  = 6
+} HsmState;
+
 typedef struct CPU {
     uint64_t regs[32];      /* x0..x31; x0 is always zero (sext_xlen in RV32) */
     uint64_t fregs[32];     /* f0..f31 (M20): 64-bit, single-precision NaN-boxed */
@@ -124,6 +139,7 @@ typedef struct CPU {
     uint32_t priv;          /* current privilege: PRIV_U / PRIV_S / PRIV_M */
     int      trapped;       /* set within a step when a trap redirected the PC */
     int      sbi_timer_armed; /* SBI set_timer set a deadline the firmware watches */
+    int      hsm_state;     /* SBI HSM hart state (M22): HSM_STARTED/STOPPED/... */
     int      reserve_valid; /* RV-A: an LR set a reservation still held */
     uint64_t reserve_addr;  /* RV-A: physical word the reservation covers */
     TlbEntry tlb[TLB_ENTRIES]; /* M12: cached Sv32 translations */

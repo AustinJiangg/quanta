@@ -9,6 +9,27 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **SBI HSM — hart state management** — Quanta's own SBI (`src/sbi.c`) now
+  implements the Hart State Management extension (`hart_start`, `hart_stop`,
+  `hart_suspend`, `hart_get_status`), the firmware side of SMP hart bring-up. A
+  from-scratch S-mode SMP kernel that runs with Quanta as its firmware can now park
+  its secondary harts and wake them: `hart_start` re-enters a stopped hart in
+  S-mode (a0=hartid, a1=opaque, satp=Bare, supervisor interrupts off) at the given
+  address, `hart_stop` parks the caller, and `hart_get_status` reports the state.
+  Each hart tracks an `hsm_state` (`STARTED`/`STOPPED`/…); a stopped hart's
+  round-robin slot is a no-op until it is restarted. Pinned by
+  `tests/rv64/test_rv64_hsm.S` / `make check-hsm` (four harts: the secondaries stop
+  themselves, hart 0 restarts each at a worker, and the status transitions and both
+  error cases are checked). (M22)
+
+- **RV64 SBI error returns are now sign-extended** — `sbi_return` wrote the
+  (negative) SBI error code through a `uint32_t`, which zero-extends in the 64-bit
+  `a0`, so an RV64 supervisor reading `a0` as a `long` saw e.g.
+  `0x00000000fffffffd` instead of `-3`. SBI return values are XLEN-wide longs, so
+  the error is now sign-extended. Previously invisible because every earlier SBI
+  test only checked `a0 != 0`, never a specific negative code; the HSM test's
+  explicit `INVALID_PARAM`/`ALREADY_AVAILABLE` comparisons surfaced it. (M22)
+
 - **Bit-manipulation extensions (Zba/Zbb/Zbs/Zbc)** — Quanta now runs the
   ratified `B` extension (Zba address-generation, Zbb basic bit-manip, Zbs
   single-bit) plus Zbc carry-less multiply, at both RV32 and RV64 widths. They

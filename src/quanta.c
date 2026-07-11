@@ -256,9 +256,13 @@ static int setup_firmware_boot(Quanta *q, uint64_t next_addr, const char *bootar
     reg_write(&q->harts[0], 12, info_addr);     /* a2 = &fw_dynamic_info */
 
     /* SMP under an M-mode firmware (OpenSBI, then Linux SMP) needs every hart to
-     * enter the firmware and be released by SBI HSM hart_start — not yet modelled.
-     * So on the firmware path the secondaries stay parked and only the boot hart
-     * runs; the direct ELF path (setup_boot) is the SMP route (xv6 CPUS>1). */
+     * enter the firmware and be released by SBI HSM hart_start. Bringing them all
+     * in does get a secondary CPU into the Linux kernel (it runs and prints), but
+     * completing a secondary's onlining currently livelocks, so the full multi-hart
+     * Linux boot is not there yet — future work (M22). Meanwhile the secondaries
+     * stay parked and only the boot hart runs on the firmware path; the direct ELF
+     * path (setup_boot) is the SMP route (xv6 CPUS>1), and Quanta's own SBI HSM
+     * (sbi.c) serves a from-scratch SMP kernel that uses Quanta as firmware. */
     for (int i = 1; i < q->nharts; i++) {
         q->harts[i].halted = 1;
         q->harts[i].halt_reason = HALT_EXIT;    /* parked, not a fault */

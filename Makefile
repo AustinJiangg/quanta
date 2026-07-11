@@ -57,7 +57,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-smp check-os check-rv64 check-diff check-arch check-snapshot check-replay embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-smp check-hsm check-os check-rv64 check-diff check-arch check-snapshot check-replay embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean
 
 all: $(BIN)
 
@@ -171,7 +171,7 @@ RV64_ELF := $(RV64_SRC:.S=.elf)
 # The virtio test needs a --disk image and the SMP test needs --harts, so they
 # run under their own targets (check-virtio, check-smp) rather than the generic
 # exit-0/differential runner; build them, but keep them out of that list.
-RV64_RUN := $(filter-out tests/rv64/test_rv64_virtio.elf tests/rv64/test_rv64_smp.elf,$(RV64_ELF))
+RV64_RUN := $(filter-out tests/rv64/test_rv64_virtio.elf tests/rv64/test_rv64_smp.elf tests/rv64/test_rv64_hsm.elf,$(RV64_ELF))
 RV64FLAGS := -march=rv64imac_zicsr -mabi=lp64 -nostdlib -nostartfiles \
              -Ttext=0x80000000 -Itests
 
@@ -206,6 +206,11 @@ tests/rv64/test_rv64_virtio.elf: RV64FLAGS += -mno-relax
 # and its IPI handler with `la`, and sets no global pointer — so like the virtio
 # test it must keep `la` PC-relative, not have it relaxed to a gp-relative load.
 tests/rv64/test_rv64_smp.elf: RV64FLAGS += -mno-relax
+
+# The HSM test (M22) coordinates its harts through the SBI, taking the address of
+# its restart entry and its in-RAM counter with `la` — so like the SMP test it
+# must keep `la` PC-relative, not relaxed to a gp-relative load.
+tests/rv64/test_rv64_hsm.elf: RV64FLAGS += -mno-relax
 
 # Run the RV32I conformance suite (tests/test_*.S) through the emulator. Each
 # test exits 0 on success or the number of its first failed check, which quanta
@@ -313,6 +318,14 @@ check-virtio: $(BIN) tests/rv64/test_rv64_virtio.elf
 check-smp: $(BIN) tests/rv64/test_rv64_smp.elf
 	@sh tests/check_smp.sh
 
+# Exercise the SBI HSM extension (M22): boot the HSM test with --harts=4 and
+# assert a clean exit 0 — hart 0 stopped, restarted, and re-stopped its three
+# secondaries through SBI hart_start/hart_stop/hart_get_status, and the error
+# cases returned the right codes. Quanta-as-firmware + multi-hart; a non-zero
+# exit is the failing stage's id.
+check-hsm: $(BIN) tests/rv64/test_rv64_hsm.elf
+	@sh tests/check_hsm.sh
+
 # Differential test: compare quanta against a reference simulator (qemu-riscv32
 # by default; override with REF=...) on the sample programs. Skips cleanly if
 # the reference simulator is not installed.
@@ -375,7 +388,7 @@ sanitize:
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
 		check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio \
-		check-smp check-os check-rv64 check-diff check-snapshot check-replay
+		check-smp check-hsm check-os check-rv64 check-diff check-snapshot check-replay
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
 # the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`

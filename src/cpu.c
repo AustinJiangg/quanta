@@ -73,6 +73,7 @@ void cpu_init(CPU *cpu, Memory *mem, uint64_t entry_pc, int xlen) {
     cpu->priv        = PRIV_M; /* the hart resets into Machine mode */
     cpu->trapped     = 0;
     cpu->sbi_timer_armed = 0;
+    cpu->hsm_state   = HSM_STARTED; /* every hart boots STARTED; HSM may stop it */
     cpu->reserve_valid = 0;
     cpu->reserve_addr  = 0;
     mmu_flush(cpu); /* invalidate the TLB */
