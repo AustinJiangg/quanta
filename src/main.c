@@ -7,6 +7,7 @@
 #include "disasm.h"
 #include "pipeline.h"
 #include "gdbstub.h"
+#include "netstack.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -24,7 +25,7 @@
  * Usage:
  *   quanta [--version] [--trace] [--quiet] [--cache[=SIZE:WAYS:BLOCK]]
  *          [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] [--gdb[=PORT]] [--signature=FILE]
- *          [--disk=FILE] [--snapshot=FILE] [--restore=FILE]
+ *          [--disk=FILE] [--netdev=user] [--snapshot=FILE] [--restore=FILE]
  *          [--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]]
  *          [program.elf]
  *
@@ -347,6 +348,18 @@ static int dump_signature(const char *path, Quanta *q, const char *sigfile) {
     return rc;
 }
 
+/* Bridge the virtio-net device to the usermode network stack (--netdev=user).
+ * A frame the guest transmits goes device -> net_backend_tx -> the stack; a reply
+ * the stack produces goes stack -> net_deliver_to_guest -> the device's receive
+ * path. The two directions are synchronous: the stack answers during the guest's
+ * transmit, so no background polling is needed for its virtual-gateway services. */
+static void net_backend_tx(void *ctx, const uint8_t *frame, uint32_t len) {
+    netstack_input((NetStack *)ctx, frame, len);
+}
+static void net_deliver_to_guest(void *ctx, const uint8_t *frame, uint32_t len) {
+    quanta_net_rx((Quanta *)ctx, frame, len);
+}
+
 int main(int argc, char **argv) {
     int trace = 0;
     int quiet = 0;
@@ -367,6 +380,8 @@ int main(int argc, char **argv) {
     const char *snappath = NULL;   /* --snapshot=FILE: save machine state on exit (E10) */
     const char *restorepath = NULL;/* --restore=FILE: resume from a saved snapshot (E10) */
     int nharts = 1;             /* --harts=N: number of harts for SMP (M19) */
+    const char *netdev = NULL;  /* --netdev=user: attach the usermode network stack (M23) */
+    NetStack *ns = NULL;        /* the usermode network stack, when --netdev=user */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
             printf("quanta %s\n", quanta_version());
@@ -462,11 +477,18 @@ int main(int argc, char **argv) {
                         argv[i] + 8, QUANTA_MAX_HARTS);
                 return 2;
             }
+        } else if (strncmp(argv[i], "--netdev=", 9) == 0) {
+            netdev = argv[i] + 9;
+            if (strcmp(netdev, "user") != 0) {
+                fprintf(stderr, "unknown --netdev backend '%s' (want 'user')\n",
+                        netdev);
+                return 2;
+            }
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] "
-                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] "
+                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [--netdev=user] "
                     "[--snapshot=FILE] [--restore=FILE] "
                     "[--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]] "
                     "[program.elf]\n",
@@ -477,7 +499,7 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
                     "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] "
-                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] "
+                    "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE] [--netdev=user] "
                     "[--snapshot=FILE] [--restore=FILE] "
                     "[--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]] "
                     "[program.elf]\n",
@@ -556,6 +578,20 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Optionally attach the usermode network stack to the virtio-net device: it
+     * presents a virtual gateway (10.0.2.0/24) the guest can DHCP against and
+     * ping, needing no host privileges. The device's transmit path feeds the
+     * stack, and the stack's replies come back through the receive path. */
+    if (netdev) {
+        ns = netstack_new(net_deliver_to_guest, q);
+        if (!ns) {
+            fprintf(stderr, "failed to create the network stack\n");
+            quanta_destroy(q);
+            return 1;
+        }
+        quanta_net_set_backend(q, net_backend_tx, ns);
+    }
+
     /* The loader set PC to the entry point and sp to the top of the region. */
     uint64_t entry = quanta_pc(q);
     uint64_t sp    = quanta_reg(q, 2);
@@ -619,6 +655,7 @@ int main(int argc, char **argv) {
             printf("GDB session ended.\n");
         }
         quanta_destroy(q);
+        netstack_free(ns);
         return gdb_status;
     }
 
@@ -721,5 +758,6 @@ int main(int argc, char **argv) {
     if (sig_failed && status == 0) status = 1;  /* surface a dump failure */
     if (snap_failed && status == 0) status = 1; /* surface a snapshot-write failure */
     quanta_destroy(q);
+    netstack_free(ns);
     return status;
 }

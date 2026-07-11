@@ -450,6 +450,18 @@ int quanta_uart_input(Quanta *q, uint8_t byte) {
     return plat_uart_rx(&q->plat, byte);
 }
 
+int quanta_net_rx(Quanta *q, const uint8_t *frame, uint32_t len) {
+    if (!q || !q->loaded || !frame) return 0;
+    return plat_net_rx(&q->plat, frame, len);
+}
+
+void quanta_net_set_backend(Quanta *q,
+                            void (*tx)(void *ctx, const uint8_t *frame, uint32_t len),
+                            void *ctx) {
+    if (!q) return;
+    plat_net_set_backend(&q->plat, tx, ctx);
+}
+
 /*
  * Snapshot / restore (E10). The whole mutable machine is a fixed-size struct plus
  * two heap buffers (guest RAM and the optional in-memory disk); everything else —

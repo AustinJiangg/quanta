@@ -1314,10 +1314,29 @@ transmitted frames straight back to receive**, which needs no host networking an
 is what the deterministic test drives: `tests/rv64/test_rv64_virtio_net.S` (23
 checks — identity, feature handshake, MAC read, both queues, and a
 transmit→loopback→receive round trip with the interrupt) runs under `make
-check-virtnet`, quanta-only like the block test. Still to come: the Linux-facing
-**TAP backend** (`feat: add a tap backend`) and the from-scratch **usermode
-NAT/SLIRP stack** (`feat: add a usermode nat network stack`), plus a `virtio,mmio`
-DTB node so a guest Linux discovers the device.
+check-virtnet`, quanta-only like the block test.
+
+**The usermode network stack has landed (second commit).** `src/netstack.{h,c}` is
+a from-scratch, no-dependency, no-privilege virtual gateway on 10.0.2.0/24 (the
+qemu-slirp layout), attached to the device by the new `--netdev=user` flag. It is
+a pure ethernet-frame processor (`netstack_input` in, replies out through a
+callback, no CPU/platform coupling), answering **ARP** (for the gateway/DNS IPs),
+**ICMP echo** (ping the gateway), and **DHCP** (DISCOVER→OFFER, REQUEST→ACK,
+handing the guest 10.0.2.15 with the gateway/DNS/mask). It is pinned two ways:
+`tests/net_test.c` drives the stack standalone (ARP/ICMP/DHCP and the IP/ICMP
+checksums), and `tests/rv64/test_rv64_net.S` ARPs the gateway through the real
+virtio-net device under `--netdev=user` (`make check-net`), proving the full
+device↔backend↔stack↔CPU path. The `main.c` bridge (`net_backend_tx` /
+`net_deliver_to_guest`) is synchronous — a reply is produced during the guest's
+transmit — so no background pump is needed yet.
+
+Still to come, chosen for testability/ethos over the roadmap's original
+TAP-then-NAT order (TAP needs `/dev/net/tun` + `CAP_NET_ADMIN`, so it can't be
+tested deterministically here): **outbound UDP/TCP NAT to real host sockets** and a
+**DNS relay** (so the guest reaches the outside — `feat: add a usermode nat network
+stack`), a **`virtio,mmio` DTB node** so a guest Linux discovers the device, and
+the **Linux TAP backend** (`feat: add a tap backend`). The host-socket pieces need
+a real guest to validate, so they are manual milestones like the OS boots.
 
 - [ ] **Build:** a virtio-net device (modern, RX/TX virtqueues) in `device.c`, and
   a host backend in tiers: first a Linux **TAP** backend behind a flag, then a

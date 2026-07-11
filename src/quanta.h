@@ -145,6 +145,21 @@ QuantaStatus quanta_attach_disk(Quanta *q, const char *path);
  * full (hold the byte and retry). The CLI pumps host stdin through here. */
 int quanta_uart_input(Quanta *q, uint8_t byte);
 
+/* --- optional network device --- */
+
+/* Deliver a received ethernet frame to the virtio-net device (M23): a host
+ * network backend calls this for each frame arriving from the outside. Returns 1
+ * if buffered/delivered, 0 if the frame is empty/oversized or the receive FIFO is
+ * full. */
+int quanta_net_rx(Quanta *q, const uint8_t *frame, uint32_t len);
+
+/* Attach a host backend for frames the guest transmits: `tx(ctx, frame, len)` is
+ * called once per outgoing ethernet frame. tx = NULL restores the device's
+ * internal loopback. The CLI wires this to its usermode network stack. */
+void quanta_net_set_backend(Quanta *q,
+                            void (*tx)(void *ctx, const uint8_t *frame, uint32_t len),
+                            void *ctx);
+
 /* --- optional cache model --- */
 
 /* Attach a set-associative LRU cache over data accesses (geometry as the

@@ -95,6 +95,7 @@ make check-sbi     # check the SBI on a bare-metal S-mode program (needs cross-t
 make check-uart-rx # check UART receive (piped stdin) and the --disk backend (M18)
 make check-virtio  # check the virtio-mmio block device on a --disk image (M18)
 make check-virtnet # check the virtio-mmio network device via loopback (M23)
+make check-net     # check the usermode network stack (ARP/ICMP/DHCP) (M23)
 make check-smp     # check SMP: 4 harts, contended LR/SC, a CLINT IPI (M19)
 make check-hsm     # check SBI HSM: park/restart secondary harts (M22)
 make check-snapshot # check machine snapshot/restore replays a run bit-for-bit (E10)
@@ -127,7 +128,10 @@ optional `K`/`M`/`G` suffix, e.g. `--memory=8M`) to grow the guest RAM region
 beyond its ELF image — spare RAM lands above the image for an OS-style guest to
 manage, and the boot DTB advertises the real size (`tests/os/` needs it). Add
 `--disk=FILE` to attach a raw block-device image (read wholly into memory) that
-the virtio-mmio block device serves as an OS's root filesystem (M18). With the
+the virtio-mmio block device serves as an OS's root filesystem (M18). Add
+`--netdev=user` to attach the from-scratch usermode network stack to the
+virtio-net device: it presents a virtual gateway on 10.0.2.0/24 (the qemu-slirp
+layout) the guest can DHCP against and ping, with no host privileges (M23). With the
 `--bios`/`--kernel` firmware-boot path, add `--initrd=FILE` to stage a cpio
 initramfs in RAM as the kernel's root filesystem (advertised via the DTB
 `/chosen` `linux,initrd-start`/`-end`) — how Linux reaches its `/init` (M18). Add
@@ -215,6 +219,16 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   structure block, deduplicated strings) from a `DtbConfig` describing the RAM
   and the M13 devices — no external `dtc`. A pure serialiser with no machine
   state; the boot handoff that *uses* it lives in `quanta.c`'s `setup_boot`.
+- `src/netstack.{h,c}` — the usermode network backend for virtio-net (M23): a
+  from-scratch, no-dependency, no-privilege network stack presenting a virtual
+  gateway on 10.0.2.0/24 (the qemu-slirp layout). A pure ethernet-frame processor
+  — `netstack_input(ns, frame, len)` parses a guest frame and emits replies
+  through the callback given at `netstack_new`, holding no reference to the CPU or
+  platform (so `tests/net_test.c` drives it standalone). Answers ARP for the
+  gateway/DNS IPs, ICMP echo to the gateway, and DHCP (DISCOVER→OFFER,
+  REQUEST→ACK, handing the guest 10.0.2.15). `main.c`'s `--netdev=user` bridges it
+  to the device (device transmit → `netstack_input`, replies → `quanta_net_rx`).
+  Outbound UDP/TCP NAT to host sockets and a DNS relay are the next M23 step.
 - `src/decode.h` — shared instruction decoding: field-extraction and
   immediate-decoding helpers, the opcode map, and ABI register names, all
   `static inline`. The executor and the disassembler decode through this, so
@@ -354,6 +368,8 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
 - `src/main.c` — the CLI driver, a thin client over `quanta.h`: argument parsing,
   the `--trace` narration, the `--pipeline`/`--cache` overlays, the `--gdb` stub
   hand-off, the `--signature` arch-test dump, `--disk` attachment, the
+  `--netdev=user` network backend (creating the `netstack` and bridging it to the
+  virtio-net device, M23), the
   `--snapshot`/`--restore` machine state save/resume (E10), the
   `--bios`/`--kernel` firmware-boot path (loads an M-mode firmware that hands off
   to an S-mode OS via `quanta_load_firmware`), the
@@ -1069,8 +1085,32 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   function pointer is NULL on this path, so it round-trips through a snapshot
   harmlessly; a real backend will need it re-wired on restore (a commit-2 concern).
   A DTB `virtio,mmio` node is deferred to the Linux-networking step, as the block
-  device's was — the bare-metal test hardcodes the address. TAP and usermode-NAT
-  backends are the next two M23 commits.
+  device's was — the bare-metal test hardcodes the address.
+- Usermode network stack (M23, `src/netstack.c`, `--netdev=user`): the first host
+  backend for virtio-net — a from-scratch, no-privilege virtual gateway on
+  10.0.2.0/24 (the qemu-slirp layout: guest 10.0.2.15, gateway 10.0.2.2, DNS
+  10.0.2.3, gateway MAC `52:55:0a:00:02:02`). It is a **pure ethernet-frame
+  processor** with no CPU/platform dependency — `netstack_input` parses a guest
+  frame and emits replies through a callback — so `tests/net_test.c` drives it
+  standalone (ARP/ICMP/DHCP + checksums), the strongest net for the protocol code,
+  while `tests/rv64/test_rv64_net.S` (an ARP round trip under `--netdev=user`,
+  `make check-net`) proves the full device↔backend↔stack↔CPU path the loopback
+  test cannot. Design points: (1) the virtual-gateway services are **synchronous**
+  — a reply is produced during the guest's transmit notify (device →
+  `net_backend_tx` → `netstack_input` → `net_deliver_to_guest` → `quanta_net_rx` →
+  the receive FIFO), so **no main-loop pump is needed** for this commit (an async
+  host-socket/TAP backend later will need one). (2) All packet parsing is
+  bounds-checked against the frame length (guest-controlled input); the IP header
+  length from the header is clamped to what the frame actually carries. (3) The IP
+  and ICMP checksums are computed (RFC 1071); the UDP checksum is left 0 (legal on
+  IPv4). (4) DHCP replies are broadcast (the client has no address yet), pad the
+  BOOTP body to 300 bytes, and echo the request's xid. (5) The `main.c` bridge owns
+  the `NetStack` and frees it on every exit path (gdb and normal), since
+  `quanta_destroy` does not (it is external to the engine). Outbound UDP/TCP NAT to
+  real host sockets, a DNS relay, a `virtio,mmio` DTB node (so Linux discovers the
+  device), and a Linux TAP backend are the remaining M23 steps — the host-socket
+  ones need a real guest to validate, so they are manual milestones like the OS
+  boots, not deterministic checks.
 - Booting an OS (M16, `tests/os/`): the teaching kernel is *entered in M-mode*
   (Quanta's loader enters every ELF in M-mode), and its `boot.S` does the
   drop-to-S itself — the same pattern `test_sbi`/`test_stimer` use — rather than

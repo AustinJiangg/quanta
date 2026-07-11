@@ -2,6 +2,7 @@
 /quanta
 /examples/embed
 /tests/snapshot_test
+/tests/net_test
 /fuzz/fuzz_elf
 /fuzz/fuzz_decode
 /fuzz/*.replay
