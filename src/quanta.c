@@ -251,21 +251,17 @@ static int setup_firmware_boot(Quanta *q, uint64_t next_addr, const char *bootar
             info[i * 8 + b] = (uint8_t)(words[i] >> (8 * b));
     if (mem_load(&q->mem, info_addr, info, sizeof info) != 0) return -1;
 
-    reg_write(&q->harts[0], 10, cfg.boot_hart); /* a0 = hartid */
-    reg_write(&q->harts[0], 11, dtb_addr);      /* a1 = DTB */
-    reg_write(&q->harts[0], 12, info_addr);     /* a2 = &fw_dynamic_info */
-
-    /* SMP under an M-mode firmware (OpenSBI, then Linux SMP) needs every hart to
-     * enter the firmware and be released by SBI HSM hart_start. Bringing them all
-     * in does get a secondary CPU into the Linux kernel (it runs and prints), but
-     * completing a secondary's onlining currently livelocks, so the full multi-hart
-     * Linux boot is not there yet — future work (M22). Meanwhile the secondaries
-     * stay parked and only the boot hart runs on the firmware path; the direct ELF
-     * path (setup_boot) is the SMP route (xv6 CPUS>1), and Quanta's own SBI HSM
-     * (sbi.c) serves a from-scratch SMP kernel that uses Quanta as firmware. */
-    for (int i = 1; i < q->nharts; i++) {
-        q->harts[i].halted = 1;
-        q->harts[i].halt_reason = HALT_EXIT;    /* parked, not a fault */
+    /* SMP under an M-mode firmware (OpenSBI, then Linux SMP): every hart enters
+     * the firmware at reset with the boot registers set (a0 = its own hartid, a1 =
+     * DTB, a2 = &fw_dynamic_info). OpenSBI's boot-hart lottery lets the designated
+     * boot hart (fw_dynamic boot_hart, here 0) cold-boot and jump to the OS, while
+     * the others fall into OpenSBI's warm-boot / HSM wait loop until Linux releases
+     * each via SBI hart_start (a CLINT IPI). So the secondaries run from reset
+     * rather than being parked. */
+    for (int i = 0; i < q->nharts; i++) {
+        reg_write(&q->harts[i], 10, (uint64_t)i);  /* a0 = this hart's id */
+        reg_write(&q->harts[i], 11, dtb_addr);     /* a1 = DTB */
+        reg_write(&q->harts[i], 12, info_addr);    /* a2 = &fw_dynamic_info */
     }
     return 0;
 }

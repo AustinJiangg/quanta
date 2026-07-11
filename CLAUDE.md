@@ -915,19 +915,40 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   none` convention), so a kernel that expects that is unaffected; HSM is for a
   kernel that instead parks and wakes harts itself. Pinned by
   `tests/rv64/test_rv64_hsm.S` / `make check-hsm`.
-- SMP under an M-mode firmware (M22, deferred): booting **Linux** SMP under OpenSBI
-  needs every hart to enter the firmware at reset and be released by OpenSBI's
-  warm-boot path (SBI `hart_start` → a CLINT IPI). Prototyped (bring all harts into
-  `setup_firmware_boot` instead of parking the secondaries) and **reverted**:
-  bringing them all in does get a secondary CPU *into* the Linux kernel (cpu1 runs
-  and prints "Bringing up secondary CPUs"), but completing a secondary's onlining
-  livelocks — a deep blind-kernel-debug problem, and shipping it would degrade the
-  untested `--harts>1 --bios` Linux path from "boots 1 CPU" to "livelock". So the
-  firmware path still parks the secondaries (`halted=1`, a clean `HALT_EXIT`, not a
-  fault) and only the boot hart runs; the *direct* ELF path is the SMP route (xv6
-  `--harts=3`), and Quanta's own SBI HSM above serves a from-scratch SMP kernel.
-  Left as future work (the M22 "done when" — Linux `--harts=4` with the scheduler
-  across all harts — is not there yet).
+- SMP under an M-mode firmware (M22): booting **Linux SMP under OpenSBI** works —
+  `setup_firmware_boot` (quanta.c) now brings **every** hart into the firmware at
+  reset (each with a0=hartid, a1=DTB, a2=`fw_dynamic_info`) instead of parking the
+  secondaries. OpenSBI's boot-hart lottery cold-boots one and drops it into the OS;
+  the rest fall into OpenSBI's HSM wait loop and are released when Linux calls SBI
+  `hart_start` (which rings the target's CLINT `msip`). **Linux 6.6 boots
+  `--harts=4`** — `smp: Brought up 1 node, 4 CPUs`, and the test `/init`'s `cpuinfo`
+  lists all four. The single machine-model gap this needed was **AIA `mtopi`**: see
+  the AIA-mtopi gotcha below — without it the inter-processor MSI storms and the
+  boot "livelocks" (the symptom the earlier prototype hit and could not get past).
+  `nharts==1 --bios` is byte-identical to before (the bring-up loop sets hart 0's
+  a0/a1/a2 exactly as the old single-hart code did). The *direct* ELF path
+  (`setup_boot`, xv6 `--harts=3`) is unchanged, and Quanta's own SBI HSM still
+  serves a from-scratch SMP kernel that uses Quanta as firmware.
+- AIA `mtopi`/`stopi` (Smaia/Ssaia top-interrupt CSRs, M22): qemu's prebuilt
+  OpenSBI detects these CSRs present — our lenient CSR file *answers* an unknown
+  CSR (returns stored 0) rather than trapping, so OpenSBI's trap-probe feature
+  detection concludes Smaia is present — and then drives its **entire M-mode
+  interrupt dispatch off `mtopi`** (CSR 0xfb0): read the top pending interrupt,
+  service it, re-read until zero. Left unimplemented, `mtopi` read 0, so OpenSBI saw
+  every machine software interrupt (the IPI that wakes/reschedules a secondary hart)
+  as "nothing pending", returned **without clearing the CLINT `msip`**, and the MSI
+  re-fired every instruction — an IPI storm that reads as a livelock. It was
+  invisible on a uniprocessor (one hart takes no IPI, and its timer uses Sstc, so
+  the `mtopi` path is dead code) — the first machine interrupt OpenSBI must dispatch
+  in SMP is the wake IPI, which hit it immediately. Fix: `topi_value` in cpu.c
+  implements `mtopi`/`stopi` as read-only views of the highest default-priority
+  interrupt pending **and** enabled for the level (M-level = `mip & mie & ~mideleg`,
+  S-level = the delegated ones), encoded AIA-style (IID in bits [27:16], a non-zero
+  IPRIO in [7:0]; 0 when none), ignoring the global `mstatus.MIE` gate the way
+  firmware reads it mid-handler. This matches qemu (whose virt CPU implements
+  `mtopi`, which is *why* OpenSBI took this path). We model only these two CSRs, not
+  the full IMSIC/APLIC — enough for OpenSBI's dispatch; Linux still uses the PLIC
+  (our DTB advertises `riscv,plic0`, no APLIC/IMSIC node) and never reads `stopi`.
 - SBI supervisor-timer delivery: `set_timer` routes through
   `cpu_arm_supervisor_timer` (cpu.c), which programs the CLINT comparator, clears
   any pending supervisor timer (STIP), and arms `sbi_timer_armed`. Each step

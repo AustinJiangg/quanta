@@ -9,6 +9,28 @@ once in `src/quanta.h` (`QUANTA_VERSION_*`) and surfaced by `quanta --version`.
 
 ### Added
 
+- **Linux boots SMP under OpenSBI** — the `--bios` firmware path now brings
+  **every** hart into the firmware at reset (a0=hartid, a1=DTB, a2=`fw_dynamic_info`)
+  instead of parking the secondaries, so a mainline **Linux 6.6 boots SMP on
+  Quanta**: `quanta --harts=4 --bios=<opensbi> --kernel=Image …` reaches
+  `smp: Brought up 1 node, 4 CPUs` with the scheduler running across all harts, and
+  the test `/init`'s new `cpuinfo` command (procfs mounted at boot) lists every hart
+  from userspace. OpenSBI's boot-hart lottery cold-boots one hart into the OS and
+  leaves the rest in its HSM wait loop, released when Linux calls SBI `hart_start`
+  (a CLINT IPI). `--harts=1 --bios` is byte-identical to before. (M22)
+
+- **AIA `mtopi`/`stopi` top-interrupt CSRs** — Quanta now implements the Smaia/Ssaia
+  machine/supervisor top-interrupt registers (CSR 0xfb0/0xdb0) as read-only views of
+  the highest default-priority interrupt pending and enabled for that level (AIA
+  encoding: IID in bits [27:16]). qemu's prebuilt OpenSBI detects these CSRs present
+  and drives its entire M-mode interrupt dispatch off `mtopi`; unimplemented, it read
+  0, so every inter-processor MSI was seen as "nothing pending" and OpenSBI never
+  cleared the CLINT `msip` — an IPI storm that made SMP Linux appear to livelock
+  during secondary-CPU bring-up. Invisible on a uniprocessor (no IPIs; the timer uses
+  Sstc), so it only surfaced with `--harts>1 --bios`. This is the machine-model fix
+  that unblocked SMP Linux, and it matches qemu (whose virt CPU implements `mtopi`).
+  (M22)
+
 - **SBI HSM — hart state management** — Quanta's own SBI (`src/sbi.c`) now
   implements the Hart State Management extension (`hart_start`, `hart_stop`,
   `hart_suspend`, `hart_get_status`), the firmware side of SMP hart bring-up. A

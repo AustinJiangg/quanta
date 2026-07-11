@@ -21,9 +21,14 @@
  */
 
 /* asm-generic syscall numbers (arch/riscv shares include/uapi/asm-generic). */
+#define SYS_openat  56
+#define SYS_close   57
 #define SYS_read    63
 #define SYS_write   64
+#define SYS_mount   40
 #define SYS_reboot 142
+
+#define AT_FDCWD   (-100)   /* openat: resolve the path relative to cwd */
 
 /* reboot(2) magics and the power-off command (include/uapi/linux/reboot.h). */
 #define REBOOT_MAGIC1    0xfee1deadL
@@ -49,9 +54,32 @@ static long sys4(long n, long a0, long a1, long a2, long a3) {
     return x0;
 }
 
+static long sys5(long n, long a0, long a1, long a2, long a3, long a4) {
+    register long x0 asm("a0") = a0;
+    register long x1 asm("a1") = a1;
+    register long x2 asm("a2") = a2;
+    register long x3 asm("a3") = a3;
+    register long x4 asm("a4") = a4;
+    register long x7 asm("a7") = n;
+    asm volatile("ecall" : "+r"(x0)
+                 : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x7) : "memory");
+    return x0;
+}
+
 static long slen(const char *s) { long n = 0; while (s[n]) n++; return n; }
 static void puts_(const char *s) { sys3(SYS_write, 1, (long)s, slen(s)); }
 static void putn_(const char *s, long n) { sys3(SYS_write, 1, (long)s, n); }
+
+/* Copy /proc/cpuinfo to the console — proof, from userspace, of every hart the
+ * kernel brought online (the SMP boot's "done when"). procfs is mounted at start. */
+static void cat_cpuinfo(void) {
+    long fd = sys4(SYS_openat, AT_FDCWD, (long)"/proc/cpuinfo", 0 /*O_RDONLY*/, 0);
+    if (fd < 0) { puts_("cpuinfo: /proc not mounted\n"); return; }
+    char b[512];
+    long r;
+    while ((r = sys3(SYS_read, fd, (long)b, sizeof b)) > 0) putn_(b, r);
+    sys3(SYS_close, fd, 0, 0);
+}
 
 /* Does the console line `buf[0..n)` (trailing CR/LF stripped) equal `lit`? */
 static int line_is(const char *buf, long n, const char *lit) {
@@ -63,8 +91,10 @@ static int line_is(const char *buf, long n, const char *lit) {
 }
 
 void __attribute__((noreturn)) _start(void) {
+    sys5(SYS_mount, (long)"proc", (long)"/proc", (long)"proc", 0, 0); /* for cpuinfo */
+
     puts_("\n[ quanta ] userspace reached: PID 1 running, no libc, raw syscalls.\n");
-    puts_("commands: help, echo <text>, poweroff (or Ctrl-A x to quit Quanta)\n");
+    puts_("commands: help, echo <text>, cpuinfo, poweroff (or Ctrl-A x to quit)\n");
 
     char buf[256];
     for (;;) {
@@ -75,7 +105,11 @@ void __attribute__((noreturn)) _start(void) {
             line_is(buf, n, "halt"))
             break;
         if (line_is(buf, n, "help")) {
-            puts_("builtins: help, echo <text>, poweroff\n");
+            puts_("builtins: help, echo <text>, cpuinfo, poweroff\n");
+            continue;
+        }
+        if (line_is(buf, n, "cpuinfo")) {     /* list the harts the kernel onlined */
+            cat_cpuinfo();
             continue;
         }
         if (n > 5 && buf[0] == 'e' && buf[1] == 'c' && buf[2] == 'h' &&

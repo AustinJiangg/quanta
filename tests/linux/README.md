@@ -84,3 +84,25 @@ quanta$ poweroff
 The console is interactive: type at the `quanta$` prompt and the kernel's tty
 line discipline echoes it, just like a real serial console. `Ctrl-A x` quits
 Quanta itself.
+
+## SMP (M22)
+
+Add `--harts=N` (up to 8) to boot Linux on multiple harts. All harts enter the
+OpenSBI firmware at reset; OpenSBI cold-boots one and releases the rest through
+the SBI hart-start protocol as Linux brings them online. The kernel reports
+`smp: Bringing up secondary CPUs ...` / `smp: Brought up 1 node, N CPUs`, and the
+`cpuinfo` command (the `/init` mounts procfs and reads `/proc/cpuinfo`) lists every
+hart:
+
+```sh
+quanta --harts=4 --bios=… --kernel=Image --initrd=build/linux/initramfs.cpio \
+       --memory=128M --max-steps=0 --append="earlycon=uart8250,mmio,0x10000000 console=ttyS0"
+...
+quanta$ cpuinfo
+processor : 0
+hart      : 0
+isa       : rv64imac_zicntr_zicsr_zifencei_zihpm
+mmu       : sv39
+...
+processor : 3
+```

@@ -10,8 +10,9 @@
  * synthesising the header directly can).
  *
  * It packs a fixed, minimal tree — a `/dev` directory, a `/dev/console`
- * character device (major 5, minor 1), and `/init` (the given binary) — which is
- * all a single-program userspace needs. Output goes to stdout:
+ * character device (major 5, minor 1), an empty `/proc` directory (init mounts
+ * procfs there so `cpuinfo` can list the harts), and `/init` (the given binary) —
+ * which is all a single-program userspace needs. Output goes to stdout:
  *   mkcpio path/to/init > initramfs.cpio
  *
  * The newc entry is a 110-byte ASCII header (13 fixed 8-hex-digit fields after
@@ -89,6 +90,7 @@ int main(int argc, char **argv) {
      * create parent directories. */
     entry("dev", TYPE_DIR | 0755, 2, 0, 0, NULL, 0);
     entry("dev/console", TYPE_CHR | 0600, 1, 5, 1, NULL, 0);   /* the kernel console */
+    entry("proc", TYPE_DIR | 0755, 2, 0, 0, NULL, 0);          /* mountpoint for procfs */
     entry("init", TYPE_REG | 0755, 1, 0, 0, init, init_len);
     entry("TRAILER!!!", 0, 1, 0, 0, NULL, 0);                  /* end of archive */
 

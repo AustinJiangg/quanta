@@ -1239,10 +1239,12 @@ disassembler mirrors the decode and matches binutils exactly (pinned by
 
 ### Stage 6 — Platform realism, boot a distribution (M22–M24)
 
-## M22 — SMP under firmware (SBI HSM) — SBI HSM DONE; Linux multi-hart deferred
+## M22 — SMP under firmware (SBI HSM) (DONE)
 
-The `--bios` firmware path parks the secondary harts (M19); booting Linux SMP
-under OpenSBI needs the harts to come up through the SBI hart-start protocol.
+The `--bios` firmware path parked the secondary harts (M19); booting Linux SMP
+under OpenSBI needs the harts to come up through the SBI hart-start protocol —
+now done, so **Linux 6.6 boots SMP on Quanta** (`--harts=4`, all four CPUs
+online, the scheduler running across them).
 
 - [x] **Build:** the SBI **HSM** extension
   (`hart_start`/`hart_stop`/`hart_suspend`/`hart_get_status`) in Quanta's own
@@ -1253,24 +1255,44 @@ under OpenSBI needs the harts to come up through the SBI hart-start protocol.
   also flushed out a real RV64 SBI bug: error returns must be **sign-extended**
   XLEN longs (`sbi_return` cast a0 to `int32_t`→`uint32_t`, so an RV64 caller saw
   `0x00000000fffffffd`, not `-3`).
-- [ ] **Build (deferred):** on the firmware path, bring every hart into the
-  firmware at reset and let OpenSBI's warm-boot path release them via the CLINT IPI
-  (the hart-start handshake), instead of parking the secondaries. Prototyped and
-  reverted: bringing all harts in does get a secondary CPU *into* the Linux kernel
-  (cpu1 runs and prints), but completing a secondary's onlining livelocks — a deep
-  blind-kernel-debug rabbit hole, and shipping it would degrade the untested
-  `--harts>1 --bios` Linux path from "boots 1 CPU" to "livelock". Left as future
-  work; the secondaries stay parked on the firmware path.
-- [x] **ISA:** none new — the hart bring-up / HSM protocol.
-- [x] **Concept:** hart bring-up, the boot-hart lottery, and the HSM state machine.
-- [ ] **Done when:** Linux boots SMP under OpenSBI (`--harts=4`) and `/proc/cpuinfo`
-  shows every hart with the scheduler running across them. *(Not there yet — see the
-  deferred build item. The SBI HSM half is pinned by `tests/rv64/test_rv64_hsm.S` /
-  `make check-hsm`: four harts, secondaries park via `hart_stop`, hart 0 restarts
-  each at a worker via `hart_start`, checks the status transitions and the error
-  codes.)*
-- [x] **Commits:** `feat: add sbi hsm hart management`.
-  `feat: bring up all harts under firmware` — deferred (see above).
+- [x] **Build (Linux SMP under firmware):** on the `--bios` firmware path, bring
+  **every** hart into the firmware at reset (a0=hartid, a1=DTB, a2=fw_dynamic_info)
+  instead of parking the secondaries — OpenSBI's boot-hart lottery cold-boots one
+  and the rest fall into its HSM wait loop, released by Linux via SBI `hart_start`
+  (a CLINT IPI). The one machine-model gap this exposed was **AIA `mtopi`/`stopi`**
+  (Smaia/Ssaia top-interrupt CSRs): qemu's prebuilt OpenSBI detects these CSRs
+  present (our lenient CSR file answered them instead of trapping) and drives its
+  **entire M-mode interrupt dispatch off `mtopi`** — read the top interrupt,
+  service it, re-read until zero. With `mtopi` unimplemented it read 0, so every
+  inter-processor interrupt (the machine software interrupt that wakes/reschedules
+  a secondary) was seen as "nothing pending": OpenSBI returned without clearing the
+  CLINT `msip`, and the MSI re-fired forever — the "livelock" (really an IPI
+  storm). It was invisible on a uniprocessor because a single hart takes no IPI and
+  uses Sstc for its timer, so the `mtopi` dispatch path was dead code. Implementing
+  `mtopi`/`stopi` as read-only views of the highest-priority pending-and-enabled
+  interrupt (AIA default priority, IID in bits [27:16]) fixed it, matching qemu.
+- [x] **Build (SBI HSM):** the SBI **HSM** extension
+  (`hart_start`/`hart_stop`/`hart_suspend`/`hart_get_status`) in Quanta's own
+  `sbi.c`, so a from-scratch SMP kernel that uses Quanta-as-firmware brings its
+  secondaries down and up. A stopped hart's round-robin slot is a no-op until
+  `hart_start` re-enters it in S-mode (a0=hartid, a1=opaque, satp=Bare, SIE off);
+  `hart_stop` parks the caller; `hart_get_status` reports the state machine. This
+  also flushed out a real RV64 SBI bug: error returns must be **sign-extended**
+  XLEN longs (`sbi_return` cast a0 to `int32_t`→`uint32_t`, so an RV64 caller saw
+  `0x00000000fffffffd`, not `-3`).
+- [x] **ISA:** the AIA Smaia/Ssaia `mtopi`/`stopi` CSRs; the hart bring-up / HSM
+  protocol.
+- [x] **Concept:** hart bring-up, the boot-hart lottery, the HSM state machine, and
+  how firmware feature-detection (a lenient CSR file mis-answering a probe) can
+  steer the whole interrupt path.
+- [x] **Done when:** Linux boots SMP under OpenSBI (`--harts=4`) with every hart
+  online and the scheduler running across them — `smp: Brought up 1 node, 4 CPUs`,
+  and the test `/init`'s `cpuinfo` (procfs) lists all four. The SBI HSM half is
+  pinned by `tests/rv64/test_rv64_hsm.S` / `make check-hsm`: four harts, secondaries
+  park via `hart_stop`, hart 0 restarts each at a worker via `hart_start`, checks
+  the status transitions and the error codes.
+- [x] **Commits:** `feat: add sbi hsm hart management`,
+  `feat: boot linux smp under opensbi`.
 
 ## M23 — virtio-net and a network path
 

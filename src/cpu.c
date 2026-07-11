@@ -702,6 +702,40 @@ static void exec_store(CPU *cpu, uint32_t inst) {
  * privilege and read-only checks in exec_csr — funnel through.
  * ------------------------------------------------------------------------ */
 
+/* The live device-driven mip: the stored bits with the CLINT/PLIC-owned ones
+ * (MSIP/MTIP/MEIP/SEIP) recomputed from the platform. A const mirror of
+ * effective_mip's read half, so mtopi/stopi below (and any const reader) see the
+ * current pending set without mutating the CSR file. */
+static uint32_t live_mip(const CPU *cpu) {
+    uint32_t mip = cpu->csr[CSR_MIP];
+    if (cpu->mem->plat) {
+        mip &= ~(MIP_MSIP | MIP_MTIP | MIP_MEIP | MIP_SEIP);
+        mip |= plat_mip_bits(cpu->mem->plat, cpu->hartid);
+    }
+    return mip;
+}
+
+/* AIA mtopi/stopi (Smaia/Ssaia): report the highest default-priority interrupt
+ * pending and enabled for this level, encoded as IID in bits [27:16] and a
+ * non-zero IPRIO in [7:0] (0 when none). `to_s` selects S-level (interrupts
+ * delegated to S via mideleg) vs M-level (the rest). OpenSBI, having found these
+ * CSRs present, drives its interrupt dispatch off mtopi — it reads the top
+ * interrupt, services it, and re-reads until zero — so this must track the live
+ * pending set and drop to zero once the source is cleared. Unlike take_interrupt
+ * this ignores the global mstatus.MIE gate: firmware reads it inside its handler
+ * (MIE already cleared) to learn what to service. The AIA default priority order
+ * is MEI > MSI > MTI > SEI > SSI > STI > LCOFI(13). */
+static uint64_t topi_value(const CPU *cpu, int to_s) {
+    uint32_t pend = live_mip(cpu) & (uint32_t)cpu->csr[CSR_MIE];
+    uint32_t del  = (uint32_t)cpu->csr[CSR_MIDELEG];
+    pend &= to_s ? del : ~del;
+    static const int order[] = { IRQ_MEXT, IRQ_MSOFT, IRQ_MTIMER,
+                                 IRQ_SEXT, IRQ_SSOFT, IRQ_STIMER, 13 };
+    for (unsigned k = 0; k < sizeof order / sizeof order[0]; k++)
+        if (pend & (1u << order[k])) return ((uint64_t)order[k] << 16) | 1u;
+    return 0;
+}
+
 /* Read CSR `addr`. The three unprivileged counters (and their RV32 high
  * halves) read back the retired-instruction count; cycle == instret here
  * because the functional core retires one instruction per "cycle" — the
@@ -719,6 +753,8 @@ static uint64_t csr_read(const CPU *cpu, uint32_t addr) {
         case CSR_SSTATUS: return cpu->csr[CSR_MSTATUS] & SSTATUS_MASK;
         case CSR_SIE:     return cpu->csr[CSR_MIE]     & S_INT_MASK;
         case CSR_SIP:     return cpu->csr[CSR_MIP]     & S_INT_MASK;
+        case CSR_MTOPI:   return topi_value(cpu, 0);   /* AIA: M-level top interrupt */
+        case CSR_STOPI:   return topi_value(cpu, 1);   /* AIA: S-level top interrupt */
         default:
             return cpu->csr[addr];
     }

@@ -154,7 +154,12 @@ enum {
     CSR_MCOUNTEREN = 0x306, CSR_MSTATUSH = 0x310,
     CSR_MENVCFG    = 0x30a, CSR_MENVCFGH = 0x31a, /* env config: Sstc STCE (M18) */
     CSR_MSCRATCH   = 0x340, CSR_MEPC    = 0x341, CSR_MCAUSE  = 0x342,
-    CSR_MTVAL      = 0x343, CSR_MIP     = 0x344
+    CSR_MTVAL      = 0x343, CSR_MIP     = 0x344,
+    /* AIA (Smaia/Ssaia) top-interrupt registers: read-only views of the
+     * highest-priority pending-and-enabled interrupt at each level. We model
+     * only these (not the full IMSIC/APLIC), which is enough for OpenSBI's
+     * interrupt dispatch (M18/M22). */
+    CSR_STOPI      = 0xdb0, CSR_MTOPI   = 0xfb0
 };
 
 /* ABI register names (x0..x31), handy for register dumps and disassembly. */
