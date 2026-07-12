@@ -3,6 +3,7 @@
 /examples/embed
 /tests/snapshot_test
 /tests/net_test
+/tests/dcache_test
 /fuzz/fuzz_elf
 /fuzz/fuzz_decode
 /fuzz/*.replay
