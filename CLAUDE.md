@@ -217,7 +217,11 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   buffers and the `--disk` image, writing the used ring, and asserting its PLIC
   interrupt. The register files sit on the qemu `virt` address map with no CPU
   dependency — the memory layer dispatches accesses here, and the CPU pulls
-  `plat_mip_bits()` (MTIP/MSIP/MEIP) each step. `plat_tick` advances `mtime` one
+  `plat_mip_bits()` (MTIP/MSIP/MEIP) each step. That per-step pull short-circuits
+  the PLIC's two 32-source priority scans when `plic_lines()` reports no device is
+  asserting a line (the common case even under a running OS) — bit-exact, since
+  `plic_best` returns 0 with no line set anyway, but a large speedup (the scan was
+  the dominant per-step cost, M25 perf). `plat_tick` advances `mtime` one
   tick per CPU step (deterministic). The `Platform` also holds a `Disk` — the raw
   block-device image (`--disk`, owned by the engine) the virtio device serves —
   and, unlike the other (register-only) devices, a pointer to guest RAM

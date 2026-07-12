@@ -803,8 +803,15 @@ uint32_t plat_mip_bits(Platform *p, uint32_t hart) {
         if (p->clint.mtime >= p->clint.mtimecmp[hart]) bits |= MIP_MTIP;
         if (p->clint.msip[hart] & 1u)                  bits |= MIP_MSIP;
     }
-    /* qemu virt PLIC context layout: 2*hart = M-mode (MEIP), 2*hart+1 = S (SEIP). */
-    if (plic_best(p, 2u * hart)      != 0) bits |= MIP_MEIP;
-    if (plic_best(p, 2u * hart + 1u) != 0) bits |= MIP_SEIP;
+    /* qemu virt PLIC context layout: 2*hart = M-mode (MEIP), 2*hart+1 = S (SEIP).
+     * The CPU pulls this every step, so short-circuit the common case: when no
+     * device is asserting an interrupt line at all (true for the vast majority of
+     * steps, even under a running OS), neither context can have a pending source,
+     * so skip both 32-source priority scans. Bit-exact — plic_best returns 0 when
+     * no line is set anyway; this only avoids the wasted scan (M25a perf). */
+    if (plic_lines(p)) {
+        if (plic_best(p, 2u * hart)      != 0) bits |= MIP_MEIP;
+        if (plic_best(p, 2u * hart + 1u) != 0) bits |= MIP_SEIP;
+    }
     return bits;
 }
