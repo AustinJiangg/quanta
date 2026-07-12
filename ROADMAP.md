@@ -1469,6 +1469,16 @@ device/interrupt/timer suite stays green. This was the lesson M25 is meant to
 teach — *measure before optimising*: the decode cache was the roadmap's named
 first step, but a one-line device-model gate was the larger win.
 
+**Validated on a real OS boot.** Timing the full OpenSBI → Linux 6.6 →
+userspace-prompt boot (`--bios`/`--kernel`/`--initrd`, wall-clock to the init
+shell's prompt, median of 5 runs each, every run exiting cleanly via poweroff):
+the pre-M25 baseline boots in **9.8 s**; the PLIC gate alone cuts it to **5.0 s**
+(~2.0x); the decode cache on top takes it to **4.0 s** (~1.25x more, **~2.5x
+combined**). The full-system ranking matches the compute-loop profile — the
+interrupt-poll gate is the bigger win, the decode cache a solid second — with the
+combined speedup a little below the loop's ~3.4x, as expected for a workload that
+also exercises MMU walks, devices, and DMA the loop does not.
+
 **Where the time goes now (after both commits):** profiling the same loop shows
 the residual interrupt path (~8%) and address translation (~1%) are no longer
 significant; the remaining cost is the instruction dispatch/execute itself. So the
