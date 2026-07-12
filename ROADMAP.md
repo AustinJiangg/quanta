@@ -1453,10 +1453,32 @@ check-dcache` (`tests/dcache_test.c`) runs each guest with the cache on and off
 and asserts identical final state, and `tests/smc.S` (self-modifying code +
 `FENCE.I`) exercises the invalidation path specifically; the whole existing suite
 (conformance, the qemu differential, paging, snapshot/restore) stays green with
-the cache on by default. `make bench` reports ~1.2x on a compute loop. **Still to
-do for M25a:** the threaded-dispatch / operand-pre-decode half (a function-pointer
-or computed-goto dispatch over a fully pre-decoded slot), the larger win the box
-below still tracks.
+the cache on by default. `make bench` reports ~1.2x on a compute loop.
+
+**Profiling then found the real hot spot: the per-step interrupt poll (second
+commit).** The CPU pulls `plat_mip_bits()` every step, which ran the PLIC's two
+32-source priority scans (M and S contexts) *unconditionally* — the single
+dominant cost of the interpreter loop. But an interrupt can only be pending if a
+device is actually asserting a line (`plic_lines()`, three device flags), which is
+false on the vast majority of steps even under a running OS. Gating the scans on
+`plic_lines()` (bit-exact — `plic_best` returns 0 with no line set) took the same
+compute loop to **~2.8x** on top of the decode cache (~3.4x combined), and unlike
+the decode cache it helps interrupt-driven full-system workloads (Linux boot)
+directly, since the redundant scan ran every step there too. The whole
+device/interrupt/timer suite stays green. This was the lesson M25 is meant to
+teach — *measure before optimising*: the decode cache was the roadmap's named
+first step, but a one-line device-model gate was the larger win.
+
+**Where the time goes now (after both commits):** profiling the same loop shows
+the residual interrupt path (~8%) and address translation (~1%) are no longer
+significant; the remaining cost is the instruction dispatch/execute itself. So the
+next lever *is* the threaded-dispatch / operand-pre-decode half of M25a — but its
+expected win is modest (~1.3x) against a large, correctness-sensitive refactor
+(a leaf handler per instruction, all bit-exact), and true threaded (computed-goto)
+dispatch chains across instructions, which is in tension with the M19 round-robin
+scheduler's one-instruction-per-hart return. The order-of-magnitude step is the
+M25b JIT, which supersedes the interpreter hot path anyway. **Still open for
+M25a:** the threaded-dispatch half, weighed against going straight to M25b.
 
 - [ ] **Build (M25a — decode cache + threaded dispatch):** pre-decode each
   instruction into an internal micro-op the first time its PC is executed, cache
