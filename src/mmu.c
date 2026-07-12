@@ -135,17 +135,18 @@ uint32_t mmu_translate(CPU *cpu, uint64_t va, AccessType acc, uint64_t *pa) {
 
     uint64_t vpn = va >> 12;
 
-    /* TLB serves fetches and loads; stores always walk so the dirty bit is set
-     * on the real PTE before the write is allowed to land. */
-    if (acc != ACC_STORE) {
-        for (int i = 0; i < TLB_ENTRIES; i++) {
-            TlbEntry *e = &cpu->tlb[i];
-            if (e->valid && e->vpn == vpn && e->asid == asid) {
-                if (!perm_ok(cpu, e->pte_flags, acc, priv)) return pf_cause(acc);
-                *pa = (e->ppn << 12) | (va & 0xfff);
-                return 0;
-            }
-        }
+    /* TLB lookup, direct-mapped by the low VPN bits (an O(1) probe — the old
+     * linear scan of all entries was ~20% of a full-system run, M25 perf). A
+     * store may be served from the TLB only when the cached PTE already has its
+     * dirty bit set: the walk it skips would find A|D already set and write
+     * nothing back, so the hit is equivalent. A store to a clean page still
+     * walks, so the dirty bit lands on the real PTE before the write. */
+    TlbEntry *e = &cpu->tlb[vpn & (TLB_ENTRIES - 1)];
+    if (e->valid && e->vpn == vpn && e->asid == asid &&
+        (acc != ACC_STORE || (e->pte_flags & PTE_D))) {
+        if (!perm_ok(cpu, e->pte_flags, acc, priv)) return pf_cause(acc);
+        *pa = (e->ppn << 12) | (va & 0xfff);
+        return 0;
     }
 
     /* Multi-level walk from the root table at satp.PPN. */
@@ -185,12 +186,10 @@ uint32_t mmu_translate(CPU *cpu, uint64_t va, AccessType acc, uint64_t *pa) {
         else              mem_write64(cpu->mem, pte_addr, newpte);
     }
 
-    if (acc != ACC_STORE) { /* cache the fresh translation */
-        TlbEntry *e = &cpu->tlb[cpu->tlb_next];
-        e->valid = 1; e->vpn = vpn; e->asid = (uint32_t)asid; e->ppn = ppn;
-        e->pte_flags = (uint32_t)(newpte & 0xff);
-        cpu->tlb_next = (cpu->tlb_next + 1) % TLB_ENTRIES;
-    }
+    /* Cache the fresh translation in its direct-mapped slot. A store's fill
+     * carries the dirty bit just set, so later stores to the page hit too. */
+    e->valid = 1; e->vpn = vpn; e->asid = (uint32_t)asid; e->ppn = ppn;
+    e->pte_flags = (uint32_t)(newpte & 0xff);
 
     *pa = (ppn << 12) | (va & 0xfff);
     return 0;

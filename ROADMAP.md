@@ -1479,13 +1479,34 @@ interrupt-poll gate is the bigger win, the decode cache a solid second — with 
 combined speedup a little below the loop's ~3.4x, as expected for a workload that
 also exercises MMU walks, devices, and DMA the loop does not.
 
-**Where the time goes now (after both commits):** profiling the same loop shows
-the residual interrupt path (~8%) and address translation (~1%) are no longer
-significant; the remaining cost is the instruction dispatch/execute itself. So the
-next lever *is* the threaded-dispatch / operand-pre-decode half of M25a — but its
-expected win is modest (~1.3x) against a large, correctness-sensitive refactor
-(a leaf handler per instruction, all bit-exact), and true threaded (computed-goto)
-dispatch chains across instructions, which is in tension with the M19 round-robin
+**Profiling the full-system workload found a different second hot spot (third
+commit).** gprof over the whole Linux boot (112.9M instructions) — not the
+compute loop — showed `mmu_translate` at **19%** self time (154.8M calls, ~1.37
+per step once Sv39 is up): the TLB probe was a *linear scan* of all 16 entries,
+run at least once per instruction for the fetch. Three more findings rode along:
+the round-robin scheduler paid an integer divide per step (`% nharts`), two
+one-line platform getters (`plat_tick`, `plat_poweroff_requested`) were
+cross-TU calls made three times per step, and the CLI drove the engine through
+three public API calls per instruction. The fixes, all semantics-free: the TLB
+is now **direct-mapped** by the low VPN bits (O(1) probe) and also serves
+**stores to already-dirty pages** (the walk such a hit skips would find A|D set
+and write nothing back — a store to a clean page still walks, so the hardware
+dirty-bit contract is untouched); the modulo became a compare-and-wrap; the two
+getters became `static inline`; and the CLI's no-overlay path now runs in
+1024-step `quanta_run` chunks (the console-pump cadence, unchanged). Interleaved
+A/B on the Linux boot: **5.8 s → 3.9 s (another ~1.5x; ~3.6x total from the
+pre-M25 baseline** — 9.8 s → 2.7 s on a quiet host). The whole suite (16 check
+targets including the dcache on/off differential, snapshot replay, and the qemu
+differentials) plus `make sanitize` stays green. Same lesson, second verse:
+the *compute-loop* profile said dispatch dominates, but the *full-system*
+profile said the MMU does — profile the workload you actually care about.
+
+**Where the time goes now (after all three commits):** the remaining cost is the
+instruction dispatch/execute itself. So the next lever *is* the
+threaded-dispatch / operand-pre-decode half of M25a — but its expected win is
+modest (~1.3x) against a large, correctness-sensitive refactor (a leaf handler
+per instruction, all bit-exact), and true threaded (computed-goto) dispatch
+chains across instructions, which is in tension with the M19 round-robin
 scheduler's one-instruction-per-hart return. The order-of-magnitude step is the
 M25b JIT, which supersedes the interpreter hot path anyway. **Still open for
 M25a:** the threaded-dispatch half, weighed against going straight to M25b.

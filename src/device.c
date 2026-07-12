@@ -61,20 +61,13 @@ static void test_write(Platform *p, uint32_t value) {
     }
 }
 
-int plat_poweroff_requested(const Platform *p, uint32_t *code) {
-    if (!p->poweroff) return 0;
-    if (code) *code = p->poweroff_code;
-    return 1;
-}
+/* plat_poweroff_requested and plat_tick live in device.h as static inlines:
+ * they run every step of the interpreter loop (M25 perf). */
 
 void plat_attach_ram(Platform *p, uint8_t *ram, uint64_t base, uint64_t size) {
     p->ram      = ram;
     p->ram_base = base;
     p->ram_size = size;
-}
-
-void plat_tick(Platform *p) {
-    p->clint.mtime++;
 }
 
 /* ------------------------------------------------------------------------

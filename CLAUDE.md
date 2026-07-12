@@ -928,9 +928,12 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   in M-mode or Bare mode, so paging is inert until a guest sets `satp` (every
   pre-paging test is unaffected). Page tables are read *physically* by the
   walker, so they need no mapping. A/D bits are set in hardware (A on any access,
-  D on a store); the TLB therefore serves only fetches and loads — stores always
-  walk so the dirty bit lands on the real PTE — and is flushed by `sfence.vma`
-  and any `satp` write. `mstatus.MPRV` lets an M-mode load/store translate as
+  D on a store); the TLB — direct-mapped by the low VPN bits since the M25 perf
+  pass (an O(1) probe; the old linear scan was ~20% of a full-system run) —
+  serves fetches, loads, and stores to **already-dirty** pages (the walk such a
+  hit skips would find A|D set and write nothing back, so it is equivalent); a
+  store to a clean page still walks so the dirty bit lands on the real PTE. It
+  is flushed by `sfence.vma` and any `satp` write. `mstatus.MPRV` lets an M-mode load/store translate as
   MPP; SUM/MXR gate S-mode access to user pages. A walk failure (missing PTE, bad
   permission, misaligned superpage, non-canonical Sv39 VA) returns the page-fault
   cause, which `cpu.c` raises as a trap with the faulting VA in `*tval`. Not

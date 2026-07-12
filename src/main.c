@@ -502,6 +502,25 @@ static void net_pump(NetPump *np) {
 static uint64_t run_until_halt(Quanta *q, int trace, Pipeline *pipe,
                                uint64_t max_steps, NetPump *net) {
     uint64_t steps = 0;
+
+    /* Fast path: with no per-instruction observer attached, drive the engine in
+     * console-pump-sized chunks through quanta_run — the per-step quanta_step /
+     * quanta_pc / quanta_halt_reason API calls were a measurable tax on a
+     * full-system run (M25 perf). The pump cadence is unchanged: one
+     * console/net poll per 1024 instructions. */
+    if (!trace && !pipe) {
+        while (quanta_halt_reason(q) == QUANTA_RUN && !g_console_quit &&
+               (max_steps == 0 || steps < max_steps)) {
+            console_pump(q); net_pump(net);
+            uint64_t chunk = 0x400;
+            if (max_steps && max_steps - steps < chunk) chunk = max_steps - steps;
+            uint64_t ran = 0;
+            quanta_run(q, chunk, &ran); /* stops early on any halt */
+            steps += ran;
+        }
+        return steps;
+    }
+
     while (quanta_halt_reason(q) == QUANTA_RUN && !g_console_quit &&
            (max_steps == 0 || steps < max_steps)) {
         /* Feed any waiting console input to the UART, and poll the NAT sockets,

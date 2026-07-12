@@ -83,7 +83,9 @@ typedef enum { ACC_FETCH, ACC_LOAD, ACC_STORE } AccessType;
 
 /* A software TLB entry: one cached VA-page -> PA-page translation, tagged by
  * ASID and carrying the leaf PTE's permission bits so per-access permission
- * checks still run on a hit. Flushed by sfence.vma and any satp write. */
+ * checks still run on a hit. Direct-mapped by the low VPN bits (an O(1) probe;
+ * the count must stay a power of two — M25 perf). Flushed by sfence.vma and any
+ * satp write. */
 #define TLB_ENTRIES 16
 typedef struct {
     int      valid;
@@ -145,7 +147,7 @@ typedef struct CPU {
     int      reserve_valid; /* RV-A: an LR set a reservation still held */
     uint64_t reserve_addr;  /* RV-A: physical word the reservation covers */
     TlbEntry tlb[TLB_ENTRIES]; /* M12: cached Sv32 translations */
-    uint32_t tlb_next;      /* round-robin TLB replacement index */
+    uint32_t tlb_next;      /* unused since the direct-mapped TLB (kept for layout) */
     uint64_t csr[4096];     /* CSR file: Zicsr counters + the M9 trap registers */
 } CPU;
 

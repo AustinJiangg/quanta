@@ -486,7 +486,7 @@ QuantaHalt quanta_step(Quanta *q) {
     if (q->sched == 0) plat_tick(&q->plat);
     CPU *h = &q->harts[q->sched];
     if (!h->halted) cpu_step(h);
-    q->sched = (q->sched + 1) % q->nharts;
+    if (++q->sched >= q->nharts) q->sched = 0; /* wrap, not %: a div per step */
     machine_poll_halt(q);
     return q->m_halted ? map_halt(q->m_reason) : QUANTA_RUN;
 }
@@ -499,7 +499,7 @@ QuantaHalt quanta_run(Quanta *q, uint64_t max_steps, uint64_t *steps_out) {
             if (q->sched == 0) plat_tick(&q->plat);   /* one tick per scheduler round */
             CPU *h = &q->harts[q->sched];
             if (!h->halted) { cpu_step(h); steps++; } /* count only real instructions */
-            q->sched = (q->sched + 1) % q->nharts;
+            if (++q->sched >= q->nharts) q->sched = 0;
             machine_poll_halt(q);
         }
     }

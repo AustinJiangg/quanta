@@ -231,8 +231,13 @@ int plat_contains(uint64_t addr);
 uint32_t plat_read(Platform *p, uint64_t addr, uint32_t size);
 void     plat_write(Platform *p, uint64_t addr, uint32_t size, uint32_t value);
 
-/* Advance the timer by one tick (called once per CPU step). */
-void plat_tick(Platform *p);
+/* Advance the timer by one tick (called once per scheduler round). Static
+ * inline: this and the poweroff poll below run on every step of the hot
+ * interpreter loop, and as one-line accessors the cross-TU call was pure
+ * overhead (M25 full-system profiling). */
+static inline void plat_tick(Platform *p) {
+    p->clint.mtime++;
+}
 
 /* Deliver a received byte to the UART (as if it arrived on the serial line):
  * buffer it for the guest to read from RBR and, if RX interrupts are enabled,
@@ -264,6 +269,10 @@ uint32_t plat_mip_bits(Platform *p, uint32_t hart);
 /* Has the SiFive test device been written to request power-off? If so, returns 1
  * and stores the exit status in *code; the CPU then halts the machine (a device
  * cannot stop the hart itself). The CPU polls this once per step. */
-int plat_poweroff_requested(const Platform *p, uint32_t *code);
+static inline int plat_poweroff_requested(const Platform *p, uint32_t *code) {
+    if (!p->poweroff) return 0;
+    if (code) *code = p->poweroff_code;
+    return 1;
+}
 
 #endif /* QUANTA_DEVICE_H */
