@@ -582,6 +582,7 @@ int main(int argc, char **argv) {
     int trace = 0;
     int quiet = 0;
     int cache_on = 0;
+    int no_dcache = 0;  /* --no-dcache: run the plain interpreter (M25a reference) */
     int pipe_on = 0;
     int gdb_on = 0;
     int gdb_port = 1234;            /* the conventional gdbserver/qemu port */
@@ -617,6 +618,8 @@ int main(int argc, char **argv) {
             trace = 1;
         } else if (strcmp(argv[i], "--quiet") == 0) {
             quiet = 1;
+        } else if (strcmp(argv[i], "--no-dcache") == 0) {
+            no_dcache = 1;  /* disable the decoded-instruction cache (M25a) */
         } else if (strcmp(argv[i], "--cache") == 0) {
             cache_on = 1;
         } else if (strncmp(argv[i], "--cache=", 8) == 0) {
@@ -753,6 +756,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "failed to allocate emulator\n");
         return 1;
     }
+    if (no_dcache) quanta_set_dcache(q, 0); /* opt out of the decode cache (M25a) */
 
     /* Configure SMP before loading, so the boot handoff brings up every hart. */
     if (quanta_set_harts(q, nharts) != QUANTA_OK) {

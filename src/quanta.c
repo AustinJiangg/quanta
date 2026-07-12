@@ -4,6 +4,7 @@
 #include "memory.h"
 #include "elf.h"
 #include "cache.h"
+#include "decodecache.h"
 #include "device.h"
 #include "dtb.h"
 #include "decode.h"
@@ -42,6 +43,8 @@ struct Quanta {
     Platform plat;    /* MMIO devices: CLINT timer/IPI, PLIC, 16550 UART (M13) */
     uint32_t dtb_addr;  /* where the boot device tree was placed (0 if none, M14) */
     int      cache_on;  /* a cache has been attached */
+    int      dcache_on; /* the decoded-instruction cache is enabled (M25a; default) */
+    DecodeCache *dcaches[QUANTA_MAX_HARTS]; /* per-hart decode caches (engine-owned) */
     int      loaded;    /* memory is initialised and PC/sp are set */
     int      netdev_advertised; /* emit the virtio-net node in the boot DTB (M23) */
     int      disk_advertised;   /* emit the virtio-blk node in the boot DTB (M24) */
@@ -75,8 +78,25 @@ static QuantaStatus in_range(const Memory *mem, uint64_t addr, size_t len,
 
 Quanta *quanta_create(void) {
     Quanta *q = calloc(1, sizeof(Quanta)); /* NULL on OOM */
-    if (q) q->nharts = 1;                  /* a uniprocessor unless --harts asks for more */
+    if (q) { q->nharts = 1;       /* a uniprocessor unless --harts asks for more */
+             q->dcache_on = 1; }  /* the decode cache is on by default (M25a) */
     return q;
+}
+
+/* Attach or detach the per-hart decoded-instruction caches to match dcache_on
+ * and the current hart count. Allocated lazily on first enable and reused (and
+ * flushed) across reloads/restores; a failed allocation silently falls back to
+ * the plain interpreter for that hart. Called from the loader tail and restore. */
+static void attach_dcaches(Quanta *q) {
+    for (int i = 0; i < q->nharts; i++) {
+        if (q->dcache_on) {
+            if (!q->dcaches[i]) q->dcaches[i] = dcache_new();
+            dcache_flush(q->dcaches[i]); /* stale after a (re)load or restore */
+            q->harts[i].dcache = q->dcaches[i];
+        } else {
+            q->harts[i].dcache = NULL;
+        }
+    }
 }
 
 QuantaStatus quanta_set_harts(Quanta *q, int nharts) {
@@ -84,6 +104,12 @@ QuantaStatus quanta_set_harts(Quanta *q, int nharts) {
     if (nharts < 1 || nharts > (int)QUANTA_MAX_HARTS) return QUANTA_ERR_INVAL;
     q->nharts = nharts;
     return QUANTA_OK;
+}
+
+void quanta_set_dcache(Quanta *q, int on) {
+    if (!q) return;
+    q->dcache_on = on ? 1 : 0;
+    if (q->loaded) attach_dcaches(q); /* (de)attach immediately if already running */
 }
 
 /* Update the machine-level halt state, polled after every hart step. The whole
@@ -110,6 +136,7 @@ static void machine_poll_halt(Quanta *q) {
 
 void quanta_destroy(Quanta *q) {
     if (!q) return;
+    for (unsigned i = 0; i < QUANTA_MAX_HARTS; i++) dcache_free(q->dcaches[i]);
     if (q->cache_on) cache_free(&q->cache);
     if (q->plat.disk.file) {           /* flush write-through and release the handle */
         fflush(q->plat.disk.file);
@@ -144,6 +171,7 @@ static void start_at(Quanta *q, uint64_t entry, int xlen) {
     q->dtb_addr = 0;          /* set only by the boot handoff below (ELF path) */
     q->sched = 0;
     q->m_halted = 0; q->m_reason = HALT_NONE; q->m_exit = 0;
+    attach_dcaches(q);        /* per-hart decode caches (M25a), flushed for the new image */
     q->loaded = 1;
 }
 
@@ -587,6 +615,7 @@ QuantaStatus quanta_restore(Quanta *q, const QuantaSnapshot *s) {
     for (unsigned i = 0; i < QUANTA_MAX_HARTS; i++) {
         q->harts[i].mem   = &q->mem;
         q->harts[i].cache = s->cache_on ? &q->cache : NULL;
+        q->harts[i].dcache = NULL; /* re-wired by attach_dcaches below */
     }
 
     q->nharts   = s->nharts;   q->sched    = s->sched;
@@ -615,6 +644,8 @@ QuantaStatus quanta_restore(Quanta *q, const QuantaSnapshot *s) {
     q->plat.disk.writable = live_wr;
     if (live_disk && s->disk_data) memcpy(live_disk, s->disk_data, s->disk_size);
 
+    attach_dcaches(q); /* re-wire the borrowed decode-cache pointers, flushed for
+                        * the restored RAM (M25a; derived state, not in the snapshot) */
     return QUANTA_OK;
 }
 

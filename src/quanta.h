@@ -80,6 +80,14 @@ void quanta_destroy(Quanta *q);
  * harts; the firmware (--bios) path parks the secondaries. */
 QuantaStatus quanta_set_harts(Quanta *q, int nharts);
 
+/* Enable (on != 0) or disable the decoded-instruction cache (M25a). It is a pure
+ * performance overlay — memoising fetch + length-decode + RVC expansion per
+ * physical PC — so results are bit-identical either way; disabling it selects the
+ * plain switch-dispatched interpreter, the golden reference the on/off
+ * differential test compares against. On by default; may be called before or
+ * after loading. */
+void quanta_set_dcache(Quanta *q, int on);
+
 /* --- loading --- */
 
 /* Load a static little-endian RV32 ELF executable: size guest memory to its

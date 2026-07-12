@@ -4,6 +4,7 @@
 #include "syscall.h"
 #include "sbi.h"
 #include "cache.h"
+#include "decodecache.h"
 #include "mmu.h"
 #include "device.h"
 #include "softfloat.h"
@@ -66,6 +67,7 @@ void cpu_init(CPU *cpu, Memory *mem, uint64_t entry_pc, int xlen) {
     cpu->hartid    = 0;    /* the engine overrides per hart before running (M19) */
     cpu->mem       = mem;
     cpu->cache     = NULL;
+    cpu->dcache    = NULL; /* the engine attaches one (M25a); NULL = plain interp */
     cpu->halted      = 0;
     cpu->halt_reason = HALT_NONE;
     cpu->exit_code   = 0;
@@ -1483,33 +1485,52 @@ void cpu_step(CPU *cpu) {
         if (take_interrupt(cpu)) return;
     }
 
-    /* FETCH: read the low halfword first. Its low two bits decide the length:
-     * a value other than 0b11 is a 16-bit compressed instruction (RV32C),
-     * expanded here to the 32-bit instruction it stands for; 0b11 introduces a
-     * 32-bit instruction whose upper halfword may lie in the next page, so it is
-     * translated separately. Either way decode/execute below is unchanged. */
+    /* FETCH. Translate the PC to a physical address (fault-checked every step,
+     * hit or miss) and, when a decode cache is attached, look the physical
+     * address up: a hit reuses the memoised expansion below and skips the memory
+     * reads and length-decode entirely (M25a — see decodecache.h). */
     uint64_t lo_pa;
     uint32_t fc = mmu_translate(cpu, cpu->pc, ACC_FETCH, &lo_pa);
     if (fc) { raise_trap(cpu, fc, cpu->pc); return; } /* instruction page fault */
-    uint16_t lo = mem_read16(cpu->mem, lo_pa);
-    if (cpu->mem->fault) { /* unmapped fetch: trap before decoding garbage */
-        raise_trap(cpu, CAUSE_INSN_ACCESS, cpu->pc);
-        return;
-    }
 
     uint32_t inst, ilen;
-    if ((lo & 0x3u) != 0x3u) {           /* 16-bit compressed instruction */
-        inst = rvc_expand(lo, cpu->xlen == 64);
-        ilen = 2;
-        if (inst == RVC_ILLEGAL) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, lo); return; }
-    } else {                             /* 32-bit instruction: fetch upper half */
-        uint64_t hi_pa;
-        uint32_t fch = mmu_translate(cpu, cpu->pc + 2, ACC_FETCH, &hi_pa);
-        if (fch) { raise_trap(cpu, fch, cpu->pc + 2); return; }
-        uint16_t hi = mem_read16(cpu->mem, hi_pa);
-        if (cpu->mem->fault) { raise_trap(cpu, CAUSE_INSN_ACCESS, cpu->pc + 2); return; }
-        inst = (uint32_t)lo | ((uint32_t)hi << 16);
-        ilen = 4;
+    DecodeCache *dc = cpu->dcache;
+    DecodedInsn *slot = dc ? &dc->slots[DC_INDEX(lo_pa)] : NULL;
+    if (slot && slot->gen == dc->gen && slot->pa == lo_pa) {
+        inst = slot->inst;               /* decode-cache hit */
+        ilen = slot->ilen;
+    } else {
+        /* MISS. Read the low halfword; its low two bits decide the length. A
+         * value other than 0b11 is a 16-bit compressed instruction (RV32/64C),
+         * expanded to the 32-bit instruction it stands for; 0b11 introduces a
+         * 32-bit instruction whose upper halfword may lie in the next page, so it
+         * is translated separately. Decode/execute below is unchanged either way. */
+        uint16_t lo = mem_read16(cpu->mem, lo_pa);
+        if (cpu->mem->fault) { /* unmapped fetch: trap before decoding garbage */
+            raise_trap(cpu, CAUSE_INSN_ACCESS, cpu->pc);
+            return;
+        }
+        int cacheable = dc != NULL; /* fill only RAM fetches (see below) */
+        if ((lo & 0x3u) != 0x3u) {          /* 16-bit compressed instruction */
+            inst = rvc_expand(lo, cpu->xlen == 64);
+            ilen = 2;
+            if (inst == RVC_ILLEGAL) { raise_trap(cpu, CAUSE_ILLEGAL_INSN, lo); return; }
+        } else {                            /* 32-bit instruction: fetch upper half */
+            uint64_t hi_pa;
+            uint32_t fch = mmu_translate(cpu, cpu->pc + 2, ACC_FETCH, &hi_pa);
+            if (fch) { raise_trap(cpu, fch, cpu->pc + 2); return; }
+            uint16_t hi = mem_read16(cpu->mem, hi_pa);
+            if (cpu->mem->fault) { raise_trap(cpu, CAUSE_INSN_ACCESS, cpu->pc + 2); return; }
+            inst = (uint32_t)lo | ((uint32_t)hi << 16);
+            ilen = 4;
+            if (cacheable && cpu->mem->plat && plat_contains(hi_pa)) cacheable = 0;
+        }
+        /* Do not cache a fetch that read from a device window: an MMIO read is
+         * not idempotent, so memoising it could diverge from the interpreter that
+         * re-reads it. (Executing from MMIO is a guest bug regardless.) */
+        if (cacheable && cpu->mem->plat && plat_contains(lo_pa)) cacheable = 0;
+        if (cacheable) { slot->gen = dc->gen; slot->pa = lo_pa;
+                         slot->inst = inst;   slot->ilen = ilen; }
     }
     uint64_t next_pc = cpu->pc + ilen; /* default: fall through to the next insn */
 
@@ -1588,8 +1609,13 @@ void cpu_step(CPU *cpu) {
 
         case OP_FENCE:
             /* FENCE / FENCE.I: memory- and instruction-ordering hints. A single
-             * hart that executes in program order, with no modelled instruction
-             * cache, has nothing to reorder, so these are no-ops (PC += 4). */
+             * hart that executes in program order has nothing to reorder, so
+             * FENCE is a no-op. FENCE.I (funct3 == 1, Zifencei) is the point the
+             * guest signals that stores to instruction memory must become visible
+             * to its own fetches, so it flushes the decoded-instruction cache —
+             * the only event that can change what a cached physical address
+             * decodes to (M25a — see decodecache.h). Both still just PC += 4. */
+            if (funct3(inst) == 0x1) dcache_flush(cpu->dcache);
             break;
 
         case OP_SYSTEM:

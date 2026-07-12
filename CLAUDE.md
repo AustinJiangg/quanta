@@ -56,7 +56,10 @@ differential-tested against qemu) — are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
-memory, and a `--pipeline` timing model estimates cycles and CPI.
+memory, a `--pipeline` timing model estimates cycles and CPI, and the first
+performance step past the naive interpreter — a **decoded-instruction cache**
+(M25a, physical-PC-keyed, flushed on `FENCE.I`, bit-identical to the interpreter
+by construction) — speeds the fetch/decode hot path.
 Quanta loads static little-endian ELF32/ELF64
 executables (`quanta program.elf`), services `write`/`exit` system calls through
 the ECALL path — the built-in SEE that runs until a guest installs its own trap
@@ -101,6 +104,8 @@ make check-smp     # check SMP: 4 harts, contended LR/SC, a CLINT IPI (M19)
 make check-hsm     # check SBI HSM: park/restart secondary harts (M22)
 make check-snapshot # check machine snapshot/restore replays a run bit-for-bit (E10)
 make check-replay  # check --snapshot/--restore file round-trip and resume (E10)
+make check-dcache  # check the decode cache is bit-identical to the interpreter (M25a)
+make bench         # time the interpreter with the decode cache on vs off (M25a)
 make check-os      # boot the M16 teaching kernel to userspace (needs cross-toolchain)
 make linux-initramfs # build the Linux initramfs (tests/linux/) for the OpenSBI->Linux boot (M18)
 make alpine-rootfs # build the Alpine RV64 ext4 rootfs (tests/alpine/) for the distribution boot (M24)
@@ -123,7 +128,9 @@ stderr. Add `--quiet` to suppress all driver output (banner, summary, register
 dump), leaving only the guest's own stdout — used by `make check-diff`. Add `--cache[=SIZE:WAYS:BLOCK]` (e.g. `--cache=1024:2:32`) to model a
 set-associative L1 over the run's data accesses and print a hit/miss summary at
 exit, and/or `--pipeline` to print a 5-stage cycle/CPI estimate. The overlays
-compose. Add `--gdb[=PORT]` (default 1234) to start a GDB remote stub and wait
+compose. Add `--no-dcache` to disable the decoded-instruction cache (M25a; on by
+default) and run the plain switch-dispatched interpreter — a bit-identical but
+slower reference, the mode `make check-dcache` compares against. Add `--gdb[=PORT]` (default 1234) to start a GDB remote stub and wait
 for a debugger to `target remote :PORT`; it drives execution itself, so it does
 not combine with `--trace`/`--pipeline`. Add `--memory=SIZE` (bytes, with an
 optional `K`/`M`/`G` suffix, e.g. `--memory=8M`) to grow the guest RAM region
@@ -330,6 +337,13 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   observability layer: `cpu_step`'s load/store paths feed it data addresses, it
   tallies hits/misses, but the bytes still come from `memory.c`, so results are
   untouched. Off unless `--cache` is given (`cpu->cache == NULL`).
+- `src/decodecache.{h,c}` — the decoded-instruction cache (M25a): a per-hart,
+  direct-mapped memo of `cpu_step`'s fetch + length-decode + `rvc_expand`, keyed
+  by physical PC. Owns only the table lifecycle (`dcache_new`/`dcache_free`, the
+  inline `dcache_flush`); the lookup and fill live inline in `cpu_step` for speed.
+  A pure speed overlay — the semantics are unchanged, so `cpu->dcache == NULL` is
+  the bit-identical plain interpreter. The engine (`quanta.c`) owns the per-hart
+  caches; `cpu_step` flushes on `FENCE.I`. See the decode-cache gotcha.
 - `src/pipeline.{h,c}` — optional 5-stage pipeline *timing* model. Another
   overlay: `main.c`'s run loop feeds it each retired instruction word and whether
   control redirected, and it estimates cycles/CPI by charging load-use and
@@ -792,15 +806,47 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   stalls), predict-not-taken control penalties (JAL 1, taken branch/JALR 2), no
   structural or cache-miss penalties — not a cycle-accurate simulation.
 - FENCE (MISC-MEM opcode `0x0f`) is a no-op — a single in-order hart has
-  nothing to reorder — and so is FENCE.I (Zifencei), its instruction-stream
-  cousin, for the same reason (no modelled icache to flush). WFI is likewise a
-  nop (no interrupt sources to wait for yet). CSR instructions (Zicsr, M8) run
+  nothing to reorder. FENCE.I (Zifencei) was likewise a no-op until M25a; now it
+  **flushes the decoded-instruction cache** (an O(1) generation bump — see the
+  decode-cache gotcha), the point the guest signals its stores to instruction
+  memory must become visible to fetch. Both still just advance the PC. WFI is
+  likewise a nop (no interrupt sources to wait for yet). CSR instructions (Zicsr, M8) run
   `csrrw/s/c` and their immediate forms through `exec_csr`: most CSRs are plain
   WARL storage; the unprivileged counters (`cycle`/`time`/`instret` and their
   high halves) read back the retired-instruction count. `exec_csr` enforces the
   access privilege encoded in CSR bits [9:8] and raises illegal-instruction on a
   write to a read-only CSR (bits [11:10] == `0b11`) — except a `csrrs/csrrc` with
   an `x0` source, which performs no write and so never trips that check.
+- Decoded-instruction cache (M25a, `src/decodecache.{h,c}`, the first performance
+  step): a per-hart, direct-mapped memo of the work `cpu_step` would otherwise
+  redo every time an instruction executes — the halfword read(s), the
+  compressed-vs-32 length decision, and `rvc_expand`. Each slot caches, keyed by
+  the **physical** address of the low halfword, the expanded 32-bit `inst` and its
+  `ilen`; a hit reuses them and skips the fetch reads and the expansion, and the
+  opcode dispatch and `exec_*` semantics that follow are **unchanged**. So it is a
+  pure speed overlay like the cache/pipeline models — a hart with `cpu->dcache ==
+  NULL` is the plain interpreter, the **golden reference** the on/off differential
+  (`make check-dcache` / `tests/dcache_test.c`) pins it against, and `--no-dcache`
+  selects. Key design points: **(1)** PA keying means the cache survives
+  address-space switches (satp writes, `sfence.vma` — those do **not** flush it;
+  they are far too frequent and PA keying makes it unnecessary), so a kernel's hot
+  code stays decoded across context switches. **(2)** The one event that changes
+  what instruction lives at a physical address is a write to that memory, which
+  the RISC-V Zifencei contract requires a `FENCE.I` to make visible to fetch on
+  that hart — so cpu_step flushes the cache **only** on `FENCE.I` (an O(1) `gen++`
+  in `dcache_flush`), exactly and only where the architecture says a modified
+  instruction becomes visible. `tests/smc.S` (self-modifying code + `FENCE.I`,
+  driven by `check-dcache`) pins it: with the flush disabled its second execution
+  runs the stale decode and diverges. **(3)** Fetches from a device window are not
+  cached (an MMIO read is not idempotent; executing from MMIO is a guest bug
+  regardless). **(4)** The cache is derived state: it is **not** in the snapshot
+  (like the cache model), each ~1.5 MiB table is heap-allocated (never inline in
+  `CPU`, whose value copy backs the snapshot), the engine (`quanta.c`) owns the
+  per-hart caches and re-wires + flushes them on restore, and adding the `dcache`
+  pointer to `CPU` grew `sizeof(CPU)`, so old `--snapshot` files reject on the
+  layout signature (documented-acceptable). Enabled by default; ~1.2x on the
+  `make bench` compute loop. (Threaded dispatch / operand pre-decode — the rest of
+  M25a's "decode cache + threaded dispatch" — is the next step; the JIT is M25b.)
 - Privilege and traps (M9): the hart tracks a current mode (`PRIV_M`/`S`/`U`,
   resets to M) and `raise_trap` is the one path every synchronous exception
   takes. It resolves the target mode via `medeleg` (a trap in S/U delegates to

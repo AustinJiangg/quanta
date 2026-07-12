@@ -132,6 +132,8 @@ typedef struct CPU {
     uint32_t hartid;        /* this hart's id (mhartid; a0 at boot); 0 on a uniprocessor */
     Memory  *mem;           /* attached memory (not owned by the CPU) */
     struct Cache *cache;    /* optional cache model; NULL if off (not owned) */
+    struct DecodeCache *dcache; /* optional decoded-instruction cache (M25a);
+                                 * NULL => the plain interpreter (not owned) */
     int      halted;        /* set when execution should stop */
     HaltReason halt_reason; /* why it stopped (meaningful once halted) */
     uint32_t exit_code;     /* status the exit syscall passed in a0 */

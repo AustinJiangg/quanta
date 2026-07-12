@@ -1433,11 +1433,36 @@ Quanta is a switch-dispatched interpreter; this stage makes it fast while keepin
 the interpreter as the bit-exact reference. It splits into a cheap win and an
 ambitious capstone.
 
+**The decoded-instruction cache has landed (M25a, first commit).** `src/decodecache.
+{h,c}` memoises the work `cpu_step` would otherwise redo on every execution of an
+instruction: the halfword read(s), the compressed-vs-32 length decision, and the
+`rvc_expand` of a compressed one. Each slot caches, keyed by the **physical**
+address of the instruction's low halfword, the expanded 32-bit `inst` and its
+`ilen`; on a hit `cpu_step` reuses them and skips the fetch reads and the
+expansion, and the opcode dispatch and `exec_*` semantics that follow are
+unchanged — so a hart with `cpu->dcache == NULL` is the plain interpreter, the
+golden reference. Physical-address keying makes the cache survive address-space
+switches (satp writes, `sfence.vma` do not flush it); the one event that changes
+what instruction lives at a physical address is a write to it, which the RISC-V
+Zifencei contract requires a `FENCE.I` to make visible to fetch, so the cache is
+flushed only on `FENCE.I` (an O(1) generation bump) — exactly where the
+architecture says a modified instruction becomes visible. It is a pure speed
+overlay (not in the snapshot; the engine owns and re-wires the per-hart caches),
+on by default and disabled by `--no-dcache`. Two nets pin bit-exactness: `make
+check-dcache` (`tests/dcache_test.c`) runs each guest with the cache on and off
+and asserts identical final state, and `tests/smc.S` (self-modifying code +
+`FENCE.I`) exercises the invalidation path specifically; the whole existing suite
+(conformance, the qemu differential, paging, snapshot/restore) stays green with
+the cache on by default. `make bench` reports ~1.2x on a compute loop. **Still to
+do for M25a:** the threaded-dispatch / operand-pre-decode half (a function-pointer
+or computed-goto dispatch over a fully pre-decoded slot), the larger win the box
+below still tracks.
+
 - [ ] **Build (M25a — decode cache + threaded dispatch):** pre-decode each
   instruction into an internal micro-op the first time its PC is executed, cache
   it per address, and dispatch through computed-goto / function-pointer threading
   instead of the central `switch`. A large speedup at modest complexity, still
-  portable.
+  portable. *(Decode cache done; threaded dispatch next.)*
 - [ ] **Build (M25b — basic-block JIT):** a from-scratch dynamic binary translator
   that compiles hot basic blocks to host x86-64 (no LLVM/libjit — a small
   hand-written code generator, in keeping with the no-dependency contract), with

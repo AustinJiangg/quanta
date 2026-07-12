@@ -57,7 +57,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-virtnet check-net check-smp check-hsm check-os check-rv64 check-diff check-arch check-snapshot check-replay embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean alpine-rootfs
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-virtnet check-net check-smp check-hsm check-os check-rv64 check-diff check-arch check-snapshot check-replay check-dcache bench embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean alpine-rootfs
 
 all: $(BIN)
 
@@ -95,7 +95,7 @@ examples/embed: examples/embed.c $(LIB)
 # does not model the UART MMIO). It has its own target and the pattern rule builds it.
 # opensbi_payload is an rv64 S-mode payload built to a raw .bin (not a standalone
 # test ELF); it has its own rule and is driven by check-opensbi.
-TEST_SRC := $(filter-out tests/uart_echo.S tests/opensbi_payload.S,$(wildcard tests/*.S))
+TEST_SRC := $(filter-out tests/uart_echo.S tests/opensbi_payload.S tests/smc.S tests/bench.S,$(wildcard tests/*.S))
 TEST_ELF := $(TEST_SRC:.S=.elf)
 
 tests: $(TEST_ELF)
@@ -140,6 +140,21 @@ tests/test_atomic.elf: RVCFLAGS := $(subst rv32i,rv32ia,$(RVCFLAGS))
 # enable Zba/Zbb/Zbs/Zbc for just this ELF. User-mode integer code, so qemu
 # cross-checks it via make check-diff and objdump via make check-disasm.
 tests/test_bitmanip.elf: RVCFLAGS := $(subst rv32i,rv32i_zba_zbb_zbs_zbc,$(RVCFLAGS))
+
+# smc.S is the decode-cache invalidation test (M25a): self-modifying code plus
+# FENCE.I. It needs Zifencei (fence.i) and is built without the compressed
+# extension so `site` and its replacement are both fixed 4-byte `ori`s, and
+# -mno-relax so its `la` stays PC-relative (gp is 0). Driven by check-dcache; it
+# is filtered out of TEST_SRC (its runtime self-modification would not match the
+# static objdump, so it is out of check/check-disasm/check-diff).
+tests/smc.elf: RVCFLAGS := $(subst rv32i,rv32i_zifencei,$(RVCFLAGS)) -mno-relax
+
+# bench.S is the M25a performance benchmark (make bench): a long RV64IMAC compute
+# loop mixing compressed and 32-bit instructions. Its own rule (rv64), filtered
+# out of TEST_SRC — it is not a conformance test.
+tests/bench.elf: tests/bench.S
+	$(RVCC) -march=rv64imac -mabi=lp64 -nostdlib -nostartfiles -Ttext=0x80000000 -o $@ $<
+	@echo "Built $@ — time it with: make bench"
 
 # M16 teaching kernel (tests/os/): a freestanding S-mode kernel that boots and
 # runs a userspace process — the integration of M8-M15. Unlike the conformance
@@ -396,6 +411,24 @@ check-snapshot: tests/snapshot_test $(SNAP_ELF)
 tests/snapshot_test: tests/snapshot_test.c $(LIB) $(wildcard src/*.h)
 	$(CC) $(CFLAGS) -o $@ tests/snapshot_test.c $(LIB) $(LDFLAGS)
 
+# Decoded-instruction cache differential (M25a): run each guest with the decode
+# cache on and off and assert bit-identical results — the cache's guarantee that
+# it never changes what a program computes. The guests span the state, and smc.elf
+# exercises the FENCE.I invalidation path (self-modifying code) specifically.
+DCACHE_ELF := tests/test_stack.elf tests/test_muldiv.elf tests/test_atomic.elf \
+              tests/test_bitmanip.elf tests/test_irq.elf tests/test_vm.elf tests/smc.elf
+
+check-dcache: tests/dcache_test $(DCACHE_ELF)
+	./tests/dcache_test $(DCACHE_ELF)
+
+tests/dcache_test: tests/dcache_test.c $(LIB) $(wildcard src/*.h)
+	$(CC) $(CFLAGS) -o $@ tests/dcache_test.c $(LIB) $(LDFLAGS)
+
+# Time the interpreter with the decode cache on vs off on a long compute loop
+# (M25a). A wall-clock demonstration of the speedup, not a pass/fail check.
+bench: $(BIN) tests/bench.elf
+	@sh tests/bench.sh
+
 # Exercise the snapshot *file* serialisation (--snapshot / --restore, E10): split
 # a run with a mid-run snapshot and confirm the resumed half reproduces the whole
 # run's output and exit, that a halted-machine snapshot round-trips, and that a
@@ -425,7 +458,7 @@ sanitize:
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
 		check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-virtnet check-net \
-		check-smp check-hsm check-os check-rv64 check-diff check-snapshot check-replay
+		check-smp check-hsm check-os check-rv64 check-diff check-snapshot check-replay check-dcache
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
 # the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`
@@ -456,7 +489,7 @@ COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
 
 coverage:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-virtnet check-net check-smp check-os check-snapshot check-replay
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-virtnet check-net check-smp check-os check-snapshot check-replay check-dcache
 	@sh tests/coverage.sh
 
 # Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),
@@ -484,7 +517,7 @@ uninstall:
 		$(DESTDIR)$(PREFIX)/share/man/man1/quanta.1
 
 clean:
-	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/snapshot_test tests/net_test tests/*.elf \
+	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/snapshot_test tests/net_test tests/dcache_test tests/*.elf \
 		tests/os/*.elf tests/rv64/*.elf $(FUZZ_TARGETS) fuzz/*.replay \
 		src/*.gcno src/*.gcda examples/*.gcno examples/*.gcda
 	rm -rf build/arch-work build/coverage
