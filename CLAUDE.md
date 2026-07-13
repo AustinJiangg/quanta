@@ -56,10 +56,13 @@ differential-tested against qemu) — are implemented
 and pinned by a hand-written conformance suite (`make check`) plus the official
 RISC-V architectural tests (`make check-arch`, run offline against the suite's
 own committed reference signatures), an optional cache model sits in front of
-memory, a `--pipeline` timing model estimates cycles and CPI, and the first
-performance step past the naive interpreter — a **decoded-instruction cache**
+memory, a `--pipeline` timing model estimates cycles and CPI, and the
+performance steps past the naive interpreter — a **decoded-instruction cache**
 (M25a, physical-PC-keyed, flushed on `FENCE.I`, bit-identical to the interpreter
-by construction) — speeds the fetch/decode hot path.
+by construction) speeds the fetch/decode hot path, and a from-scratch
+**basic-block JIT** (M25b, `--jit`, opt-in) translates hot straight-line guest
+code to native x86-64 (`make check-jit` pins bit-exactness; ~7.8x on the bench
+loop, and the Linux/Alpine boots run under it).
 Quanta loads static little-endian ELF32/ELF64
 executables (`quanta program.elf`), services `write`/`exit` system calls through
 the ECALL path — the built-in SEE that runs until a guest installs its own trap
@@ -105,7 +108,8 @@ make check-hsm     # check SBI HSM: park/restart secondary harts (M22)
 make check-snapshot # check machine snapshot/restore replays a run bit-for-bit (E10)
 make check-replay  # check --snapshot/--restore file round-trip and resume (E10)
 make check-dcache  # check the decode cache is bit-identical to the interpreter (M25a)
-make bench         # time the interpreter with the decode cache on vs off (M25a)
+make check-jit     # check the basic-block JIT is bit-identical to the interpreter (M25b)
+make bench         # time the interpreter (dcache on/off) and the JIT (M25a/M25b)
 make check-os      # boot the M16 teaching kernel to userspace (needs cross-toolchain)
 make linux-initramfs # build the Linux initramfs (tests/linux/) for the OpenSBI->Linux boot (M18)
 make alpine-rootfs # build the Alpine RV64 ext4 rootfs (tests/alpine/) for the distribution boot (M24)
@@ -130,7 +134,11 @@ set-associative L1 over the run's data accesses and print a hit/miss summary at
 exit, and/or `--pipeline` to print a 5-stage cycle/CPI estimate. The overlays
 compose. Add `--no-dcache` to disable the decoded-instruction cache (M25a; on by
 default) and run the plain switch-dispatched interpreter — a bit-identical but
-slower reference, the mode `make check-dcache` compares against. Add `--gdb[=PORT]` (default 1234) to start a GDB remote stub and wait
+slower reference, the mode `make check-dcache` compares against. Add `--jit`
+(M25b; opt-in, x86-64 hosts only) to translate hot basic blocks to native code —
+bit-identical to the interpreter by the same differential contract (`make
+check-jit`), ~7.8x on the bench compute loop; it engages only on a uniprocessor
+and not under `--gdb`/`--trace` (see the JIT gotcha). Add `--gdb[=PORT]` (default 1234) to start a GDB remote stub and wait
 for a debugger to `target remote :PORT`; it drives execution itself, so it does
 not combine with `--trace`/`--pipeline`. Add `--memory=SIZE` (bytes, with an
 optional `K`/`M`/`G` suffix, e.g. `--memory=8M`) to grow the guest RAM region
@@ -348,6 +356,20 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   A pure speed overlay — the semantics are unchanged, so `cpu->dcache == NULL` is
   the bit-identical plain interpreter. The engine (`quanta.c`) owns the per-hart
   caches; `cpu_step` flushes on `FENCE.I`. See the decode-cache gotcha.
+- `src/jit.{h,c}` — the basic-block JIT (M25b, `--jit`): a from-scratch dynamic
+  binary translator to host x86-64 (a small hand-written emitter — no LLVM, no
+  libjit). Straight-line guest runs are translated once (keyed by physical PC,
+  tagged by virtual PC) into native code operating directly on the CPU struct;
+  base ALU ops inline, loads/stores and exotic ALU encodings call back into
+  `cpu_exec_mem`/`cpu_exec_alu` (the interpreter's own exec bodies, exported
+  from cpu.c), and control transfers end blocks with the next PC computed
+  natively. The dispatcher lives in `quanta_run`'s JIT fast path; cpu.c's
+  exported `cpu_pre_step` and `cpu_interrupt_horizon` keep multi-instruction
+  execution bit-exact at interrupt boundaries. Flushed on `FENCE.I` (via
+  `cpu->jit`) and machine restore; `make check-jit` (`tests/jit_test.c`) is the
+  on/off differential. The project's fourth OS-specific corner (POSIX mmap for
+  the RWX code arena, x86-64 only — elsewhere `jit_available()` is 0). See the
+  JIT gotcha.
 - `src/pipeline.{h,c}` — optional 5-stage pipeline *timing* model. Another
   overlay: `main.c`'s run loop feeds it each retired instruction word and whether
   control redirected, and it estimates cycles/CPI by charging load-use and
@@ -849,8 +871,57 @@ test `-march=rv32i_zicsr_zifencei`, the M9/M12 privilege and paging tests
   per-hart caches and re-wires + flushes them on restore, and adding the `dcache`
   pointer to `CPU` grew `sizeof(CPU)`, so old `--snapshot` files reject on the
   layout signature (documented-acceptable). Enabled by default; ~1.2x on the
-  `make bench` compute loop. (Threaded dispatch / operand pre-decode — the rest of
-  M25a's "decode cache + threaded dispatch" — is the next step; the JIT is M25b.)
+  `make bench` compute loop. (Threaded dispatch / operand pre-decode was folded
+  into the M25b JIT below, which subsumes it.)
+- Basic-block JIT (M25b, `src/jit.{h,c}`, `--jit`, **opt-in**): translates
+  straight-line guest runs to host x86-64 once and re-executes them natively;
+  the interpreter stays the bit-exact golden reference (`make check-jit` /
+  `tests/jit_test.c` — halt, exit, **step count**, and a PC+regs+RAM fingerprint,
+  on/off, over the RV32+RV64 fleets). What makes multi-instruction execution
+  bit-exact (the design core — preserve these invariants): **(1)** the
+  dispatcher (`quanta_run`'s JIT path) runs `cpu_pre_step` — the interpreter's
+  own prologue, exported — so pending interrupts are taken at the same boundary;
+  it is idempotent when nothing fires, so falling back to `cpu_step` re-runs it
+  harmlessly. **(2)** `cpu_interrupt_horizon` (cpu.c) bounds how many
+  instructions can retire before a *time-driven* interrupt (CLINT MTIP, the SBI
+  STIP relay, Sstc) could newly become takeable, mirroring `take_interrupt`'s
+  enable/delegation/privilege gates — a block longer than the horizon is not
+  entered. The gates only change via CSR writes/traps/mret, and **SYSTEM, AMO,
+  FP, and FENCE.I are never translated** (they end blocks), so the gates are
+  constants within one. **(3)** every translated load/store calls `jit_h_mem`,
+  which probes the physical target first and **aborts the block before
+  executing** an MMIO access (status 3: pc already points at the instruction,
+  nothing consumed — the interpreter re-runs it at a true boundary with mtime
+  exact); a CLINT `mtime` read from inside a block would otherwise see a stale
+  clock, and a device write can move interrupt lines. **(4)** every exit path
+  credits the exact retired count to `instret` (a trap exit credits the k
+  earlier instructions and consumes k+1 steps), and the engine advances `mtime`
+  by `consumed - 1` after the entry tick — so instret/mtime/steps read exactly
+  as if each instruction had been `cpu_step`ped, which the differential's
+  step-count compare pins. **(5)** blocks are keyed by **physical** PC but
+  tagged with the **virtual** PC too (AUIPC/JAL/branch targets are embedded
+  VA-derived constants — remapped code must retranslate), never cross a page
+  boundary, and flush on `FENCE.I` (via `cpu->jit`) and restore — satp writes
+  and `sfence.vma` do **not** flush, same PA-keying argument as the decode
+  cache; the per-block entry check `mmu_translate(pc, ACC_FETCH)` re-validates
+  the mapping like the interpreter's per-step fetch. **(6)** helpers reuse the
+  interpreter's own exec bodies (`cpu_exec_alu`/`cpu_exec_mem`, exported from
+  cpu.c with the fault→trap tail folded in), so semantics can't drift; inline
+  emission is a strict subset (base ALU rows, funct6-discriminated shifts) and
+  anything else falls back to the helper. **(7)** uniprocessor only (M19's
+  round-robin must stay one-instruction-grained) and only inside `quanta_run` —
+  `quanta_step` (gdb, `--trace`, pipeline) always interprets; `--harts=N`
+  silently leaves the JIT unattached. **(8)** x86-64 POSIX only (mmap RWX arena
+  — the fourth OS-specific corner); elsewhere `--jit` errors out. Adding
+  `cpu->jit` grew `sizeof(CPU)`, so old snapshot files reject (documented-
+  acceptable; the JIT itself is derived state, never snapshotted). Measured:
+  ~7.8x on `make bench`'s compute loop, ~1.4x on the Linux-boot wall clock
+  (2.9 s → 2.1 s to the init prompt; Alpine-from-ext4 boots under it too). The
+  full-system gap is the follow-up roadmap: loads/stores pay a helper call plus
+  a second translation (the MMIO probe), AMO/CSR-heavy kernel paths interpret,
+  and kernel blocks are short so per-block dispatch (lookup + horizon) weighs
+  in — inline RAM fast paths and cheaper dispatch come before flipping the
+  default on.
 - Privilege and traps (M9): the hart tracks a current mode (`PRIV_M`/`S`/`U`,
   resets to M) and `raise_trap` is the one path every synchronous exception
   takes. It resolves the target mode via `medeleg` (a trap in S/U delegates to

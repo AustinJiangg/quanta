@@ -5,6 +5,7 @@
 #include "sbi.h"
 #include "cache.h"
 #include "decodecache.h"
+#include "jit.h"
 #include "mmu.h"
 #include "device.h"
 #include "softfloat.h"
@@ -68,6 +69,7 @@ void cpu_init(CPU *cpu, Memory *mem, uint64_t entry_pc, int xlen) {
     cpu->mem       = mem;
     cpu->cache     = NULL;
     cpu->dcache    = NULL; /* the engine attaches one (M25a); NULL = plain interp */
+    cpu->jit       = NULL; /* the engine attaches one (M25b); only FENCE.I uses it */
     cpu->halted      = 0;
     cpu->halt_reason = HALT_NONE;
     cpu->exit_code   = 0;
@@ -129,9 +131,12 @@ static void break_reservation(CPU *cpu, uint64_t addr) {
  * (clz/ctz/cpop/rev8/orc.b) branch on cpu->xlen (`bits`).
  * ------------------------------------------------------------------------ */
 
-/* All-ones mask for the low `bits` bits (bits is 32 or 64). */
+/* All-ones mask for the low `bits` bits (bits is 32 or 64). The shift operand
+ * is masked into [0,63] so the expression is defined for any argument — the
+ * same guard bm_bits128 carries, which keeps the analyzer clean now that
+ * cpu_exec_alu (M25b) exposes these paths with unconstrained arguments. */
 static inline uint64_t bm_mask(int bits) {
-    return bits == 64 ? ~(uint64_t)0 : (((uint64_t)1 << bits) - 1);
+    return bits >= 64 ? ~(uint64_t)0 : (((uint64_t)1 << (bits & 63)) - 1);
 }
 
 static int bm_clz(uint64_t v, int bits) {
@@ -650,12 +655,15 @@ static uint64_t exec_branch(CPU *cpu, uint32_t inst, uint32_t ilen) {
 }
 
 /* Execute LOAD: read memory into a register. The address is virtual; translate
- * it first, raising a load page fault if the mapping is missing or unreadable. */
-static void exec_load(CPU *cpu, uint32_t inst) {
+ * it first, raising a load page fault if the mapping is missing or unreadable.
+ * `pa_out` (if non-NULL) receives the translated physical address, so the JIT
+ * helper can tell a device access from a RAM one (M25b). */
+static void exec_load(CPU *cpu, uint32_t inst, uint64_t *pa_out) {
     uint64_t va = reg_read(cpu, rs1(inst)) + (uint64_t)imm_i(inst);
     uint64_t pa;
     uint32_t fault = mmu_translate(cpu, va, ACC_LOAD, &pa);
     if (fault) { raise_trap(cpu, fault, va); return; }
+    if (pa_out) *pa_out = pa;
     uint64_t result = 0;
 
     if (cpu->cache) cache_access(cpu->cache, pa, 0); /* observe, don't alter */
@@ -673,13 +681,15 @@ static void exec_load(CPU *cpu, uint32_t inst) {
 }
 
 /* Execute STORE: write a register to memory, translating the virtual address
- * first (a store page fault if the page is missing or read-only). */
-static void exec_store(CPU *cpu, uint32_t inst) {
+ * first (a store page fault if the page is missing or read-only). `pa_out` is
+ * the JIT's device-access probe, as in exec_load. */
+static void exec_store(CPU *cpu, uint32_t inst, uint64_t *pa_out) {
     uint64_t va  = reg_read(cpu, rs1(inst)) + (uint64_t)imm_s(inst);
     uint64_t val = reg_read(cpu, rs2(inst));
     uint64_t pa;
     uint32_t fault = mmu_translate(cpu, va, ACC_STORE, &pa);
     if (fault) { raise_trap(cpu, fault, va); return; }
+    if (pa_out) *pa_out = pa;
 
     break_reservation(cpu, pa); /* RV-A: a plain store can void an LR/SC pair */
     if (cpu->cache) cache_access(cpu->cache, pa, 1); /* observe, don't alter */
@@ -1460,30 +1470,34 @@ static uint64_t exec_system(CPU *cpu, uint32_t inst) {
     return cpu->pc + 4;
 }
 
+/* The instruction-boundary prologue shared by cpu_step and the JIT dispatcher
+ * (M25b — see cpu.h). Take any pending interrupt before fetch, at this
+ * instruction boundary; a taken interrupt vectors into the handler and retires
+ * nothing. (The platform timer advances once per scheduler round, driven by
+ * the engine, so mtime ticks at one rate no matter the hart count.) */
+int cpu_pre_step(CPU *cpu) {
+    if (!cpu->mem->plat) return 0;
+    uint32_t off_code;
+    if (plat_poweroff_requested(cpu->mem->plat, &off_code)) {
+        /* The SiFive test device was written (OpenSBI SRST / Linux poweroff):
+         * stop the machine with the requested status. */
+        cpu->exit_code   = off_code;
+        cpu->halt_reason = HALT_EXIT;
+        cpu->halted      = 1;
+        return 1;
+    }
+    firmware_timer_tick(cpu); /* convert a reached SBI deadline into STIP */
+    sstc_tick(cpu);           /* or drive STIP directly from stimecmp (Sstc) */
+    return take_interrupt(cpu);
+}
+
 void cpu_step(CPU *cpu) {
     /* Clear any stale fault; a faulting access this step sets it and we turn
      * that into a trap rather than letting the access abort the host. */
     cpu->mem->fault = 0;
     cpu->trapped = 0; /* set by raise_trap if this step vectors into a handler */
 
-    /* Take any pending interrupt before fetch, at this instruction boundary. A
-     * taken interrupt vectors into the handler and retires nothing, so we return
-     * without fetching. (The platform timer advances once per scheduler round,
-     * driven by the engine, so mtime ticks at one rate no matter the hart count.) */
-    if (cpu->mem->plat) {
-        uint32_t off_code;
-        if (plat_poweroff_requested(cpu->mem->plat, &off_code)) {
-            /* The SiFive test device was written (OpenSBI SRST / Linux poweroff):
-             * stop the machine with the requested status. */
-            cpu->exit_code   = off_code;
-            cpu->halt_reason = HALT_EXIT;
-            cpu->halted      = 1;
-            return;
-        }
-        firmware_timer_tick(cpu); /* convert a reached SBI deadline into STIP */
-        sstc_tick(cpu);           /* or drive STIP directly from stimecmp (Sstc) */
-        if (take_interrupt(cpu)) return;
-    }
+    if (cpu_pre_step(cpu)) return; /* power-off, or an interrupt was taken */
 
     /* FETCH. Translate the PC to a physical address (fault-checked every step,
      * hit or miss) and, when a decode cache is attached, look the physical
@@ -1579,11 +1593,11 @@ void cpu_step(CPU *cpu) {
             break;
 
         case OP_LOAD:
-            exec_load(cpu, inst);
+            exec_load(cpu, inst, NULL);
             break;
 
         case OP_STORE:
-            exec_store(cpu, inst);
+            exec_store(cpu, inst, NULL);
             break;
 
         case OP_AMO:
@@ -1615,7 +1629,10 @@ void cpu_step(CPU *cpu) {
              * to its own fetches, so it flushes the decoded-instruction cache —
              * the only event that can change what a cached physical address
              * decodes to (M25a — see decodecache.h). Both still just PC += 4. */
-            if (funct3(inst) == 0x1) dcache_flush(cpu->dcache);
+            if (funct3(inst) == 0x1) {
+                dcache_flush(cpu->dcache);
+                if (cpu->jit) jit_flush(cpu->jit); /* M25b: same Zifencei contract */
+            }
             break;
 
         case OP_SYSTEM:
@@ -1646,6 +1663,86 @@ void cpu_step(CPU *cpu) {
 
     cpu->instret++; /* the instruction retired; drives the counter CSRs */
     cpu->pc = sext_xlen(cpu, next_pc); /* keep the sext invariant on PC */
+}
+
+/* ------------------------------------------------------------------------
+ * JIT support (M25b): the fragments of a step the translated code cannot (or
+ * should not) inline are exported here, built on the same static exec_*
+ * functions cpu_step dispatches to — so the JIT and the interpreter execute
+ * an instruction through one body of code and cannot disagree.
+ * ------------------------------------------------------------------------ */
+
+/* One integer ALU instruction, any encoding (see cpu.h). "Did not retire" is
+ * cpu->trapped (a guest handler took an illegal-instruction trap) or
+ * cpu->halted (the trap fell back to the SEE, which stops the machine). */
+int cpu_exec_alu(CPU *cpu, uint32_t inst) {
+    cpu->trapped = 0;
+    switch (opcode(inst)) {
+        case OP_IMM:    exec_op_imm(cpu, inst);   break;
+        case OP_IMM_32: exec_op_imm32(cpu, inst); break;
+        case OP_REG:    exec_op(cpu, inst);       break;
+        case OP_REG_32: exec_op32(cpu, inst);     break;
+        default:        raise_trap(cpu, CAUSE_ILLEGAL_INSN, inst); break;
+    }
+    return (cpu->trapped || cpu->halted) ? 1 : 0;
+}
+
+/* One LOAD or STORE, with cpu_step's out-of-range tail folded in: an access
+ * that left mapped memory becomes the same access-fault trap, checked before
+ * cpu->trapped exactly as the interpreter orders it. */
+int cpu_exec_mem(CPU *cpu, uint32_t inst, uint64_t *pa_out) {
+    cpu->mem->fault = 0;
+    cpu->trapped = 0;
+    if (opcode(inst) == OP_LOAD) exec_load(cpu, inst, pa_out);
+    else                         exec_store(cpu, inst, pa_out);
+    if (cpu->mem->fault) {
+        uint32_t cause = (opcode(inst) == OP_STORE) ? CAUSE_STORE_ACCESS
+                                                    : CAUSE_LOAD_ACCESS;
+        raise_trap(cpu, cause, cpu->mem->fault_addr);
+        return 1;
+    }
+    return (cpu->trapped || cpu->halted) ? 1 : 0;
+}
+
+/* The time-driven interrupt horizon (see cpu.h). Mirrors take_interrupt's
+ * gates: a source bounds the horizon only if its assertion would actually be
+ * taken — enabled in mie, and the destination privilege's global gate open.
+ * Those gates change only via CSR writes, mret/sret, or traps, none of which
+ * a translated block contains; every non-time source needs an MMIO access
+ * (which ends a block) or host input (which arrives between run chunks). */
+uint64_t cpu_interrupt_horizon(CPU *cpu) {
+    const uint64_t far = (uint64_t)1 << 62; /* effectively unbounded */
+    uint64_t h = far;
+    Platform *p = cpu->mem->plat;
+    if (!p) return h;
+
+    uint32_t mie     = (uint32_t)cpu->csr[CSR_MIE];
+    uint32_t mideleg = (uint32_t)cpu->csr[CSR_MIDELEG];
+    uint32_t ms      = (uint32_t)cpu->csr[CSR_MSTATUS];
+    int m_on = (cpu->priv < PRIV_M) || (ms & MSTATUS_MIE);
+    int s_on = (cpu->priv < PRIV_S) ||
+               ((cpu->priv == PRIV_S) && (ms & MSTATUS_SIE));
+
+    uint64_t mtime    = p->clint.mtime;
+    uint64_t mtimecmp = p->clint.mtimecmp[cpu->hartid];
+    uint64_t d_mtip   = (mtime >= mtimecmp) ? 0 : mtimecmp - mtime;
+
+    if (mie & (1u << IRQ_MTIMER)) { /* the machine timer itself */
+        int gate = ((mideleg >> IRQ_MTIMER) & 1u) ? s_on : m_on;
+        if (gate && d_mtip < h) h = d_mtip;
+    }
+    if (mie & (1u << IRQ_STIMER)) { /* STIP, via either relay */
+        int gate = ((mideleg >> IRQ_STIMER) & 1u) ? s_on : m_on;
+        if (gate) {
+            if (cpu->sbi_timer_armed && d_mtip < h) h = d_mtip;
+            if (cpu->csr[CSR_MENVCFG] & MENVCFG_STCE) {
+                uint64_t cmp = cpu->csr[CSR_STIMECMP];
+                uint64_t d = (cpu->instret >= cmp) ? 0 : cmp - cpu->instret;
+                if (d < h) h = d;
+            }
+        }
+    }
+    return h;
 }
 
 const char *halt_reason_str(HaltReason r) {

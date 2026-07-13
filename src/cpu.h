@@ -136,6 +136,9 @@ typedef struct CPU {
     struct Cache *cache;    /* optional cache model; NULL if off (not owned) */
     struct DecodeCache *dcache; /* optional decoded-instruction cache (M25a);
                                  * NULL => the plain interpreter (not owned) */
+    struct Jit *jit;        /* optional basic-block JIT (M25b); the pointer is
+                             * here only so FENCE.I can flush it — dispatch
+                             * lives in the engine, not cpu_step (not owned) */
     int      halted;        /* set when execution should stop */
     HaltReason halt_reason; /* why it stopped (meaningful once halted) */
     uint32_t exit_code;     /* status the exit syscall passed in a0 */
@@ -168,6 +171,43 @@ void reg_write(CPU *cpu, uint32_t i, uint64_t value);
  * or to a branch/jump target). On a memory fault it records HALT_MEM_FAULT and
  * stops instead of advancing. */
 void cpu_step(CPU *cpu);
+
+/* ------------------------------------------------------------------------
+ * JIT support (M25b). The basic-block JIT executes translated guest code
+ * outside cpu_step, so the pieces of a step it must reproduce exactly are
+ * exported here. Each mirrors a fragment of cpu_step and is also used *by*
+ * cpu_step, so the two engines cannot drift apart.
+ * ------------------------------------------------------------------------ */
+
+/* The instruction-boundary prologue of a step: poll for a platform power-off,
+ * run the firmware/Sstc timer relays, and take a pending interrupt. Returns 1
+ * when the step is consumed (the hart halted or vectored into a handler and
+ * retires nothing this round), 0 to proceed to fetch/execute. Idempotent when
+ * it returns 0, so a JIT dispatch that runs it and then falls back to
+ * cpu_step (which runs it again) stays bit-exact. */
+int cpu_pre_step(CPU *cpu);
+
+/* Execute one OP / OP-IMM / OP-32 / OP-IMM-32 instruction (any encoding,
+ * including the M and bit-manip extensions) exactly as cpu_step would.
+ * cpu->pc must already hold the instruction's address (a raised trap saves
+ * it). Returns 0 if the instruction retired, 1 if it trapped or halted. */
+int cpu_exec_alu(CPU *cpu, uint32_t inst);
+
+/* Execute one LOAD or STORE exactly as cpu_step would, including the
+ * out-of-range-access trap conversion. On success *pa_out (if non-NULL) holds
+ * the translated physical address, so a caller can tell a device access from
+ * a RAM one. Returns 0 if the instruction retired, 1 if it trapped/halted. */
+int cpu_exec_mem(CPU *cpu, uint32_t inst, uint64_t *pa_out);
+
+/* How many instructions may retire, starting now, before a *time-driven*
+ * interrupt (the CLINT machine timer, the SBI firmware STIP relay, or an Sstc
+ * stimecmp compare) could newly become takeable at an instruction boundary —
+ * given the current enable/delegation/privilege gates, which only a trap or a
+ * CSR write can change. Every other interrupt source is device-driven and can
+ * only change via MMIO or host input. Call it right after cpu_pre_step()
+ * returned 0; the JIT runs a translated block only if it is shorter than
+ * this. */
+uint64_t cpu_interrupt_horizon(CPU *cpu);
 
 /* Arm the supervisor timer on behalf of the SBI (M15 follow-up): set the CLINT
  * comparator to `deadline`, clear any pending supervisor timer interrupt, and

@@ -57,7 +57,7 @@ LIB_OBJ := $(LIB_SRC:.c=.o)
 LIB     := libquanta.a
 BIN     := quanta
 
-.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-virtnet check-net check-smp check-hsm check-os check-rv64 check-diff check-arch check-snapshot check-replay check-dcache bench embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean alpine-rootfs
+.PHONY: all run tests check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi linux-initramfs check-devices check-sbi check-uart-rx check-virtio check-virtnet check-net check-smp check-hsm check-os check-rv64 check-diff check-arch check-snapshot check-replay check-dcache check-jit bench embed sanitize fuzz fuzz-replay coverage analyze install uninstall debug clean alpine-rootfs
 
 all: $(BIN)
 
@@ -424,8 +424,28 @@ check-dcache: tests/dcache_test $(DCACHE_ELF)
 tests/dcache_test: tests/dcache_test.c $(LIB) $(wildcard src/*.h)
 	$(CC) $(CFLAGS) -o $@ tests/dcache_test.c $(LIB) $(LDFLAGS)
 
+# Basic-block JIT differential (M25b): run each guest with the JIT on and off
+# and assert bit-identical results *and step counts* — translated execution
+# must be indistinguishable from the interpreter. The list is broad: the whole
+# RV32 conformance fleet (straight-line code, traps, Sv32 paging, device
+# interrupts, the SBI timers), the RV64 fleet it can load standalone (Sv39,
+# Sstc, the S-mode PLIC context, floats falling back to the interpreter), and
+# smc.elf for the FENCE.I flush. Skips cleanly on a non-x86-64 host.
+JIT_ELF := $(TEST_ELF) tests/smc.elf tests/bench.elf \
+           tests/rv64/test_rv64.elf tests/rv64/test_rv64c.elf \
+           tests/rv64/test_rv64_bitmanip.elf tests/rv64/test_rv64_fpu.elf \
+           tests/rv64/test_rv64_priv.elf tests/rv64/test_rv64_vm.elf \
+           tests/rv64/test_rv64_sstc.elf tests/rv64/test_rv64_plic.elf
+
+check-jit: tests/jit_test $(JIT_ELF)
+	./tests/jit_test $(JIT_ELF)
+
+tests/jit_test: tests/jit_test.c $(LIB) $(wildcard src/*.h)
+	$(CC) $(CFLAGS) -o $@ tests/jit_test.c $(LIB) $(LDFLAGS)
+
 # Time the interpreter with the decode cache on vs off on a long compute loop
-# (M25a). A wall-clock demonstration of the speedup, not a pass/fail check.
+# (M25a), and the M25b JIT against both. A wall-clock demonstration of the
+# speedup, not a pass/fail check.
 bench: $(BIN) tests/bench.elf
 	@sh tests/bench.sh
 
@@ -458,7 +478,7 @@ sanitize:
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -g -O1 $(SANFLAGS) -Isrc" \
 		embed check check-disasm check-cache check-pipeline check-gdb \
 		check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-virtnet check-net \
-		check-smp check-hsm check-os check-rv64 check-diff check-snapshot check-replay check-dcache
+		check-smp check-hsm check-os check-rv64 check-diff check-snapshot check-replay check-dcache check-jit
 
 # Fuzzing. `make fuzz` builds the libFuzzer harnesses (clang only): each links
 # the engine sources under -fsanitize=fuzzer,address,undefined. `make fuzz-replay`
@@ -489,7 +509,7 @@ COVFLAGS := -std=c11 -Wall -Wextra -g -O0 --coverage -Isrc
 
 coverage:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-virtnet check-net check-smp check-os check-snapshot check-replay check-dcache
+	$(MAKE) CFLAGS="$(COVFLAGS)" all embed check check-disasm check-cache check-pipeline check-gdb check-console check-opensbi check-devices check-sbi check-uart-rx check-virtio check-virtnet check-net check-smp check-os check-snapshot check-replay check-dcache check-jit
 	@sh tests/coverage.sh
 
 # Static analysis: run whatever analyzers are installed (cppcheck, clang-tidy),
@@ -517,7 +537,7 @@ uninstall:
 		$(DESTDIR)$(PREFIX)/share/man/man1/quanta.1
 
 clean:
-	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/snapshot_test tests/net_test tests/dcache_test tests/*.elf \
+	rm -f $(BIN) $(LIB) src/*.o examples/embed tests/snapshot_test tests/net_test tests/dcache_test tests/jit_test tests/*.elf \
 		tests/os/*.elf tests/rv64/*.elf $(FUZZ_TARGETS) fuzz/*.replay \
 		src/*.gcno src/*.gcda examples/*.gcno examples/*.gcda
 	rm -rf build/arch-work build/coverage

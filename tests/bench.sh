@@ -1,8 +1,8 @@
 #!/bin/sh
-# M25a: time the interpreter with the decoded-instruction cache on vs off on the
-# long compute loop tests/bench.elf, and report the speedup. Uses best-of-N user
-# CPU time (steadier than wall clock under load). Observability only — not a
-# pass/fail check (make bench), so it never fails the build.
+# M25a/M25b: time the interpreter (decode cache off / on) and the basic-block
+# JIT on the long compute loop tests/bench.elf, and report the speedups. Uses
+# best-of-N user CPU time (steadier than wall clock under load). Observability
+# only — not a pass/fail check (make bench), so it never fails the build.
 
 set -u
 BIN=./quanta
@@ -31,8 +31,13 @@ best_user() {
 echo "Timing $ELF (best user-time of $RUNS runs each)..."
 off=$(best_user "--no-dcache")
 on=$(best_user "")
+jit=$(best_user "--jit")
 echo "  decode cache OFF : ${off} s"
 echo "  decode cache ON  : ${on} s"
+echo "  JIT              : ${jit} s"
 if [ "$off" != "n/a" ] && [ "$on" != "n/a" ]; then
-    awk "BEGIN{ if ($on>0) printf \"  speedup          : %.2fx\n\", $off/$on }"
+    awk "BEGIN{ if ($on>0) printf \"  dcache speedup   : %.2fx\n\", $off/$on }"
+fi
+if [ "$on" != "n/a" ] && [ "$jit" != "n/a" ]; then
+    awk "BEGIN{ if ($jit>0) printf \"  jit speedup      : %.2fx over the interpreter\n\", $on/$jit }"
 fi

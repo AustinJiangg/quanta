@@ -1508,26 +1508,66 @@ modest (~1.3x) against a large, correctness-sensitive refactor (a leaf handler
 per instruction, all bit-exact), and true threaded (computed-goto) dispatch
 chains across instructions, which is in tension with the M19 round-robin
 scheduler's one-instruction-per-hart return. The order-of-magnitude step is the
-M25b JIT, which supersedes the interpreter hot path anyway. **Still open for
-M25a:** the threaded-dispatch half, weighed against going straight to M25b.
+M25b JIT, which supersedes the interpreter hot path anyway — so M25a's
+threaded-dispatch half was **skipped in favour of going straight to M25b**,
+which subsumes it (a translated block *is* threaded dispatch, minus the
+per-instruction indirection).
 
-- [ ] **Build (M25a — decode cache + threaded dispatch):** pre-decode each
-  instruction into an internal micro-op the first time its PC is executed, cache
-  it per address, and dispatch through computed-goto / function-pointer threading
-  instead of the central `switch`. A large speedup at modest complexity, still
-  portable. *(Decode cache done; threaded dispatch next.)*
+**The basic-block JIT has landed (M25b, first commit — `--jit`, opt-in).**
+`src/jit.{h,c}` is a from-scratch dynamic binary translator: straight-line runs
+of guest instructions are translated once into host x86-64 (a small hand-written
+emitter, no LLVM/libjit — the no-dependency contract holds; ~1000 lines) and
+re-executions run native code operating directly on the CPU struct. Hot base
+ALU ops are inlined; anything subtle calls back into the *same* `exec_*` bodies
+the interpreter dispatches to (`cpu_exec_alu`/`cpu_exec_mem`), so the two
+engines cannot drift. Blocks end at control transfers (branch/JAL/JALR emit the
+next PC natively), at SYSTEM/AMO/FP/FENCE.I, at a page boundary, and at
+`JIT_MAX_INSNS`. What makes multi-instruction execution bit-exact — the design
+problem of the milestone — is boundary accounting: the dispatcher runs the
+interpreter's own step prologue first (`cpu_pre_step`), a *time-driven*
+interrupt horizon (`cpu_interrupt_horizon`) keeps any block from running past
+the step where a CLINT/Sstc/SBI-relay interrupt could newly fire, every MMIO
+data access aborts its block *before* executing and is re-run by the
+interpreter at a true boundary (device reads are time-sensitive, device writes
+move interrupt lines), and each exit path credits the exact retired count to
+`instret` while the engine advances `mtime` by the consumed steps. Blocks are
+keyed by physical PC *and* tagged by virtual PC (they embed VA-derived
+constants), survive satp/sfence.vma like the decode cache, and flush on FENCE.I
+(`tests/smc.S` pins it). `make check-jit` (`tests/jit_test.c`) is the on/off
+differential — halt reason, exit code, **step count**, and a PC+registers+RAM
+fingerprint over the whole RV32 fleet, the standalone RV64 fleet, and a
+100M-step bench truncation — all bit-identical; the full suite plus
+`make sanitize` stays green with the JIT exercised. Measured: **7.8x** over the
+interpreter on the `make bench` compute loop (0.53 s vs 4.14 s), **~1.4x** on
+the full OpenSBI → Linux 6.6 → shell boot (2.90 s → 2.06 s to the init prompt).
+The full-system gap is the roadmap for the next commits: loads/stores call a
+helper (with a second translation for the MMIO probe), AMO/CSR-heavy kernel
+paths still interpret, and kernel blocks are short so per-block dispatch
+(lookup + horizon) weighs more — inline RAM fast paths and cheaper dispatch are
+the follow-up levers. The JIT engages only on a uniprocessor (SMP's round-robin
+interleaving must stay one-instruction-grained) and only inside `quanta_run`;
+`--gdb`/`--trace`/`quanta_step` always interpret. x86-64 POSIX hosts only —
+elsewhere `--jit` is refused and nothing changes.
+
+- [x] **Build (M25a — decode cache):** pre-decode each instruction the first
+  time its PC is executed and cache it per physical address. *(Threaded
+  dispatch was folded into M25b — a translated block is the stronger form.)*
 - [ ] **Build (M25b — basic-block JIT):** a from-scratch dynamic binary translator
   that compiles hot basic blocks to host x86-64 (no LLVM/libjit — a small
   hand-written code generator, in keeping with the no-dependency contract), with
   hot-path detection and a fallback to the interpreter for cold or unsupported
-  paths.
-- [ ] **ISA:** none new — an execution-engine rewrite behind the same semantics.
-- [ ] **Concept:** interpreter dispatch overhead; dynamic binary translation; hot-
+  paths. *(Landed opt-in behind `--jit`: translator, dispatcher, differential
+  suite. Next: inline the RAM load/store fast path, trim per-block dispatch,
+  then flip the default on.)*
+- [x] **ISA:** none new — an execution-engine rewrite behind the same semantics.
+- [x] **Concept:** interpreter dispatch overhead; dynamic binary translation; hot-
   path detection; register allocation for a JIT.
 - [ ] **Done when:** a measurable speedup (e.g. Linux boot time cut several-fold)
-  with results **bit-identical** to the interpreter, differential-tested against it.
-- [ ] **Commits:** `perf: add a decoded-instruction cache`,
-  `perf: thread the interpreter dispatch`, `feat: add a basic-block jit`.
+  with results **bit-identical** to the interpreter, differential-tested against
+  it. *(Bit-identical: pinned by `make check-jit`. Compute loop 7.8x; the
+  Linux-boot several-fold cut is the remaining bar.)*
+- [ ] **Commits:** `perf: add a decoded-instruction cache` (done),
+  `feat: add a basic-block jit` (done), then the fast-path/dispatch follow-ups.
 
 ### Stage 8 — Vector (M26, long-horizon capstone)
 

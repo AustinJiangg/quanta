@@ -5,6 +5,7 @@
 #include "elf.h"
 #include "cache.h"
 #include "decodecache.h"
+#include "jit.h"
 #include "device.h"
 #include "dtb.h"
 #include "decode.h"
@@ -45,6 +46,9 @@ struct Quanta {
     int      cache_on;  /* a cache has been attached */
     int      dcache_on; /* the decoded-instruction cache is enabled (M25a; default) */
     DecodeCache *dcaches[QUANTA_MAX_HARTS]; /* per-hart decode caches (engine-owned) */
+    int      jit_on;    /* the basic-block JIT was requested (M25b; opt-in) */
+    Jit     *jit;       /* the JIT, when requested + supported (engine-owned);
+                         * engaged only on a uniprocessor, inside quanta_run */
     int      loaded;    /* memory is initialised and PC/sp are set */
     int      netdev_advertised; /* emit the virtio-net node in the boot DTB (M23) */
     int      disk_advertised;   /* emit the virtio-blk node in the boot DTB (M24) */
@@ -99,6 +103,20 @@ static void attach_dcaches(Quanta *q) {
     }
 }
 
+/* Attach or detach the JIT to match jit_on and the machine shape. The JIT
+ * engages only on a uniprocessor (the M19 scheduler interleaves SMP harts one
+ * instruction at a time; block execution would change the interleaving), and
+ * only hart 0 carries the pointer (used solely for the FENCE.I flush — the
+ * dispatch itself lives in quanta_run). Allocated lazily and reused, flushed
+ * across reloads/restores; allocation failure falls back to the interpreter. */
+static void attach_jit(Quanta *q) {
+    int want = q->jit_on && q->nharts == 1;
+    if (want && !q->jit) q->jit = jit_new(); /* NULL if unsupported / OOM */
+    if (q->jit) jit_flush(q->jit); /* stale after a (re)load or restore */
+    for (int i = 0; i < q->nharts; i++)
+        q->harts[i].jit = (want && i == 0) ? q->jit : NULL;
+}
+
 QuantaStatus quanta_set_harts(Quanta *q, int nharts) {
     if (!q || q->loaded) return QUANTA_ERR_INVAL;      /* set before loading */
     if (nharts < 1 || nharts > (int)QUANTA_MAX_HARTS) return QUANTA_ERR_INVAL;
@@ -110,6 +128,18 @@ void quanta_set_dcache(Quanta *q, int on) {
     if (!q) return;
     q->dcache_on = on ? 1 : 0;
     if (q->loaded) attach_dcaches(q); /* (de)attach immediately if already running */
+}
+
+QuantaStatus quanta_set_jit(Quanta *q, int on) {
+    if (!q) return QUANTA_ERR_INVAL;
+    if (on && !jit_available()) return QUANTA_ERR_INVAL; /* not an x86-64 host */
+    q->jit_on = on ? 1 : 0;
+    if (q->loaded) attach_jit(q); /* (de)attach immediately if already running */
+    return QUANTA_OK;
+}
+
+int quanta_jit_available(void) {
+    return jit_available();
 }
 
 /* Update the machine-level halt state, polled after every hart step. The whole
@@ -137,6 +167,7 @@ static void machine_poll_halt(Quanta *q) {
 void quanta_destroy(Quanta *q) {
     if (!q) return;
     for (unsigned i = 0; i < QUANTA_MAX_HARTS; i++) dcache_free(q->dcaches[i]);
+    jit_free(q->jit);
     if (q->cache_on) cache_free(&q->cache);
     if (q->plat.disk.file) {           /* flush write-through and release the handle */
         fflush(q->plat.disk.file);
@@ -172,6 +203,7 @@ static void start_at(Quanta *q, uint64_t entry, int xlen) {
     q->sched = 0;
     q->m_halted = 0; q->m_reason = HALT_NONE; q->m_exit = 0;
     attach_dcaches(q);        /* per-hart decode caches (M25a), flushed for the new image */
+    attach_jit(q);            /* the basic-block JIT (M25b), when requested */
     q->loaded = 1;
 }
 
@@ -494,7 +526,25 @@ QuantaHalt quanta_step(Quanta *q) {
 QuantaHalt quanta_run(Quanta *q, uint64_t max_steps, uint64_t *steps_out) {
     uint64_t cap = max_steps ? max_steps : QUANTA_DEFAULT_MAX_STEPS;
     uint64_t steps = 0;
-    if (q && q->loaded) {
+    if (q && q->loaded && q->harts[0].jit) {
+        /* The JIT fast path (M25b): a uniprocessor (attach_jit guarantees it,
+         * so the scheduler cursor stays 0) advancing by translated blocks when
+         * it can, one interpreter step when it cannot. A block's return is the
+         * scheduler steps it consumed: the entry tick already happened, so
+         * mtime advances by the remaining consumed - 1 — after which both
+         * clocks read exactly as if each instruction had been stepped. */
+        CPU *h = &q->harts[0];
+        while (!q->m_halted && steps < cap) {
+            plat_tick(&q->plat);
+            if (!h->halted) {
+                uint64_t consumed = jit_run(q->jit, h, cap - steps);
+                if (!consumed) { cpu_step(h); consumed = 1; }
+                steps += consumed;
+                q->plat.clint.mtime += consumed - 1;
+            }
+            machine_poll_halt(q);
+        }
+    } else if (q && q->loaded) {
         while (!q->m_halted && steps < cap) {
             if (q->sched == 0) plat_tick(&q->plat);   /* one tick per scheduler round */
             CPU *h = &q->harts[q->sched];
@@ -616,6 +666,7 @@ QuantaStatus quanta_restore(Quanta *q, const QuantaSnapshot *s) {
         q->harts[i].mem   = &q->mem;
         q->harts[i].cache = s->cache_on ? &q->cache : NULL;
         q->harts[i].dcache = NULL; /* re-wired by attach_dcaches below */
+        q->harts[i].jit    = NULL; /* re-wired by attach_jit below */
     }
 
     q->nharts   = s->nharts;   q->sched    = s->sched;
@@ -646,6 +697,7 @@ QuantaStatus quanta_restore(Quanta *q, const QuantaSnapshot *s) {
 
     attach_dcaches(q); /* re-wire the borrowed decode-cache pointers, flushed for
                         * the restored RAM (M25a; derived state, not in the snapshot) */
+    attach_jit(q);     /* likewise the JIT (M25b): derived state, flushed */
     return QUANTA_OK;
 }
 

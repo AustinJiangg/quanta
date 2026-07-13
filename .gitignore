@@ -4,6 +4,7 @@
 /tests/snapshot_test
 /tests/net_test
 /tests/dcache_test
+/tests/jit_test
 /fuzz/fuzz_elf
 /fuzz/fuzz_decode
 /fuzz/*.replay

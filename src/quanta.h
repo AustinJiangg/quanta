@@ -88,6 +88,20 @@ QuantaStatus quanta_set_harts(Quanta *q, int nharts);
  * after loading. */
 void quanta_set_dcache(Quanta *q, int on);
 
+/* Enable (on != 0) or disable the basic-block JIT (M25b): hot straight-line
+ * runs of guest instructions are translated once to host x86-64 and re-executed
+ * natively, with the interpreter as the bit-exact fallback (and golden
+ * reference — `make check-jit` pins the equivalence). It engages only on a
+ * uniprocessor and only inside quanta_run(); quanta_step() (the GDB stub, the
+ * trace loop) always interprets. Off by default. Returns QUANTA_ERR_INVAL when
+ * enabling on a host without JIT support (see quanta_jit_available); may be
+ * called before or after loading. */
+QuantaStatus quanta_set_jit(Quanta *q, int on);
+
+/* Can this build JIT at all (an x86-64 POSIX host)? Elsewhere the emulator is
+ * unchanged and quanta_set_jit(q, 1) is refused. */
+int quanta_jit_available(void);
+
 /* --- loading --- */
 
 /* Load a static little-endian RV32 ELF executable: size guest memory to its

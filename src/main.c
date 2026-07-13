@@ -602,6 +602,7 @@ int main(int argc, char **argv) {
     int quiet = 0;
     int cache_on = 0;
     int no_dcache = 0;  /* --no-dcache: run the plain interpreter (M25a reference) */
+    int jit_on = 0;     /* --jit: enable the basic-block JIT (M25b; opt-in) */
     int pipe_on = 0;
     int gdb_on = 0;
     int gdb_port = 1234;            /* the conventional gdbserver/qemu port */
@@ -639,6 +640,8 @@ int main(int argc, char **argv) {
             quiet = 1;
         } else if (strcmp(argv[i], "--no-dcache") == 0) {
             no_dcache = 1;  /* disable the decoded-instruction cache (M25a) */
+        } else if (strcmp(argv[i], "--jit") == 0) {
+            jit_on = 1;     /* enable the basic-block JIT (M25b) */
         } else if (strcmp(argv[i], "--cache") == 0) {
             cache_on = 1;
         } else if (strncmp(argv[i], "--cache=", 8) == 0) {
@@ -749,7 +752,7 @@ int main(int argc, char **argv) {
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
-                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] "
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--jit] [--no-dcache] [--memory=SIZE] [--harts=N] [--max-steps=N] "
                     "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE|--disk-ro=FILE] [--netdev=user|tap] "
                     "[--snapshot=FILE] [--restore=FILE] "
                     "[--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]] "
@@ -760,7 +763,7 @@ int main(int argc, char **argv) {
             path = argv[i];
         } else {
             fprintf(stderr, "usage: %s [--version] [--trace] [--quiet] "
-                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--memory=SIZE] [--harts=N] [--max-steps=N] "
+                    "[--cache[=SIZE:WAYS:BLOCK]] [--pipeline] [--jit] [--no-dcache] [--memory=SIZE] [--harts=N] [--max-steps=N] "
                     "[--gdb[=PORT]] [--signature=FILE] [--disk=FILE|--disk-ro=FILE] [--netdev=user|tap] "
                     "[--snapshot=FILE] [--restore=FILE] "
                     "[--bios=FILE --kernel=FILE [--append=STRING] [--initrd=FILE]] "
@@ -776,6 +779,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (no_dcache) quanta_set_dcache(q, 0); /* opt out of the decode cache (M25a) */
+    if (jit_on && quanta_set_jit(q, 1) != QUANTA_OK) {
+        /* Refuse rather than silently interpret: the user asked for speed. */
+        fprintf(stderr, "--jit is not supported on this host (needs x86-64)\n");
+        quanta_destroy(q);
+        return 2;
+    }
 
     /* Configure SMP before loading, so the boot handoff brings up every hart. */
     if (quanta_set_harts(q, nharts) != QUANTA_OK) {
